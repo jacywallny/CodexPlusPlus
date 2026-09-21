@@ -348,12 +348,38 @@ pub fn terminate_process(process_id: u32) -> bool {
 }
 
 #[cfg(windows)]
+pub fn terminate_process_if_birth_id(process_id: u32, expected_birth_id: u64) -> bool {
+    let Ok(handle) = (unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            process_id,
+        )
+    }) else {
+        return false;
+    };
+    if handle.is_invalid() {
+        return false;
+    }
+    let _guard = HandleGuard(handle);
+    if process_birth_id_from_handle(handle) != Some(expected_birth_id) {
+        return false;
+    }
+    unsafe { TerminateProcess(handle, 0) }.is_ok()
+}
+
+#[cfg(windows)]
 pub fn process_birth_id(process_id: u32) -> Option<u64> {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id).ok()? };
     if handle.is_invalid() {
         return None;
     }
     let _guard = HandleGuard(handle);
+    process_birth_id_from_handle(handle)
+}
+
+#[cfg(windows)]
+fn process_birth_id_from_handle(handle: HANDLE) -> Option<u64> {
     let mut creation_time = FILETIME::default();
     let mut exit_time = FILETIME::default();
     let mut kernel_time = FILETIME::default();

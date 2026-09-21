@@ -557,7 +557,9 @@ impl LauncherExitSnapshot {
     pub fn capture() -> anyhow::Result<Self> {
         let processes = crate::windows_integration::enumerate_processes();
         let ids = filter_killable_launcher_processes(
-            processes.iter().map(|p| (p.process_id, p.parent_process_id, p.exe_file.as_str())),
+            processes
+                .iter()
+                .map(|p| (p.process_id, p.parent_process_id, p.exe_file.as_str())),
             std::process::id(),
         );
         let mut captured = Vec::new();
@@ -568,23 +570,55 @@ impl LauncherExitSnapshot {
                 anyhow::bail!("Cannot verify launcher process identity: {pid}");
             }
         }
-        Ok(Self { processes: captured })
+        Ok(Self {
+            processes: captured,
+        })
     }
 
     pub fn wait_for_exit(self, timeout: Duration) -> anyhow::Result<()> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let remaining = launcher_incarnations_still_running(
-                &self.processes,
-                |pid| crate::windows_integration::process_birth_id(pid),
-            );
+            let remaining = launcher_incarnations_still_running(&self.processes, |pid| {
+                crate::windows_integration::process_birth_id(pid)
+            });
             if remaining.is_empty() {
                 return Ok(());
             }
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "Previous launcher has not exited; no process was forcibly terminated"
-            );
+            if std::time::Instant::now() >= deadline {
+                let mut force_terminated = Vec::new();
+                for (process_id, birth_id) in &self.processes {
+                    if crate::windows_integration::terminate_process_if_birth_id(
+                        *process_id,
+                        *birth_id,
+                    )
+                    {
+                        force_terminated.push(*process_id);
+                    }
+                }
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "watcher.launcher_force_terminated",
+                    serde_json::json!({
+                        "process_ids": force_terminated,
+                        "timeout_ms": timeout.as_millis()
+                    }),
+                );
+                let force_deadline = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let remaining = launcher_incarnations_still_running(&self.processes, |pid| {
+                        crate::windows_integration::process_birth_id(pid)
+                    });
+                    if remaining.is_empty() {
+                        return Ok(());
+                    }
+                    if std::time::Instant::now() >= force_deadline {
+                        anyhow::bail!(
+                            "Previous launcher remained after forced termination: {:?}",
+                            remaining
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(RESTART_STOP_WAIT_INTERVAL_MS));
+                }
+            }
             std::thread::sleep(Duration::from_millis(RESTART_STOP_WAIT_INTERVAL_MS));
         }
     }
@@ -595,9 +629,10 @@ fn launcher_incarnations_still_running(
     captured: &[(u32, u64)],
     mut birth_id: impl FnMut(u32) -> Option<u64>,
 ) -> Vec<u32> {
-    captured.iter().filter_map(|(pid, birth)| {
-        (birth_id(*pid) == Some(*birth)).then_some(*pid)
-    }).collect()
+    captured
+        .iter()
+        .filter_map(|(pid, birth)| (birth_id(*pid) == Some(*birth)).then_some(*pid))
+        .collect()
 }
 
 #[cfg(test)]
@@ -648,8 +683,7 @@ pub fn stop_codex_processes() {
 
 #[cfg(windows)]
 pub fn stop_codex_processes_and_wait() {
-    terminate_and_wait_for_exit(
-        find_codex_processes(),
+    terminate_codex_processes_and_wait(
         RESTART_STOP_WAIT_TIMEOUT_MS,
         RESTART_STOP_WAIT_INTERVAL_MS,
     );
@@ -848,6 +882,35 @@ fn terminate_and_wait_for_exit(process_ids: Vec<u32>, timeout_ms: u64, interval_
                 );
             }
             break;
+        }
+        std::thread::sleep(Duration::from_millis(interval_ms));
+    }
+}
+
+#[cfg(windows)]
+fn terminate_codex_processes_and_wait(timeout_ms: u64, interval_ms: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let process_ids = find_codex_processes();
+        if process_ids.is_empty() {
+            return;
+        }
+        for process_id in &process_ids {
+            let _ = crate::windows_integration::terminate_process(*process_id);
+        }
+        if std::time::Instant::now() >= deadline {
+            let remaining = find_codex_processes();
+            if !remaining.is_empty() {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "watcher.stop_wait_timeout",
+                    serde_json::json!({
+                        "remaining_process_ids": remaining,
+                        "timeout_ms": timeout_ms,
+                        "scope": "codex_process_tree"
+                    }),
+                );
+            }
+            return;
         }
         std::thread::sleep(Duration::from_millis(interval_ms));
     }

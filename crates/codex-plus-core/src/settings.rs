@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -10,6 +11,8 @@ use toml_edit::{DocumentMut, Item};
 
 use crate::tools::{ToolConfig, ToolId};
 use crate::zed_remote::ZedOpenStrategy;
+
+static NEXT_TEMP_PATH_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -1863,6 +1866,8 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
 #[cfg(windows)]
 fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use std::thread::sleep;
+    use std::time::Duration;
     use windows::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
@@ -1878,22 +1883,40 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    unsafe {
-        MoveFileExW(
-            PCWSTR(source.as_ptr()),
-            PCWSTR(target.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )?;
+    let mut last_error = None;
+    for attempt in 0..20 {
+        match unsafe {
+            MoveFileExW(
+                PCWSTR(source.as_ptr()),
+                PCWSTR(target.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let retryable = matches!(error.code().0 as u32, 0x8007_0020 | 0x8007_0021);
+                last_error = Some(error);
+                if retryable && attempt < 19 {
+                    sleep(Duration::from_millis(100));
+                } else {
+                    break;
+                }
+            }
+        }
     }
-    Ok(())
+    Err(last_error
+        .expect("MoveFileExW retry loop must capture an error")
+        .into())
 }
 
 fn temp_path_for(path: &Path) -> PathBuf {
     let mut temp_path = path.to_path_buf();
+    let unique_id = NEXT_TEMP_PATH_ID.fetch_add(1, Ordering::Relaxed);
+    let suffix = format!("{}.{}", std::process::id(), unique_id);
     let extension = path.extension().and_then(|value| value.to_str());
     temp_path.set_extension(match extension {
-        Some(extension) => format!("{extension}.tmp"),
-        None => "tmp".to_string(),
+        Some(extension) => format!("{extension}.tmp.{suffix}"),
+        None => format!("tmp.{suffix}"),
     });
     temp_path
 }
@@ -1926,7 +1949,14 @@ mod tests {
 
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
         assert!(!dir.join("settings.json.tmp").exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn temp_paths_are_unique_for_concurrent_writers() {
+        let path = std::path::Path::new("settings.json");
+        assert_ne!(temp_path_for(path), temp_path_for(path));
     }
 
     #[test]
