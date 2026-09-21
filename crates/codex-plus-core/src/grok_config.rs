@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -433,6 +432,7 @@ fn create_private_dir_all(path: &Path) -> anyhow::Result<()> {
 fn write_private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
+        use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
 
         let mut file = fs::OpenOptions::new()
@@ -453,6 +453,7 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 fn secure_atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let parent = path.parent().context("Grok 配置路径缺少父目录")?;
