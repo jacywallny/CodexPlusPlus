@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -8,9 +9,16 @@ import { test } from "node:test";
 const source = await readFile(new URL("../../../scripts/installer/macos/package-dmg.sh", import.meta.url), "utf8");
 const start = source.indexOf('DMG_WORK_DIR="$(mktemp');
 assert.ok(start >= 0, "the real DMG lifecycle must be exercised");
-const bash = process.platform === "win32"
-  ? join(process.env.ProgramFiles || "C:\\Program Files", "Git", "bin", "bash.exe")
-  : "/bin/bash";
+function resolveBash() {
+  if (process.platform !== "win32") return "/bin/bash";
+  const candidates = [join(process.env.ProgramFiles || "C:\\Program Files", "Git", "bin", "bash.exe")];
+  const gitPaths = spawnSync("where.exe", ["git.exe"], { encoding: "utf8" }).stdout || "";
+  for (const gitPath of gitPaths.trim().split(/\r?\n/).filter(Boolean)) {
+    candidates.push(join(dirname(dirname(gitPath)), "bin", "bash.exe"));
+  }
+  return candidates.find(existsSync) || candidates[0];
+}
+const bash = resolveBash();
 
 // Run the actual packaging tail with synthetic disk commands, never real mounts.
 const fixture = `
@@ -115,11 +123,14 @@ for (const scenario of ["success", "retry-convert", "late-convert", "delayed-out
       assert.equal(result.trace.match(/^convert /gm)?.length, 1);
     }
     if (scenario === "delayed") {
+      // 普通 detach 失败后立刻补 -force：CI runner 上「卷已消失、设备仍注册」
+      // 的中间态只有 -force 能解，普通重试不会成功（见 detach_dmg 注释）。
       assert.equal(result.trace.match(/^detach /gm)?.length, 2);
-      assert.doesNotMatch(result.trace, /-force/);
+      assert.match(result.trace, /detach \/dev\/disk4 -force/);
     }
     if (scenario === "force-only") {
-      assert.equal(result.trace.match(/^detach /gm)?.length, 5);
+      // -force 在循环内，所以第 2 次 detach 就是 force，不再等到循环跑完。
+      assert.equal(result.trace.match(/^detach /gm)?.length, 2);
       assert.match(result.trace, /detach \/dev\/disk4 -force/);
     }
   });
@@ -132,7 +143,8 @@ for (const scenario of ["no-device", "no-volume"]) {
     assert.match(result.stderr, /failed to find mounted DMG device and volume/);
     assert.doesNotMatch(result.trace, /^convert /m);
     if (scenario === "no-device") {
-      assert.equal(result.trace.match(/^detach \/Volumes\/fixture$/gm)?.length, 2);
+      // 只有挂载点可清理（无设备），detach 一次即成功。
+      assert.equal(result.trace.match(/^detach \/Volumes\/fixture$/gm)?.length, 1);
     } else {
       assert.match(result.trace, /detach \/dev\/disk4/);
     }

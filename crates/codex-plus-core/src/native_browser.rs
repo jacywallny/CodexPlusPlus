@@ -747,17 +747,38 @@ fn acquire_monitor_owner(paths: &BrowserPaths) -> Result<File> {
     Ok(owner)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeBrowserShutdown {
+    Ready,
+    /// The monitor finished and released the lock, but restore did not reach `restored`.
+    RestoreFailed,
+}
+
+#[derive(Debug)]
+pub struct NativeBrowserCleanupStillRunning;
+
+impl std::fmt::Display for NativeBrowserCleanupStillRunning {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Native browser cleanup is still running; launcher was not terminated"
+        )
+    }
+}
+
+impl std::error::Error for NativeBrowserCleanupStillRunning {}
+
 /// Called after Codex has been stopped, before the manager launches a replacement.
 /// Never restores files itself or creates a lock for an older launcher.
-pub fn wait_for_monitor_shutdown(timeout: Duration) -> Result<()> {
+pub fn wait_for_monitor_shutdown(timeout: Duration) -> Result<NativeBrowserShutdown> {
     if !cfg!(windows) {
-        return Ok(());
+        return Ok(NativeBrowserShutdown::Ready);
     }
     let paths = BrowserPaths::current()?;
     wait_for_monitor_shutdown_at(&paths, timeout)
 }
 
-fn wait_for_monitor_shutdown_at(paths: &BrowserPaths, timeout: Duration) -> Result<()> {
+fn wait_for_monitor_shutdown_at(paths: &BrowserPaths, timeout: Duration) -> Result<NativeBrowserShutdown> {
     let path = paths.state_root.join("monitor.lock");
     let _guards = pin_parents(&path)?;
     let mut options = OpenOptions::new();
@@ -770,7 +791,8 @@ fn wait_for_monitor_shutdown_at(paths: &BrowserPaths, timeout: Duration) -> Resu
     let mut file = match options.open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return verify_restored_state(paths);
+            verify_restored_state(paths)?;
+            return Ok(NativeBrowserShutdown::Ready);
         }
         Err(error) => return Err(error.into()),
     };
@@ -784,18 +806,20 @@ fn wait_for_monitor_shutdown_at(paths: &BrowserPaths, timeout: Duration) -> Resu
                 let mut bytes = Vec::new();
                 Read::by_ref(&mut file).take(1025).read_to_end(&mut bytes)?;
                 let receipt: MonitorReceipt = serde_json::from_slice(&bytes)?;
-                ensure!(
-                    receipt.schema == 1 && uuid::Uuid::parse_str(&receipt.generation).is_ok()
-                        && receipt.state == "restored",
-                    "Native browser cleanup did not complete successfully"
-                );
-                return Ok(());
+                let receipt_is_valid = receipt.schema == 1
+                    && uuid::Uuid::parse_str(&receipt.generation).is_ok();
+                if receipt_is_valid && receipt.state == "restored" {
+                    return Ok(NativeBrowserShutdown::Ready);
+                }
+                if receipt_is_valid && receipt.state == "blocked" {
+                    return Ok(NativeBrowserShutdown::RestoreFailed);
+                }
+                anyhow::bail!("Native browser cleanup did not complete successfully");
             }
             Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
-                ensure!(
-                    std::time::Instant::now() < deadline,
-                    "Native browser cleanup is still running; launcher was not terminated"
-                );
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow::Error::new(NativeBrowserCleanupStillRunning));
+                }
                 std::thread::sleep(Duration::from_millis(50).min(
                     deadline.saturating_duration_since(std::time::Instant::now()),
                 ));
@@ -1072,6 +1096,46 @@ mod tests {
                 &RuntimeContract::pinned()
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn plain_path_rejects_symlinked_ancestors_and_accepts_plain_directories() {
+        // 这条校验此前没有任何测试覆盖：既挡住了正常用法（macOS 的 /var 系统软链），
+        // 又没有回归保护。这里补上两侧——真软链必须被拒，普通目录必须通过。
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp_root(&temp);
+
+        let plain = root.join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert!(plain_path(&plain).is_ok(), "普通目录应通过");
+        assert!(plain_path(&plain.join("state")).is_ok(), "尚不存在的子路径应通过");
+
+        // 路径本身是软链
+        #[cfg(unix)]
+        {
+            let target = root.join("target");
+            fs::create_dir_all(&target).unwrap();
+            let link = root.join("link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let error = plain_path(&link).unwrap_err();
+            assert!(error.to_string().contains("Linked paths"), "{error}");
+
+            // 祖先链上有软链（等价于 macOS 的 /var 情形，必须一并拒绝）
+            let nested = link.join("state");
+            let error = plain_path(&nested).unwrap_err();
+            assert!(error.to_string().contains("Linked paths"), "{error}");
+
+            // 拒绝的是「路径里有软链」，不是「指向的目标不可用」：
+            // 走真实路径访问同一目录应当通过。
+            assert!(plain_path(&target.join("state")).is_ok());
+        }
+
+        // 相对路径与含 .. 的路径
+        assert!(plain_path(Path::new("relative/path")).is_err(), "相对路径应被拒");
+        assert!(
+            plain_path(&root.join("a").join("..").join("b")).is_err(),
+            "含 .. 的路径应被拒"
         );
     }
 
@@ -1559,7 +1623,10 @@ mod tests {
             serde_json::from_slice(&fs::read(paths.state_root.join("status.json")).unwrap()).unwrap();
         assert_eq!(status.state, "blocked");
         assert!(status.detail.contains("External runtime change"));
-        assert!(wait_for_monitor_shutdown_at(&paths, Duration::ZERO).is_err());
+        assert_eq!(
+            wait_for_monitor_shutdown_at(&paths, Duration::ZERO).unwrap(),
+            NativeBrowserShutdown::RestoreFailed
+        );
         assert!(acquire_monitor_owner(&paths).is_ok());
     }
 
@@ -1603,7 +1670,12 @@ mod tests {
         for state in ["active", "blocked"] {
             write_monitor_receipt(&mut owner, &generation, state).unwrap();
             FileExt::unlock(&owner).unwrap();
-            assert!(wait_for_monitor_shutdown_at(&paths, Duration::ZERO).is_err());
+            let shutdown = wait_for_monitor_shutdown_at(&paths, Duration::ZERO);
+            if state == "blocked" {
+                assert_eq!(shutdown.unwrap(), NativeBrowserShutdown::RestoreFailed);
+            } else {
+                assert!(shutdown.is_err());
+            }
             owner.try_lock_exclusive().unwrap();
         }
         owner.set_len(0).unwrap();
