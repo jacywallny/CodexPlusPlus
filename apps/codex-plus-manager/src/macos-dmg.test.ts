@@ -11,7 +11,9 @@ const start = source.indexOf('DMG_WORK_DIR="$(mktemp');
 assert.ok(start >= 0, "the real DMG lifecycle must be exercised");
 function resolveBash() {
   if (process.platform !== "win32") return "/bin/bash";
-  const candidates = [join(process.env.ProgramFiles || "C:\\Program Files", "Git", "bin", "bash.exe")];
+  const bashPaths = spawnSync("where.exe", ["bash.exe"], { encoding: "utf8" }).stdout || "";
+  const candidates = bashPaths.trim().split(/\r?\n/).filter((path) => /\\Git\\(?:usr\\)?bin\\bash\.exe$/i.test(path));
+  candidates.push(join(process.env.ProgramFiles || "C:\\Program Files", "Git", "bin", "bash.exe"));
   const gitPaths = spawnSync("where.exe", ["git.exe"], { encoding: "utf8" }).stdout || "";
   for (const gitPath of gitPaths.trim().split(/\r?\n/).filter(Boolean)) {
     candidates.push(join(dirname(dirname(gitPath)), "bin", "bash.exe"));
