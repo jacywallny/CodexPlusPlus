@@ -11,6 +11,25 @@ use std::sync::OnceLock;
 
 #[cfg(windows)]
 use anyhow::Context;
+
+/// NTFS ChangeTime changes on content writes even when a caller restores LastWriteTime.
+/// Startup caches must not mistake that restoration for an unchanged rollout.
+#[cfg(windows)]
+pub fn file_change_time(file: &std::fs::File) -> anyhow::Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+    };
+    let mut info = FILE_BASIC_INFO::default();
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle()), FileBasicInfo,
+            &mut info as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )?;
+    }
+    Ok(info.ChangeTime.try_into()?)
+}
 #[cfg(windows)]
 use windows::Win32::Foundation::{
     BOOL, CloseHandle, FILETIME, HANDLE, HWND, LPARAM, MAX_PATH, WPARAM,

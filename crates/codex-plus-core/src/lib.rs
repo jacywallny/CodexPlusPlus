@@ -62,6 +62,8 @@ pub mod vision;
 pub mod watcher;
 #[cfg(windows)]
 mod windows_integration;
+#[cfg(windows)]
+pub use windows_integration::file_change_time;
 pub mod zed_remote;
 
 #[cfg(windows)]

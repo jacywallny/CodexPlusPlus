@@ -2089,9 +2089,15 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
             }
         }
     }
-    Err(last_error
-        .expect("MoveFileExW retry loop must capture an error")
-        .into())
+    let error = last_error.expect("MoveFileExW retry loop must capture an error");
+    let code = error.code().0 as u32;
+    // Preserve the Win32 code as an io::Error. Consumers must recognize access/sharing
+    // conflicts by type; windows::core::Error's localized Display text is not a contract.
+    if code & 0xffff_0000 == 0x8007_0000 {
+        Err(std::io::Error::from_raw_os_error((code & 0xffff) as i32).into())
+    } else {
+        Err(error.into())
+    }
 }
 
 fn temp_path_for(path: &Path) -> PathBuf {
@@ -2136,6 +2142,30 @@ mod tests {
         assert!(!dir.join("settings.json.tmp").exists());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_write_retains_os_error_when_readable_target_denies_replacement() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        fs::write(&path, b"original").unwrap();
+        // A live rollout permits reads/writes, but does not grant FILE_SHARE_DELETE.
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&path)
+            .unwrap();
+        let error = atomic_write(&path, b"replacement").unwrap_err();
+        assert!(error.chain().any(|cause| cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| matches!(error.raw_os_error(), Some(5 | 32 | 33)))));
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        drop(held);
+        atomic_write(&path, b"replacement").unwrap();
     }
 
     #[test]

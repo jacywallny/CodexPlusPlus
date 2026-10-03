@@ -459,7 +459,7 @@ impl LaunchHooks for LauncherHooks {
     }
 
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
-        let result = tokio::task::spawn_blocking(|| codex_plus_data::run_provider_sync(None))
+        let result = tokio::task::spawn_blocking(|| codex_plus_data::run_provider_sync_for_startup(None))
             .await
             .map_err(|error| anyhow::anyhow!("provider sync task failed: {error}"))?;
         require_completed_provider_sync(&result.status, &result.message)?;
