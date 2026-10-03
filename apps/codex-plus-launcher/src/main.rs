@@ -51,6 +51,14 @@ async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let helper_only = args.iter().any(|arg| arg == "--helper-only");
     let options = parse_launch_options(args.iter());
+    // 仅检查启动条件，便于部署验收；不启动管理器、注入或激活现有窗口。
+    #[cfg(windows)]
+    if args.iter().any(|arg| arg == "--check-runtime-only") {
+        let settings = codex_plus_core::settings::SettingsStore::default().load()?;
+        let app_dir = DefaultLaunchHooks::default()
+            .resolve_app_dir(options.app_dir.as_deref(), &settings)?;
+        return codex_plus_core::runtime_gate::ensure_windows_runtime_ready(&app_dir).await;
+    }
     if let Err(error) = launcher_main(helper_only, options.clone()).await {
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
             "launcher.failed",

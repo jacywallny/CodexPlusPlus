@@ -973,6 +973,8 @@ impl LaunchHooks for DefaultLaunchHooks {
         settings: &BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch> {
+        #[cfg(windows)]
+        crate::runtime_gate::ensure_windows_runtime_ready(app_dir).await?;
         let native_menu_localization_enabled = settings.codex_app_native_menu_localization;
         let native_menu_inspector_port =
             native_menu_localization_enabled.then(|| select_native_menu_inspector_port(debug_port));

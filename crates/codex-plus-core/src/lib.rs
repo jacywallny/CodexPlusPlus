@@ -43,6 +43,8 @@ pub mod relay_rotation;
 pub mod relay_switch;
 pub mod remote_control_recovery;
 pub mod routes;
+#[cfg(windows)]
+pub mod runtime_gate;
 pub mod script_market;
 pub mod session_share;
 pub mod settings;
