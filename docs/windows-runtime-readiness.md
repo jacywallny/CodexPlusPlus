@@ -33,3 +33,7 @@ cargo build -p codex-plus-launcher --release --locked
 本机兼容层还将代理运行时直接构建到 `D:\CodexContextMenu\CuaRuntimeStore`，验证成功后再在 App 管理目录注册 Junction。构建源来自当前安装包，避免 App 清理管理目录时删除尚未注册的候选运行时。
 
 此源代码改动必须保留在后续 Codex++ 构建中。直接安装未包含本补丁的发布版会失去启动检查；JSON 文件本身不能给未修改的程序增加此功能。
+
+配套兼容层脚本与隔离验证脚本保存在 `scripts/windows-runtime-readiness/`。
+这些是现有本机兼容层的补丁与测试，完整依赖见同目录 README；启用前应确认目标
+机器的检查脚本和其修复链已安装。
