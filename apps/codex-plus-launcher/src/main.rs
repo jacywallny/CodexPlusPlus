@@ -116,7 +116,7 @@ async fn launcher_main(helper_only: bool, options: LaunchOptions) -> Result<()> 
     run_periodic_until_exit(
         handle.wait_for_codex_exit(),
         std::time::Duration::from_secs(30 * 60),
-        || repair_session_index_automatically(true),
+        repair_session_index_automatically,
     )
     .await?;
     Ok(())
@@ -130,21 +130,36 @@ where
     W: std::future::Future<Output = ()>,
 {
     tokio::pin!(exit);
+    // 应用启动和桥接准备已返回；首次索引检查不再挡在启动前。
+    let mut delay = std::time::Duration::ZERO;
     loop {
         tokio::select! {
             biased;
             result = &mut exit => return result,
-            _ = tokio::time::sleep(interval) => check().await,
+            _ = tokio::time::sleep(delay) => {
+                check().await;
+                delay = interval;
+            },
         }
     }
 }
 
-async fn repair_session_index_automatically(check_setting: bool) {
+async fn repair_session_index_automatically() {
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        if check_setting && !codex_plus_core::settings::SettingsStore::default().load()?.provider_sync_enabled {
+        if !codex_plus_core::settings::SettingsStore::default().load()?.provider_sync_enabled {
             return Ok(());
         }
-        codex_plus_data::repair_session_index(None)?;
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.session_index_repair.started",
+            json!({"phase": "background"}),
+        );
+        let report = codex_plus_data::repair_session_index(None)?;
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.session_index_repair.completed",
+            json!({"phase": "background", "elapsed_ms": report.elapsed_ms,
+                "files": report.scanned_files, "cached_files": report.cached_files,
+                "repaired_items": report.repaired_items, "skipped_items": report.skipped_items}),
+        );
         Ok(())
     })
     .await
@@ -459,11 +474,18 @@ impl LaunchHooks for LauncherHooks {
     }
 
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(|| codex_plus_data::run_provider_sync_for_startup(None))
             .await
             .map_err(|error| anyhow::anyhow!("provider sync task failed: {error}"))?;
         require_completed_provider_sync(&result.status, &result.message)?;
-        repair_session_index_automatically(false).await;
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.provider_sync.completed",
+            json!({"elapsed_ms": started.elapsed().as_millis(),
+                "changed_session_files": result.changed_session_files,
+                "sqlite_rows_updated": result.sqlite_rows_updated,
+                "skipped_files": result.skipped_locked_rollout_files.len()}),
+        );
         Ok(())
     }
 
@@ -1249,6 +1271,18 @@ fn default_user_scripts_config_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn session_index_monitor_runs_first_check_without_waiting_for_period() {
+        let (done, exit) = tokio::sync::oneshot::channel::<()>();
+        let mut done = Some(done);
+        let monitor = run_periodic_until_exit(exit, std::time::Duration::from_secs(1800), || {
+            done.take().expect("one initial check").send(()).unwrap();
+            std::future::ready(())
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), monitor)
+            .await.expect("first check must not wait 30 minutes").unwrap();
+    }
 
     #[tokio::test]
     async fn session_index_monitor_does_not_start_after_exit() {

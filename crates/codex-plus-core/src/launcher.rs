@@ -490,6 +490,7 @@ pub async fn launch_and_inject_with_hooks<H>(
 where
     H: IntoLaunchHooks,
 {
+    let startup_started = std::time::Instant::now();
     let hooks = hooks.into_launch_hooks();
     let debug_port = hooks.select_debug_port(options.debug_port);
     let mut helper_port = hooks.select_helper_port(options.helper_port);
@@ -501,18 +502,23 @@ where
     let mut keep_launched_on_error = false;
 
     let result: anyhow::Result<LaunchHandle> = async {
+        let preparation_started = std::time::Instant::now();
         hooks.start_native_browser_compatibility(&settings).await;
         let home = crate::relay_config::default_codex_home_dir();
         hooks.cleanup_unsupported_config()?;
         crate::relay_config::ensure_windows_sandbox_usable_for_current_user(&home)?;
+        log_startup_stage("prepare_runtime", preparation_started);
         if settings.provider_sync_enabled {
+            let provider_started = std::time::Instant::now();
             crate::codex_app_state::capture_app_state_snapshot_nonfatal(&home, "launcher.before");
             hooks.run_provider_sync().await?;
             crate::codex_app_state::sync_app_state_after_provider_switch_nonfatal(
                 &home,
                 "launcher.after_provider_sync",
             );
+            log_startup_stage("provider_visibility_sync", provider_started);
         }
+        let services_started = std::time::Instant::now();
         if hooks.has_pending_remote_control_session_recoveries()
             && hooks.remote_control_session_recovery_is_safe_to_run()
         {
@@ -603,13 +609,17 @@ where
             helper_started = true;
         }
 
+        log_startup_stage("prepare_services", services_started);
+        let launch_started = std::time::Instant::now();
         let launch = hooks
             .launch_codex(&app_dir, debug_port, &settings, &settings.codex_extra_args)
             .await?;
+        log_startup_stage("launch_application", launch_started);
         launched = Some(launch.clone());
         keep_launched_on_error = true;
 
         let mut injection_degraded = false;
+        let bridge_started = std::time::Instant::now();
         if settings.enhancements_enabled {
             let injection_ready = hooks
                 .ensure_injection(debug_port, helper_port, &app_dir)
@@ -648,6 +658,12 @@ where
             options.status_store.save_latest(&status)?;
             hooks.write_status("running").await;
         }
+        log_startup_stage("bridge_ready", bridge_started);
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.startup.completed",
+            serde_json::json!({"elapsed_ms": startup_started.elapsed().as_millis(),
+                "version": crate::version::VERSION, "bridge_degraded": injection_degraded}),
+        );
 
         Ok(LaunchHandle {
             debug_port,
@@ -680,6 +696,13 @@ where
             Err(error)
         }
     }
+}
+
+fn log_startup_stage(stage: &str, started: std::time::Instant) {
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "launcher.startup_stage.completed",
+        serde_json::json!({"stage": stage, "elapsed_ms": started.elapsed().as_millis()}),
+    );
 }
 
 fn relay_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
