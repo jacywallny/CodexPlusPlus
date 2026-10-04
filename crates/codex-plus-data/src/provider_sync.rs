@@ -380,6 +380,7 @@ struct BulkSessionRewritePlan {
     original_sha256: String,
     original_mtime: Option<SystemTime>,
     original_session_meta_lines: Vec<String>,
+    original_session_meta_locations: Vec<MetaLocation>,
 }
 
 #[derive(Debug, Default)]
@@ -1932,6 +1933,7 @@ fn scan_bulk_session_rewrites(
                             .and_then(|metadata| metadata.modified())
                             .ok(),
                         original_session_meta_lines,
+                        original_session_meta_locations: meta_locations,
                     });
                 }
             }
@@ -3636,7 +3638,7 @@ fn rewrite_bulk_session_plan(
     let write_result = codex_plus_core::settings::atomic_write_with(&plan.path, |file| {
         let mut writer = HashingWriter::new(BufWriter::new(file));
         let source_sha256 = stream_rewrite_rollout_session_meta_providers(
-            &plan.path,
+            plan,
             target_provider,
             &mut writer,
         )?;
@@ -3656,37 +3658,74 @@ fn rewrite_bulk_session_plan(
 }
 
 fn stream_rewrite_rollout_session_meta_providers<W: Write>(
-    path: &Path,
+    plan: &BulkSessionRewritePlan,
     target_provider: &str,
     writer: &mut W,
 ) -> std::io::Result<String> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
+    let mut reader = File::open(&plan.path)?;
     let mut hasher = Sha256::new();
-    loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut position = 0u64;
+    if plan.original_session_meta_locations.len() != plan.original_session_meta_lines.len() {
+        return Err(std::io::Error::other(BULK_SESSION_SOURCE_CHANGED_ERROR));
+    }
+    for (location, original) in plan.original_session_meta_locations.iter()
+        .zip(&plan.original_session_meta_lines)
+    {
+        let Some(gap) = location.offset.checked_sub(position) else {
+            return Err(std::io::Error::other(BULK_SESSION_SOURCE_CHANGED_ERROR));
+        };
+        // 对话正文保持原始字节；只解析已扫描、已核验的 session_meta。
+        copy_rollout_bytes(&mut reader, writer, &mut hasher, &mut buffer, Some(gap))?;
+        if location.length != original.len() as u64 {
+            return Err(std::io::Error::other(BULK_SESSION_SOURCE_CHANGED_ERROR));
         }
-        hasher.update(line.as_bytes());
-        let (record_line, line_ending) = split_line_ending(&line);
-        let mut rewritten = false;
-        if !record_line.trim().is_empty()
-            && let Some(mut record) = session_meta_record(record_line)
-            && let Some(payload) = record.get_mut("payload").and_then(Value::as_object_mut)
-            && payload.get("model_provider").and_then(Value::as_str) != Some(target_provider)
-        {
+        let mut bytes = vec![0; original.len()];
+        reader.read_exact(&mut bytes)?;
+        hasher.update(&bytes);
+        if bytes != original.as_bytes() || sha256_hex(&bytes) != location.sha256 {
+            return Err(std::io::Error::other(BULK_SESSION_SOURCE_CHANGED_ERROR));
+        }
+        let mut record = session_meta_record(original)
+            .ok_or_else(|| std::io::Error::other(BULK_SESSION_SOURCE_CHANGED_ERROR))?;
+        let payload = record.get_mut("payload").and_then(Value::as_object_mut)
+            .ok_or_else(|| std::io::Error::other(BULK_SESSION_SOURCE_CHANGED_ERROR))?;
+        if payload.get("model_provider").and_then(Value::as_str) != Some(target_provider) {
             payload.insert("model_provider".to_string(), json!(target_provider));
             serde_json::to_writer(&mut *writer, &record).map_err(std::io::Error::other)?;
-            writer.write_all(line_ending.as_bytes())?;
-            rewritten = true;
+        } else {
+            writer.write_all(&bytes)?;
         }
-        if !rewritten {
-            writer.write_all(line.as_bytes())?;
+        position = location.offset.checked_add(location.length)
+            .ok_or_else(|| std::io::Error::other(BULK_SESSION_SOURCE_CHANGED_ERROR))?;
+    }
+    copy_rollout_bytes(&mut reader, writer, &mut hasher, &mut buffer, None)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn copy_rollout_bytes<W: Write>(
+    reader: &mut File,
+    writer: &mut W,
+    hasher: &mut Sha256,
+    buffer: &mut [u8],
+    mut remaining: Option<u64>,
+) -> std::io::Result<()> {
+    while remaining != Some(0) {
+        let limit = remaining.map_or(buffer.len(), |bytes| bytes.min(buffer.len() as u64) as usize);
+        let count = reader.read(&mut buffer[..limit])?;
+        if count == 0 {
+            if remaining.is_some() {
+                return Err(std::io::Error::other(BULK_SESSION_SOURCE_CHANGED_ERROR));
+            }
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        writer.write_all(&buffer[..count])?;
+        if let Some(bytes) = &mut remaining {
+            *bytes -= count as u64;
         }
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(())
 }
 
 fn restore_bulk_session_rewrites(changes: &[AppliedBulkSessionRewrite]) -> anyhow::Result<()> {
@@ -5499,6 +5538,41 @@ mod startup_scan_cache_tests {
     }
 
     #[test]
+    fn chunk_rewrite_preserves_large_unicode_body_crlf_and_multiple_metadata_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(tmp.path(), "openai");
+        let meta = json!({"type":"session_meta","payload":{"id":"thread-a","model_provider":"openai"}});
+        let event = json!({"type":"event_msg","payload":{"type":"user_message",
+            "message": format!("{} session_meta model_provider openai", "原文🙂".repeat(128 * 1024))}});
+        let original = format!("\r\n{meta}\r\n{event}\r\n\r\n{meta}");
+        fs::write(&path, &original).unwrap();
+        let scanned = scan(tmp.path(), "relay-long-provider", false);
+        let plan = &scanned.rewrite_plans[0];
+        let mut actual = Vec::new();
+        let input_hash = stream_rewrite_rollout_session_meta_providers(
+            plan, "relay-long-provider", &mut actual).unwrap();
+        let expected = rewrite_rollout_session_meta_providers_for_threads(
+            &original, "relay-long-provider", "openai", &HashSet::from(["thread-a".to_owned()])).unwrap();
+        assert_eq!(input_hash, sha256_hex(original.as_bytes()));
+        assert_eq!(actual, expected.next_text.as_bytes());
+        assert_eq!(fs::read(path).unwrap(), original.as_bytes(), "streaming alone never replaces the source");
+    }
+
+    #[test]
+    fn chunk_rewrite_rejects_invalid_metadata_offsets_and_changed_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(tmp.path(), "openai");
+        let mut plan = scan(tmp.path(), "custom", false).rewrite_plans.remove(0);
+        let original = fs::read(&path).unwrap();
+        plan.original_session_meta_locations[0].offset += 1;
+        assert!(stream_rewrite_rollout_session_meta_providers(&plan, "custom", &mut Vec::new()).is_err());
+        plan.original_session_meta_locations[0].offset = 0;
+        plan.original_session_meta_lines[0] = plan.original_session_meta_lines[0].replace("openai", "custom");
+        assert!(stream_rewrite_rollout_session_meta_providers(&plan, "custom", &mut Vec::new()).is_err());
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
     fn startup_cache_detects_append_and_deleted_or_moved_rollouts() {
         let tmp = tempfile::tempdir().unwrap();
         let path = fixture(tmp.path(), "openai");
@@ -5653,6 +5727,94 @@ mod startup_scan_cache_tests {
         assert_eq!(warm.full_scan_bytes, 0);
         assert_eq!(warm.cached_rollout_files, 1);
         println!("startup-cache-benchmark bytes={} cold_ms={cold_ms} warm_ms={warm_ms} warm_full_scan_bytes={}", fs::metadata(path).unwrap().len(), warm.full_scan_bytes);
+    }
+
+    #[test]
+    #[ignore = "controlled 128 MiB provider change benchmark; never uses the real Codex home"]
+    fn startup_provider_switch_benchmark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(tmp.path(), "openai");
+        let body = format!("{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"{}\"}}}}\r\n",
+            "x".repeat(4096));
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        for _ in 0..32768 { file.write_all(body.as_bytes()).unwrap(); }
+        drop(file);
+        let original_size = fs::metadata(&path).unwrap().len();
+        let db = Connection::open(tmp.path().join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT, archived INTEGER, has_user_event INTEGER, cwd TEXT);").unwrap();
+        db.execute("INSERT INTO threads VALUES('thread-a','openai',0,1,'C:/work')", []).unwrap();
+        scan(tmp.path(), "openai", true).scan_cache.unwrap().save(tmp.path());
+        let plan = scan(tmp.path(), "custom", true).rewrite_plans.remove(0);
+        // 旧版逐行实现仅作为同文件、同输出摘要的对照，不进入正式程序。
+        let legacy_started = std::time::Instant::now();
+        let mut legacy_reader = BufReader::new(File::open(&path).unwrap());
+        let mut legacy_writer = HashingWriter::new(std::io::sink());
+        let mut legacy_source_hasher = Sha256::new();
+        let mut legacy_line = String::new();
+        loop {
+            legacy_line.clear();
+            if legacy_reader.read_line(&mut legacy_line).unwrap() == 0 { break; }
+            legacy_source_hasher.update(legacy_line.as_bytes());
+            let (record_line, line_ending) = split_line_ending(&legacy_line);
+            let mut rewritten = false;
+            if !record_line.trim().is_empty()
+                && let Some(mut record) = session_meta_record(record_line)
+                && let Some(payload) = record.get_mut("payload").and_then(Value::as_object_mut)
+                && payload.get("model_provider").and_then(Value::as_str) != Some("custom")
+            {
+                payload.insert("model_provider".into(), json!("custom"));
+                serde_json::to_writer(&mut legacy_writer, &record).unwrap();
+                legacy_writer.write_all(line_ending.as_bytes()).unwrap();
+                rewritten = true;
+            }
+            if !rewritten { legacy_writer.write_all(legacy_line.as_bytes()).unwrap(); }
+        }
+        legacy_writer.flush().unwrap();
+        let legacy_ms = legacy_started.elapsed().as_millis();
+        // 正式同步会检查独占访问；对照读取结束后释放句柄，避免测试自身占用文件。
+        drop(legacy_reader);
+        let chunk_started = std::time::Instant::now();
+        let mut chunk_writer = HashingWriter::new(std::io::sink());
+        let chunk_input_hash = stream_rewrite_rollout_session_meta_providers(
+            &plan, "custom", &mut chunk_writer).unwrap();
+        chunk_writer.flush().unwrap();
+        let chunk_ms = chunk_started.elapsed().as_millis();
+        assert_eq!(chunk_input_hash, format!("{:x}", legacy_source_hasher.finalize()));
+        assert_eq!(chunk_writer.sha256_hex(), legacy_writer.sha256_hex());
+        println!("rewrite-stream-benchmark bytes={original_size} legacy_ms={legacy_ms} chunk_ms={chunk_ms} input_and_output_hash_matched=true");
+        for provider in ["custom", "relay-long-provider", "openai"] {
+            fs::write(tmp.path().join("config.toml"), format!(
+                "model_provider = {provider:?}\n[model_providers.{provider}]\nname = {provider:?}\n")).unwrap();
+            let started = std::time::Instant::now();
+            let result = run_provider_sync_for_startup(Some(tmp.path()));
+            let elapsed_ms = started.elapsed().as_millis();
+            assert_eq!(result.status, ProviderSyncStatus::Synced, "{}", result.message);
+            assert_eq!(result.changed_session_files, 1, "provider={provider}; result={result:?}");
+            assert!(result.skipped_locked_rollout_files.is_empty());
+            let indexed_provider: String = db.query_row("SELECT model_provider FROM threads WHERE id='thread-a'", [], |row| row.get(0)).unwrap();
+            assert_eq!(indexed_provider, provider);
+            let mut reader = BufReader::new(File::open(&path).unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.contains(&format!("\"model_provider\":\"{provider}\"")));
+            let mut body_hasher = Sha256::new();
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let count = reader.read(&mut buffer).unwrap();
+                if count == 0 { break; }
+                body_hasher.update(&buffer[..count]);
+            }
+            let mut expected_body_hasher = Sha256::new();
+            let fixture_event = json!({"type":"event_msg","payload":{"type":"user_message","message":"PRIVATE_CONVERSATION_CONTENT"}});
+            expected_body_hasher.update(format!("{fixture_event}\n").as_bytes());
+            for _ in 0..32768 { expected_body_hasher.update(body.as_bytes()); }
+            assert_eq!(body_hasher.finalize(), expected_body_hasher.finalize());
+            let warm = scan(tmp.path(), provider, true);
+            assert_eq!(warm.cached_rollout_files, 1);
+            assert_eq!(warm.full_scan_bytes, 0);
+            assert!(warm.rewrite_plans.is_empty());
+            println!("provider-switch-benchmark bytes={original_size} provider={provider} elapsed_ms={elapsed_ms} body_hash_matched=true sqlite_provider_matched=true");
+        }
     }
 }
 
@@ -5840,6 +6002,7 @@ mod rollback_tests {
                 original_sha256,
                 original_mtime: None,
                 original_session_meta_lines: vec![incorrect_meta.to_string()],
+                original_session_meta_locations: Vec::new(),
             },
             rewritten_sha256,
         };

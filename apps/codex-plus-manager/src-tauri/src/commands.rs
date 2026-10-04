@@ -812,9 +812,17 @@ pub fn launch_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
 }
 
 #[tauri::command]
-pub fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
-    let Ok(_guard) = relay_switch_mutex().lock() else {
-        return failed("供应商切换锁已损坏，请重启管理器后再试。", json!({}));
+pub async fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
+    match run_relay_operation(move || restart_codex_plus_blocking(request)).await {
+        Ok(result) => result,
+        Err(message) => failed(&message, json!({})),
+    }
+}
+
+fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
+    let _guard = match try_relay_operation_lock(relay_switch_mutex()) {
+        Ok(guard) => guard,
+        Err(message) => return failed(message, json!({})),
     };
     let settings = if request.sync_active_relay {
         match SettingsStore::default().load() {
@@ -1753,17 +1761,20 @@ pub fn load_settings() -> CommandResult<SettingsPayload> {
 #[tauri::command]
 pub fn save_settings(settings: BackendSettings) -> CommandResult<SettingsPayload> {
     let settings = normalize_settings_before_save(settings);
-    let Ok(_guard) = relay_switch_mutex().lock() else {
-        return failed(
-            "供应商切换锁已损坏，请重启管理器后再试。",
-            SettingsPayload {
-                settings,
-                settings_path: codex_plus_core::paths::default_settings_path()
-                    .to_string_lossy()
-                    .to_string(),
-                user_scripts: user_script_inventory(),
-            },
-        );
+    let _guard = match try_relay_operation_lock(relay_switch_mutex()) {
+        Ok(guard) => guard,
+        Err(message) => {
+            return failed(
+                message,
+                SettingsPayload {
+                    settings,
+                    settings_path: codex_plus_core::paths::default_settings_path()
+                        .to_string_lossy()
+                        .to_string(),
+                    user_scripts: user_script_inventory(),
+                },
+            );
+        }
     };
     let store = SettingsStore::default();
     let previous = store.load().unwrap_or_default();
@@ -4658,16 +4669,19 @@ pub fn remove_env_conflicts(
 #[tauri::command]
 pub fn save_relay_file(request: SaveRelayFileRequest) -> CommandResult<RelayFilesPayload> {
     let home = codex_plus_core::relay_config::default_codex_home_dir();
-    let Ok(_guard) = relay_switch_mutex().lock() else {
-        return failed(
-            "供应商切换锁已损坏，请重启管理器后再试。",
-            relay_files_payload_from_home(&home).unwrap_or_else(|_| RelayFilesPayload {
-                config_path: home.join("config.toml").to_string_lossy().to_string(),
-                auth_path: home.join("auth.json").to_string_lossy().to_string(),
-                config_contents: String::new(),
-                auth_contents: String::new(),
-            }),
-        );
+    let _guard = match try_relay_operation_lock(relay_switch_mutex()) {
+        Ok(guard) => guard,
+        Err(message) => {
+            return failed(
+                message,
+                relay_files_payload_from_home(&home).unwrap_or_else(|_| RelayFilesPayload {
+                    config_path: home.join("config.toml").to_string_lossy().to_string(),
+                    auth_path: home.join("auth.json").to_string_lossy().to_string(),
+                    config_contents: String::new(),
+                    auth_contents: String::new(),
+                }),
+            );
+        }
     };
     let active_profile = SettingsStore::default()
         .load()
@@ -4713,19 +4727,38 @@ pub struct RelayProfileSwitchRequest {
 }
 
 #[tauri::command]
-pub fn switch_relay_profile(
+pub async fn switch_relay_profile(
     request: RelayProfileSwitchRequest,
 ) -> CommandResult<RelaySwitchPayload> {
-    let Ok(_guard) = relay_switch_mutex().lock() else {
-        let status = codex_plus_core::relay_config::default_relay_status();
-        return failed(
-            "供应商切换锁已损坏，请重启管理器后再试。",
+    match run_relay_operation(move || switch_relay_profile_blocking(request)).await {
+        Ok(result) => result,
+        Err(message) => failed(
+            &message,
             relay_switch_payload(
                 SettingsStore::default().load().unwrap_or_default(),
-                status,
+                codex_plus_core::relay_config::default_relay_status(),
                 None,
             ),
-        );
+        ),
+    }
+}
+
+fn switch_relay_profile_blocking(
+    request: RelayProfileSwitchRequest,
+) -> CommandResult<RelaySwitchPayload> {
+    let _guard = match try_relay_operation_lock(relay_switch_mutex()) {
+        Ok(guard) => guard,
+        Err(message) => {
+            let status = codex_plus_core::relay_config::default_relay_status();
+            return failed(
+                message,
+                relay_switch_payload(
+                    SettingsStore::default().load().unwrap_or_default(),
+                    status,
+                    None,
+                ),
+            );
+        }
     };
     let home = codex_plus_core::relay_config::default_codex_home_dir();
     let store = SettingsStore::default();
@@ -5585,12 +5618,12 @@ fn provider_doctor_recommendation(checks: &[ProviderDoctorCheck]) -> String {
 #[tauri::command]
 pub fn apply_relay_injection() -> CommandResult<RelayPayload> {
     let home = codex_plus_core::relay_config::default_codex_home_dir();
-    let Ok(_guard) = relay_switch_mutex().lock() else {
-        let status = codex_plus_core::relay_config::relay_status_from_home(&home);
-        return failed(
-            "供应商切换锁已损坏，请重启管理器后再试。",
-            relay_payload(status, None),
-        );
+    let _guard = match try_relay_operation_lock(relay_switch_mutex()) {
+        Ok(guard) => guard,
+        Err(message) => {
+            let status = codex_plus_core::relay_config::relay_status_from_home(&home);
+            return failed(message, relay_payload(status, None));
+        }
     };
     let settings = SettingsStore::default().load().unwrap_or_default();
     if !settings.relay_profiles_enabled {
@@ -5747,12 +5780,12 @@ fn apply_aggregate_relay_injection_to_home(
 #[tauri::command]
 pub fn apply_pure_api_injection() -> CommandResult<RelayPayload> {
     let home = codex_plus_core::relay_config::default_codex_home_dir();
-    let Ok(_guard) = relay_switch_mutex().lock() else {
-        let status = codex_plus_core::relay_config::relay_status_from_home(&home);
-        return failed(
-            "供应商切换锁已损坏，请重启管理器后再试。",
-            relay_payload(status, None),
-        );
+    let _guard = match try_relay_operation_lock(relay_switch_mutex()) {
+        Ok(guard) => guard,
+        Err(message) => {
+            let status = codex_plus_core::relay_config::relay_status_from_home(&home);
+            return failed(message, relay_payload(status, None));
+        }
     };
     let settings = SettingsStore::default().load().unwrap_or_default();
     if !settings.relay_profiles_enabled {
@@ -5867,12 +5900,12 @@ pub fn apply_pure_api_injection() -> CommandResult<RelayPayload> {
 #[tauri::command]
 pub fn clear_relay_injection() -> CommandResult<RelayPayload> {
     let home = codex_plus_core::relay_config::default_codex_home_dir();
-    let Ok(_guard) = relay_switch_mutex().lock() else {
-        let status = codex_plus_core::relay_config::relay_status_from_home(&home);
-        return failed(
-            "供应商切换锁已损坏，请重启管理器后再试。",
-            relay_payload(status, None),
-        );
+    let _guard = match try_relay_operation_lock(relay_switch_mutex()) {
+        Ok(guard) => guard,
+        Err(message) => {
+            let status = codex_plus_core::relay_config::relay_status_from_home(&home);
+            return failed(message, relay_payload(status, None));
+        }
     };
     let settings = SettingsStore::default().load().unwrap_or_default();
     let relay = settings.active_relay_profile();
@@ -6040,6 +6073,25 @@ fn relay_switch_payload(
 fn relay_switch_mutex() -> &'static Mutex<()> {
     static RELAY_SWITCH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     RELAY_SWITCH_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+// 停机等待和配置 IO 不占用 Tauri 的同步命令线程；锁只在工作线程内持有。
+async fn run_relay_operation<T: Send + 'static>(
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|error| format!("供应商后台操作失败：{error}"))
+}
+
+fn try_relay_operation_lock(lock: &Mutex<()>) -> Result<std::sync::MutexGuard<'_, ()>, &'static str> {
+    match lock.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::WouldBlock) =>
+            Err("已有供应商操作正在执行，请等待完成后重试。"),
+        Err(std::sync::TryLockError::Poisoned(_)) =>
+            Err("供应商切换锁已损坏，请重启管理器后再试。"),
+    }
 }
 
 fn empty_context_entries() -> codex_plus_core::relay_config::CodexContextEntries {
@@ -6608,6 +6660,55 @@ fn default_log_lines() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_worker_keeps_executor_responsive_while_process_exit_waits() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let operation = tauri::async_runtime::spawn(async move {
+            let executor_thread = std::thread::current().id();
+            run_relay_operation(move || {
+                started_tx.send((executor_thread, std::thread::current().id())).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                42
+            }).await
+        });
+        let (executor_thread, worker_thread) = started_rx
+            .recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let (heartbeat_tx, heartbeat_rx) = std::sync::mpsc::channel();
+        let heartbeat = tauri::async_runtime::spawn(async move { heartbeat_tx.send(()).unwrap(); });
+        let heartbeat_received = heartbeat_rx.recv_timeout(std::time::Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        assert_ne!(executor_thread, worker_thread, "process waits must run on a blocking worker");
+        assert!(heartbeat_received.is_ok(), "other commands must keep progressing during a process wait");
+        assert_eq!(tauri::async_runtime::block_on(operation).unwrap().unwrap(), 42);
+        tauri::async_runtime::block_on(heartbeat).unwrap();
+    }
+
+    #[test]
+    fn relay_busy_lock_returns_without_waiting_for_another_operation() {
+        let lock = Arc::new(Mutex::new(()));
+        let _guard = lock.lock().unwrap();
+        let worker_lock = lock.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done_tx.send(try_relay_operation_lock(&worker_lock).unwrap_err()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap()
+            .contains("正在执行"));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn relay_poisoned_lock_reports_recovery_instead_of_a_busy_operation() {
+        let lock = Arc::new(Mutex::new(()));
+        let worker_lock = lock.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = worker_lock.lock().unwrap();
+            panic!("fixture poisoned lock");
+        }).join();
+        assert!(try_relay_operation_lock(&lock).unwrap_err().contains("已损坏"));
+    }
 
     /// 进程级全局状态的测试锁。
     ///
@@ -7368,7 +7469,6 @@ base_url = "https://example.invalid/v1"
         assert!(config.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
     }
 
-    #[test]
     /// 回归（issue #1604）：用户点「重启 Codex++」走的就是这条同步路径。
     /// 现场遗留的 0 字节 auth.json 必须被修复成合法 JSON，否则仍然停在登录页。
     #[test]
@@ -7405,6 +7505,7 @@ base_url = "https://example.invalid/v1"
         );
     }
 
+    #[test]
     fn failed_active_relay_sync_does_not_spawn_or_change_live_files() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("config.toml"), "model = \"old\"\n").unwrap();
