@@ -1542,7 +1542,7 @@ async fn an_unrelated_helper_bind_error_is_reported_as_is() {
     );
 }
 
-/// macOS 允许端口释放竞态的六秒重试；其他平台的浮动端口仍立即失败。
+/// Windows/macOS 允许端口释放竞态的六秒重试；其他平台仍立即失败。
 #[tokio::test]
 async fn a_busy_floating_helper_port_respects_the_platform_retry_budget() {
     let temp = tempfile::tempdir().unwrap();
@@ -1572,7 +1572,7 @@ async fn a_busy_floating_helper_port_respects_the_platform_retry_budget() {
             .iter()
             .filter(|event| event.starts_with("start-helper-busy:"))
             .count(),
-        if cfg!(target_os = "macos") { 31 } else { 1 }
+        if cfg!(any(windows, target_os = "macos")) { 31 } else { 1 }
     );
     assert!(
         !events
@@ -1581,6 +1581,52 @@ async fn a_busy_floating_helper_port_respects_the_platform_retry_budget() {
             .iter()
             .any(|event| event.starts_with("launch:"))
     );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn ordinary_windows_helper_recovers_from_transient_forbidden_without_a_second_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    // 普通 helper 路径没有协议代理，复现首次绑定 10013 后再次点击才启动的分支。
+    let hooks = FakeHooks::new(events.clone()).with_helper_bind_forbidden_conflicts(3);
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions { app_dir: Some(app_dir), debug_port: 9229, helper_port: 58123, status_store },
+        &hooks,
+    ).await.unwrap();
+    handle.wait_for_codex_exit().await.unwrap();
+    let events = events.lock().unwrap();
+    assert_eq!(events.iter().filter(|event| *event == "start-helper-forbidden:58123").count(), 3);
+    assert_eq!(events.iter().filter(|event| *event == "start-helper:58123").count(), 1);
+    assert_eq!(events.iter().filter(|event| *event == "launch:9229").count(), 1);
+    assert!(!events.iter().any(|event| event == "start-helper:57321"));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn ordinary_windows_helper_persistent_forbidden_stops_after_a_bounded_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = FakeHooks::new(events.clone()).with_helper_bind_forbidden();
+    let error = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir), debug_port: 9229, helper_port: 58123,
+            status_store: StatusStore::new(temp.path().join("latest-status.json")),
+        },
+        &hooks,
+    ).await.unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("os error 10013"), "{message}");
+    assert!(message.contains("仍被系统拒绝"), "{message}");
+    assert!(!message.contains("被 Windows 保留"), "10013 alone cannot establish permanent reservation");
+    let events = events.lock().unwrap();
+    assert_eq!(events.iter().filter(|event| *event == "start-helper-forbidden:58123").count(), 31);
+    assert!(!events.iter().any(|event| event.starts_with("launch:")));
 }
 
 #[tokio::test]
