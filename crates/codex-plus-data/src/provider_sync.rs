@@ -1059,7 +1059,10 @@ where
             0,
             scanned_skipped_rollout_files.len(),
         );
+        let backup_started = std::time::Instant::now();
         let backup_dir = create_bulk_backup(&home, &target_provider, &rewrite_plans)?;
+        log_provider_sync_stage("backup", backup_started, rewrite_plans.len());
+        let rewrite_started = std::time::Instant::now();
         let applied = apply_bulk_session_rewrite_plans(
             &rewrite_plans,
             &target_provider,
@@ -1067,6 +1070,7 @@ where
             scanned_skipped_rollout_files.len(),
             &mut report_progress,
         )?;
+        log_provider_sync_stage("rewrite", rewrite_started, applied.changes.len());
         report_provider_sync_progress(
             &mut report_progress,
             ProviderSyncProgressPhase::UpdatingIndexes,
@@ -1076,6 +1080,7 @@ where
             applied.changes.len(),
             scanned_skipped_rollout_files.len() + applied.skipped_locked_rollout_files.len(),
         );
+        let indexes_started = std::time::Instant::now();
         let apply_result = (|| -> anyhow::Result<(SqliteUpdateCounts, usize)> {
             let sqlite_updates = apply_sqlite_update_for_paths(
                 &sqlite_paths,
@@ -1094,6 +1099,7 @@ where
             prune_backups(&home)?;
             Ok((sqlite_updates, updated_workspace_roots))
         })();
+        log_provider_sync_stage("indexes", indexes_started, sqlite_paths.len());
         let (sqlite_updates, updated_workspace_roots) = match apply_result {
             Ok(counts) => counts,
             Err(err) => {
@@ -1138,6 +1144,7 @@ where
         synced.encrypted_content_warning = encrypted_content_warning;
         synced.repair_audit = repair_audit;
         synced.message = provider_sync_message_with_audit(&synced.message, &synced.repair_audit);
+        let cache_started = std::time::Instant::now();
         if let Some(cache) = &mut scan_cache {
             for change in &applied.changes {
                 cache.refresh_rewritten(
@@ -1147,6 +1154,7 @@ where
             }
             cache.save(&home);
         }
+        log_provider_sync_stage("cache_refresh", cache_started, applied.changes.len());
         report_provider_sync_progress(
             &mut report_progress,
             ProviderSyncProgressPhase::Complete,
@@ -1168,6 +1176,13 @@ where
             0,
         )
     })
+}
+
+fn log_provider_sync_stage(stage: &str, started: std::time::Instant, items: usize) {
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+        "provider_sync.stage_completed",
+        json!({"stage": stage, "elapsed_ms": started.elapsed().as_millis(), "items": items}),
+    );
 }
 
 fn report_provider_sync_progress(
@@ -3630,10 +3645,14 @@ fn rewrite_bulk_session_plan(
     plan: &BulkSessionRewritePlan,
     target_provider: &str,
 ) -> anyhow::Result<Option<String>> {
-    if sha256_file(&plan.path)? != plan.original_sha256 {
-        return Ok(None);
-    }
+    rewrite_bulk_session_plan_before_revalidation(plan, target_provider, || {})
+}
 
+fn rewrite_bulk_session_plan_before_revalidation(
+    plan: &BulkSessionRewritePlan,
+    target_provider: &str,
+    before_revalidation: impl FnOnce(),
+) -> anyhow::Result<Option<String>> {
     let mut rewritten_sha256 = None;
     let write_result = codex_plus_core::settings::atomic_write_with(&plan.path, |file| {
         let mut writer = HashingWriter::new(BufWriter::new(file));
@@ -3643,6 +3662,9 @@ fn rewrite_bulk_session_plan(
             &mut writer,
         )?;
         writer.flush()?;
+        before_revalidation();
+        // 复制过程已完整计算来源 SHA；提交前再次核验原文件即可。
+        // 初始独立全文读取是重复工作，临时输出在两次核验通过前不会替换原文。
         if source_sha256 != plan.original_sha256 || sha256_file(&plan.path)? != plan.original_sha256
         {
             return Err(std::io::Error::other(BULK_SESSION_SOURCE_CHANGED_ERROR));
@@ -3681,7 +3703,14 @@ fn stream_rewrite_rollout_session_meta_providers<W: Write>(
             return Err(std::io::Error::other(BULK_SESSION_SOURCE_CHANGED_ERROR));
         }
         let mut bytes = vec![0; original.len()];
-        reader.read_exact(&mut bytes)?;
+        reader.read_exact(&mut bytes).map_err(|error| {
+            // 扫描后被截短也属于来源变化，安全跳过该文件并继续同步其他会话。
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                std::io::Error::other(BULK_SESSION_SOURCE_CHANGED_ERROR)
+            } else {
+                error
+            }
+        })?;
         hasher.update(&bytes);
         if bytes != original.as_bytes() || sha256_hex(&bytes) != location.sha256 {
             return Err(std::io::Error::other(BULK_SESSION_SOURCE_CHANGED_ERROR));
@@ -5573,6 +5602,71 @@ mod startup_scan_cache_tests {
     }
 
     #[test]
+    fn rewrite_rejects_same_size_body_change_after_copy_and_preserves_external_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(tmp.path(), "openai");
+        let plan = scan(tmp.path(), "custom", true).rewrite_plans.remove(0);
+        let original = fs::read_to_string(&path).unwrap();
+        let changed = original.replace("PRIVATE_CONVERSATION_CONTENT", "CHANGED_CONVERSATION_CONTENT");
+        assert_eq!(changed.len(), original.len());
+        let original_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        let rewritten = rewrite_bulk_session_plan_before_revalidation(&plan, "custom", || {
+            fs::write(&path, &changed).unwrap();
+            fs::File::options().write(true).open(&path).unwrap()
+                .set_times(fs::FileTimes::new().set_modified(original_mtime)).unwrap();
+        }).unwrap();
+        assert!(rewritten.is_none(), "a concurrent body change must cancel replacement");
+        assert_eq!(fs::read_to_string(&path).unwrap(), changed);
+        assert!(fs::read_to_string(&path).unwrap().contains("\"model_provider\":\"openai\""));
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn bidirectional_provider_switch_keeps_thread_identity_and_appended_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(tmp.path(), "openai");
+        let db = Connection::open(tmp.path().join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT, archived INTEGER, has_user_event INTEGER, cwd TEXT);").unwrap();
+        db.execute("INSERT INTO threads VALUES('thread-a','openai',0,1,'C:/work')", []).unwrap();
+        let official_items = json!({"type":"response_item","payload":{"type":"reasoning",
+            "id":"rs_original","encrypted_content":"opaque-original-state"}});
+        let tool_call = json!({"type":"response_item","payload":{"type":"function_call",
+            "id":"fc_original","call_id":"call_original","name":"example_tool","arguments":"{}"}});
+        let tool_output = json!({"type":"response_item","payload":{"type":"function_call_output",
+            "call_id":"call_original","output":"PRIVATE_TOOL_OUTPUT"}});
+        fs::OpenOptions::new().append(true).open(&path).unwrap()
+            .write_all(format!("{official_items}\r\n{tool_call}\r\n{tool_output}\r\n").as_bytes()).unwrap();
+        for (turn, provider) in ["custom", "openai", "relay-long-provider", "openai"].into_iter().enumerate() {
+            let before = fs::read(&path).unwrap();
+            let body_start = before.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+            let body = &before[body_start..];
+            fs::write(tmp.path().join("config.toml"), format!(
+                "model_provider = {provider:?}\n[model_providers.{provider}]\nname = {provider:?}\n")).unwrap();
+            let result = run_provider_sync_for_startup(Some(tmp.path()));
+            assert_eq!(result.status, ProviderSyncStatus::Synced, "{}", result.message);
+            assert_eq!(result.changed_session_files, 1);
+            assert!(result.skipped_locked_rollout_files.is_empty());
+            let after = fs::read(&path).unwrap();
+            let meta_end = after.iter().position(|byte| *byte == b'\n').unwrap();
+            let meta: Value = serde_json::from_slice(&after[..meta_end]).unwrap();
+            assert_eq!(meta["payload"]["id"], "thread-a");
+            assert_eq!(meta["payload"]["model_provider"], provider);
+            assert_eq!(&after[meta_end + 1..], body, "past messages, item IDs and tool links must stay byte-identical");
+            let row: (String, String, i64) = db.query_row(
+                "SELECT id,model_provider,archived FROM threads", [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+            assert_eq!(row, ("thread-a".into(), provider.into(), 0));
+            let continued = json!({"type":"event_msg","payload":{"type":"user_message",
+                "message":format!("continued-in-original-thread-{turn}")}});
+            fs::OpenOptions::new().append(true).open(&path).unwrap()
+                .write_all(format!("{continued}\n").as_bytes()).unwrap();
+        }
+        let history = fs::read_to_string(&path).unwrap();
+        for turn in 0..4 { assert!(history.contains(&format!("continued-in-original-thread-{turn}"))); }
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
     fn startup_cache_detects_append_and_deleted_or_moved_rollouts() {
         let tmp = tempfile::tempdir().unwrap();
         let path = fixture(tmp.path(), "openai");
@@ -5782,6 +5876,21 @@ mod startup_scan_cache_tests {
         assert_eq!(chunk_input_hash, format!("{:x}", legacy_source_hasher.finalize()));
         assert_eq!(chunk_writer.sha256_hex(), legacy_writer.sha256_hex());
         println!("rewrite-stream-benchmark bytes={original_size} legacy_ms={legacy_ms} chunk_ms={chunk_ms} input_and_output_hash_matched=true");
+        // 同一文件对照 1.5.4 的额外预读与 1.5.5 合并核验，两者都执行原子替换。
+        let mut rewrite_timings = Vec::new();
+        for extra_precheck in [true, false, false, true] {
+            let started = std::time::Instant::now();
+            if extra_precheck { assert_eq!(sha256_file(&path).unwrap(), plan.original_sha256); }
+            let rewritten_hash = rewrite_bulk_session_plan(&plan, "custom").unwrap().unwrap();
+            rewrite_timings.push((extra_precheck, started.elapsed().as_millis()));
+            assert_eq!(rewritten_hash, chunk_writer.sha256_hex());
+            restore_bulk_session_rewrite(&AppliedBulkSessionRewrite {
+                plan: plan.clone(), rewritten_sha256: rewritten_hash,
+            }).unwrap();
+            assert_eq!(sha256_file(&path).unwrap(), plan.original_sha256);
+        }
+        println!("atomic-rewrite-benchmark bytes={original_size} timings_extra_precheck_and_ms={rewrite_timings:?} output_hash_and_rollback_matched=true");
+        scan(tmp.path(), "openai", true).scan_cache.unwrap().save(tmp.path());
         for provider in ["custom", "relay-long-provider", "openai"] {
             fs::write(tmp.path().join("config.toml"), format!(
                 "model_provider = {provider:?}\n[model_providers.{provider}]\nname = {provider:?}\n")).unwrap();
