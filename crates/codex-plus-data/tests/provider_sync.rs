@@ -927,6 +927,39 @@ fn provider_sync_skips_rollout_locked_after_planning() {
     assert_eq!(fs::read(&rollout).unwrap(), original_rollout);
 }
 
+#[cfg(windows)]
+#[test]
+fn provider_sync_skips_readable_rollout_that_denies_replacement() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir(&home).unwrap();
+    write_provider_config(&home, "apigather");
+    let locked = home.join("sessions/rollout-a.jsonl");
+    let writable = home.join("sessions/rollout-b.jsonl");
+    write_rollout(&locked, "openai", "thread-a", "C:/workspace");
+    write_rollout(&writable, "openai", "thread-b", "C:/workspace");
+    let original = fs::read(&locked).unwrap();
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(&locked)
+        .unwrap();
+
+    let result = run_provider_sync(Some(&home));
+    assert_eq!(result.status, ProviderSyncStatus::Synced, "{}", result.message);
+    assert!(result.skipped_locked_rollout_files.contains(&locked));
+    assert_eq!(result.changed_session_files, 1);
+    assert_eq!(fs::read(&locked).unwrap(), original);
+    assert!(fs::read_to_string(&writable).unwrap().contains("apigather"));
+    drop(held);
+    let retry = run_provider_sync(Some(&home));
+    assert_eq!(retry.status, ProviderSyncStatus::Synced);
+    assert_eq!(retry.changed_session_files, 1);
+    assert!(fs::read_to_string(&locked).unwrap().contains("apigather"));
+}
+
 #[test]
 fn provider_sync_skips_rollout_changed_after_scanning() {
     let tmp = tempdir().unwrap();

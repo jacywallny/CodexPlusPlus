@@ -71,7 +71,7 @@ const MACOS_DEBUG_TAKEOVER_INTERVAL_MS: u64 = 100;
 /// 过去这里一次 bind 失败就整个启动中止，用户侧就是重启必失败、直接双击 exe 反而正常（issue #1933）。
 /// 所以固定端口下给前任一个让位的窗口。端口被占用，以及 Windows 在旧进程
 /// 退出瞬间暂时返回的 10013，都放在这一段里重试。窗口结束仍是 10013，
-/// 才当成端口被系统永久保留。
+/// 才提示检查端口占用与系统排除区间，不能单凭 10013 判定永久保留。
 const HELPER_BIND_RETRY_TIMEOUT_MS: u64 = 6_000;
 const PROTOCOL_PROXY_BIND_RETRY_TIMEOUT_MS: u64 = 10_000;
 const HELPER_BIND_RETRY_INTERVAL_MS: u64 = 200;
@@ -332,8 +332,8 @@ fn error_is_address_in_use(error: &anyhow::Error) -> bool {
 /// Windows 上 Hyper-V/WSL 会在开机时把动态端口范围（49152-65535）里的一段段端口
 /// 划进排除区间，落在区间里的端口 bind 报 os error 10013（PermissionDenied），
 /// 和「被进程占用」不是一回事。真正被排除区间划走时重试不会成功，
-/// 但重启瞬间旧套接字未放开也会暂时返回同一个错误，所以只有固定端口会在
-/// 有限窗口内重试，窗口结束后仍失败才给出对症指引。
+/// 但重启瞬间旧套接字未放开也会暂时返回同一个错误，所以 Windows 普通 helper
+/// 和固定代理端口都在有限窗口内重试，结束后仍失败才给出检查指引。
 fn error_is_bind_forbidden(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
@@ -371,16 +371,15 @@ fn describe_helper_bind_failure(
     if error_is_bind_forbidden(&error) {
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "helper.bind_forbidden_port",
-            serde_json::json!({ "helper_port": helper_port }),
+            serde_json::json!({ "helper_port": helper_port, "waited_ms": bind_retry_timeout_ms }),
         );
         if cfg!(windows) {
             return error.context(format!(
-                "helper 端口 {helper_port} 被 Windows 保留，无法绑定\
-                 （os error 10013，常见于 Hyper-V/WSL 开机划走的动态端口排除区间）。\
-                 请以管理员运行 netsh interface ipv4 show excludedportrange protocol=tcp \
-                 确认该端口是否在排除区间内，重启电脑通常可重新分配；\
-                 协议代理模式下也可以设置环境变量 CODEX_PLUS_PROTOCOL_PROXY_PORT \
-                 换一个端口后重试。"
+                "helper 端口 {helper_port} 等待 {} 秒后仍被系统拒绝绑定（os error 10013）。\
+                 这可能与端口占用、套接字释放或 Windows 端口排除区间有关。\
+                 请检查端口占用，并用 netsh interface ipv4 show excludedportrange protocol=tcp \
+                 核对排除区间；协议代理模式也可设置 CODEX_PLUS_PROTOCOL_PROXY_PORT 更换端口。",
+                bind_retry_timeout_ms / 1000
             ));
         }
         return error.context(format!(
@@ -431,10 +430,10 @@ where
     }
 }
 
-fn helper_bind_retry_timeout_ms(protocol_proxy_enabled: bool, is_macos: bool) -> u64 {
+fn helper_bind_retry_timeout_ms(protocol_proxy_enabled: bool, is_windows: bool, is_macos: bool) -> u64 {
     if protocol_proxy_enabled {
         PROTOCOL_PROXY_BIND_RETRY_TIMEOUT_MS
-    } else if is_macos {
+    } else if is_windows || is_macos {
         HELPER_BIND_RETRY_TIMEOUT_MS
     } else {
         0
@@ -490,6 +489,7 @@ pub async fn launch_and_inject_with_hooks<H>(
 where
     H: IntoLaunchHooks,
 {
+    let startup_started = std::time::Instant::now();
     let hooks = hooks.into_launch_hooks();
     let debug_port = hooks.select_debug_port(options.debug_port);
     let mut helper_port = hooks.select_helper_port(options.helper_port);
@@ -501,18 +501,23 @@ where
     let mut keep_launched_on_error = false;
 
     let result: anyhow::Result<LaunchHandle> = async {
+        let preparation_started = std::time::Instant::now();
         hooks.start_native_browser_compatibility(&settings).await;
         let home = crate::relay_config::default_codex_home_dir();
         hooks.cleanup_unsupported_config()?;
         crate::relay_config::ensure_windows_sandbox_usable_for_current_user(&home)?;
+        log_startup_stage("prepare_runtime", preparation_started);
         if settings.provider_sync_enabled {
+            let provider_started = std::time::Instant::now();
             crate::codex_app_state::capture_app_state_snapshot_nonfatal(&home, "launcher.before");
             hooks.run_provider_sync().await?;
             crate::codex_app_state::sync_app_state_after_provider_switch_nonfatal(
                 &home,
                 "launcher.after_provider_sync",
             );
+            log_startup_stage("provider_visibility_sync", provider_started);
         }
+        let services_started = std::time::Instant::now();
         if hooks.has_pending_remote_control_session_recoveries()
             && hooks.remote_control_session_recovery_is_safe_to_run()
         {
@@ -582,14 +587,14 @@ where
             helper_port = crate::protocol_proxy::protocol_proxy_port();
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
-            // macOS 重启时旧 launcher 的 socket 释放可能稍晚于进程退出。
+            // Windows/macOS 重启时 socket 释放可能稍晚于进程退出；普通 helper 也重试。
             let bind_retry_timeout_ms =
-                helper_bind_retry_timeout_ms(protocol_proxy_enabled, cfg!(target_os = "macos"));
+                helper_bind_retry_timeout_ms(protocol_proxy_enabled, cfg!(windows), cfg!(target_os = "macos"));
             start_helper_waiting_for_busy_port(
                 || hooks.start_helper(helper_port),
                 bind_retry_timeout_ms,
                 HELPER_BIND_RETRY_INTERVAL_MS,
-                protocol_proxy_enabled,
+                protocol_proxy_enabled || cfg!(windows),
             )
             .await
             .map_err(|error| {
@@ -603,13 +608,17 @@ where
             helper_started = true;
         }
 
+        log_startup_stage("prepare_services", services_started);
+        let launch_started = std::time::Instant::now();
         let launch = hooks
             .launch_codex(&app_dir, debug_port, &settings, &settings.codex_extra_args)
             .await?;
+        log_startup_stage("launch_application", launch_started);
         launched = Some(launch.clone());
         keep_launched_on_error = true;
 
         let mut injection_degraded = false;
+        let bridge_started = std::time::Instant::now();
         if settings.enhancements_enabled {
             let injection_ready = hooks
                 .ensure_injection(debug_port, helper_port, &app_dir)
@@ -648,6 +657,12 @@ where
             options.status_store.save_latest(&status)?;
             hooks.write_status("running").await;
         }
+        log_startup_stage("bridge_ready", bridge_started);
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.startup.completed",
+            serde_json::json!({"elapsed_ms": startup_started.elapsed().as_millis(),
+                "version": crate::version::VERSION, "bridge_degraded": injection_degraded}),
+        );
 
         Ok(LaunchHandle {
             debug_port,
@@ -680,6 +695,13 @@ where
             Err(error)
         }
     }
+}
+
+fn log_startup_stage(stage: &str, started: std::time::Instant) {
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "launcher.startup_stage.completed",
+        serde_json::json!({"stage": stage, "elapsed_ms": started.elapsed().as_millis()}),
+    );
 }
 
 fn relay_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
@@ -3637,18 +3659,19 @@ mod tests {
     }
 
     #[test]
-    fn helper_bind_retry_covers_fixed_proxy_ports_and_macos_restarts() {
+    fn helper_bind_retry_covers_fixed_proxy_ports_and_windows_macos_restarts() {
         assert_eq!(
-            helper_bind_retry_timeout_ms(true, false),
+            helper_bind_retry_timeout_ms(true, false, false),
             PROTOCOL_PROXY_BIND_RETRY_TIMEOUT_MS
         );
         assert_eq!(
-            helper_bind_retry_timeout_ms(false, true),
+            helper_bind_retry_timeout_ms(false, false, true),
             HELPER_BIND_RETRY_TIMEOUT_MS
         );
-        assert_eq!(helper_bind_retry_timeout_ms(false, false), 0);
+        assert_eq!(helper_bind_retry_timeout_ms(false, false, false), 0);
+        assert_eq!(helper_bind_retry_timeout_ms(false, true, false), HELPER_BIND_RETRY_TIMEOUT_MS);
         assert_eq!(
-            helper_bind_retry_timeout_ms(true, true),
+            helper_bind_retry_timeout_ms(true, true, false),
             PROTOCOL_PROXY_BIND_RETRY_TIMEOUT_MS
         );
     }
@@ -3747,7 +3770,8 @@ mod tests {
         assert!(message.contains("os error 10013"), "{message}");
         assert!(!message.contains("被其他进程占用"), "{message}");
         if cfg!(windows) {
-            assert!(message.contains("被 Windows 保留"), "{message}");
+            assert!(message.contains("仍被系统拒绝"), "{message}");
+            assert!(!message.contains("被 Windows 保留"), "{message}");
         }
     }
 
