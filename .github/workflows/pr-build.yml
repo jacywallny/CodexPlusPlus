@@ -1,78 +1,200 @@
-name: Compressed session fix Windows verification
+name: PR build artifacts
 
 on:
+  pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  windows-verification:
+  windows-artifacts:
+    name: Windows artifacts
     runs-on: windows-latest
-    timeout-minutes: 55
-    env:
-      CARGO_TERM_COLOR: never
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          fetch-depth: 0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: compressed-session-fix
-      - name: Reproduce compressed session disappearance on unpatched source
+          node-version: "22"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install NSIS
         shell: pwsh
         run: |
-          $sourcePath = 'crates/codex-plus-data/src/provider_sync.rs'
-          $patched = [IO.File]::ReadAllBytes($sourcePath)
-          try {
-            $original = git show "a5f531d0:$sourcePath"
-            if ($LASTEXITCODE -ne 0) { throw 'Cannot read the pinned baseline source' }
-            [IO.File]::WriteAllText($sourcePath, ($original -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
-            cargo test -p codex-plus-data --locked --test provider_sync compressed_rollouts_survive_repeated_sync_and_bidirectional_provider_switches -- --nocapture 2>&1 | Tee-Object baseline-regression.log
-            $baselineExit = $LASTEXITCODE
-            if ($baselineExit -eq 0) { throw 'Unpatched baseline unexpectedly passed' }
-            if (-not (Select-String -LiteralPath baseline-regression.log -SimpleMatch 'compressed_rollouts_survive_repeated_sync_and_bidirectional_provider_switches ... FAILED' -Quiet)) { throw 'Baseline did not reach the expected regression assertion' }
-          } finally {
-            [IO.File]::WriteAllBytes($sourcePath, $patched)
+          $makensis = $null
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            choco install nsis -y --no-progress
+            # Chocolatey 可能在下载失败后返回成功，必须实际验证编译器。
+            $candidates = @(
+              "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+              "$env:ProgramFiles\NSIS\makensis.exe"
+            )
+            $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+            if (-not $makensis) {
+              $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
+              if ($command) { $makensis = $command.Source }
+            }
+            if ($makensis) {
+              & $makensis /VERSION
+              if ($LASTEXITCODE -eq 0) { break }
+            }
+            $makensis = $null
+            if ($attempt -lt 3) { Start-Sleep -Seconds (10 * $attempt) }
           }
-          $global:LASTEXITCODE = 0
-      - name: Data regression suite
-        shell: pwsh
-        run: |
-          cargo test -p codex-plus-data --locked 2>&1 | Tee-Object data-regression.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Launcher regression suite
-        shell: pwsh
-        run: |
-          $env:CODEX_GATE_TEST_POWERSHELL = (Get-Command pwsh).Source
-          cargo test -p codex-plus-launcher --locked 2>&1 | Tee-Object launcher-regression.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not $makensis) { throw "NSIS 安装失败或编译器不可用，停止 PR 构建。" }
+
+      - name: Install frontend dependencies
+        working-directory: apps/codex-plus-manager
+        run: npm ci
+
+      - name: Frontend tests
+        working-directory: apps/codex-plus-manager
+        run: npm test
+
+      - name: Check native browser inspector bundle
+        run: node scripts/assemble-native-browser-inspector.mjs --check
+
+      - name: TypeScript check
+        working-directory: apps/codex-plus-manager
+        run: npm run check
+
       - name: Build frontend
         working-directory: apps/codex-plus-manager
-        run: |
-          npm ci --ignore-scripts --no-audit --no-fund
-          npm run check
-          npm run vite:build
-      - name: Build patched Windows application
-        run: |
-          cargo build --release --locked -p codex-plus-manager --bin codex-plus-plus
-          cargo build --release --locked -p codex-plus-data --example provider_sync_probe
-      - name: Hash application
+        run: npm run vite:build
+
+      - name: Rust tests
+        run: cargo test --workspace
+
+      - name: Build release application
+        run: cargo build --release
+
+      - name: Stage Windows app files
         shell: pwsh
-        run: Get-FileHash -Algorithm SHA256 -LiteralPath target/release/codex-plus-plus.exe | Format-List | Out-File -Encoding utf8 patched-application-sha256.txt
-      - uses: actions/upload-artifact@v4
-        if: always()
+        run: |
+          New-Item -ItemType Directory -Force dist/windows/app | Out-Null
+          Copy-Item target/release/codex-plus-plus.exe dist/windows/app/
+          if ((Get-ChildItem dist/windows/app -Filter *.exe).Count -ne 1) { throw "Windows 安装包必须只有一个应用程序。" }
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v", "V")
+          $version = $version -replace '[\\/]', '-'
+          if (-not $version -or $version -eq "main") {
+            $version = "0.0.0-${{ github.run_number }}"
+          }
+          # NSIS 的 64 位安装目录与 Chocolatey PATH 更新均需要兼容。
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+            "$env:ProgramFiles\NSIS\makensis.exe"
+          )
+          $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $makensis) {
+            $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
+            if ($command) { $makensis = $command.Source }
+          }
+          if (-not $makensis) {
+            throw "NSIS 编译器未找到，检查 Chocolatey 安装结果。"
+          }
+          Push-Location scripts/installer/windows
+          try {
+            & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" CodexPlusPlus.nsi
+            if ($LASTEXITCODE -ne 0) { throw "NSIS 打包失败，退出码 $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Upload Windows binaries
+        uses: actions/upload-artifact@v4
         with:
-          name: compressed-session-fix-windows
-          path: |
-            baseline-regression.log
-            data-regression.log
-            launcher-regression.log
-            patched-application-sha256.txt
-            target/release/codex-plus-plus.exe
-            target/release/examples/provider_sync_probe.exe
+          name: codex-plus-plus-windows-binaries
+          path: dist/windows/app/*
+          if-no-files-found: error
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-plus-plus-windows-installer
+          path: dist/windows/*.exe
+          if-no-files-found: error
+
+  macos-dmg:
+    # PR 构建也出通用包，跟发版产物保持一致，避免只在发版时才暴露问题。
+    # 没有签名密钥，所以这里走 ad-hoc（脚本的默认行为）。
+    name: macOS DMG (universal)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Install frontend dependencies
+        working-directory: apps/codex-plus-manager
+        run: npm ci
+
+      - name: Check native browser inspector bundle
+        run: node scripts/assemble-native-browser-inspector.mjs --check
+
+      - name: Build frontend
+        working-directory: apps/codex-plus-manager
+        run: npm run vite:build
+
+      - name: Build universal macOS DMG
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION#V}"
+          VERSION="${VERSION//\//-}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "main" ]; then
+            VERSION="0.0.0-${GITHUB_RUN_NUMBER}"
+          fi
+          # 未设置 MACOS_SIGNING_IDENTITY，脚本自动退回 ad-hoc 签名。
+          bash scripts/installer/macos/build-universal.sh "$VERSION"
+
+      - name: Verify macOS bundle structure
+        run: |
+          set -euo pipefail
+          test -L "dist/macos/stage/Applications"
+          test "$(readlink "dist/macos/stage/Applications")" = "/Applications"
+          apps=(dist/macos/stage/*.app)
+          test "${#apps[@]}" = "2"
+          test -f "dist/macos/stage/.hidden"
+          grep -qx "Codex++ 管理工具.app" "dist/macos/stage/.hidden"
+          for app in "dist/macos/stage/Codex++.app" "dist/macos/stage/Codex++ 管理工具.app"; do
+            test -f "$app/Contents/Info.plist"
+            test -f "$app/Contents/PkgInfo"
+            test -x "$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+            if [[ "$app" == *"管理工具.app" ]]; then
+              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "com.bigpizzav3.codexplusplus.manager"
+              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "CodexPlusPlusManager"
+            else
+              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "com.bigpizzav3.codexplusplus"
+              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "CodexPlusPlus"
+            fi
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CodexPlusUnifiedApp' "$app/Contents/Info.plist")" = "true"
+            plutil -lint "$app/Contents/Info.plist" >/dev/null
+            codesign -dv "$app" >/dev/null 2>&1
+            echo "verified: $app"
+          done
+
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-plus-plus-macos-universal-dmg
+          path: dist/macos/*.dmg
           if-no-files-found: error
