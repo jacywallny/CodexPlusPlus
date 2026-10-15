@@ -85,6 +85,84 @@ fn write_catalog_rollout(path: &Path) {
     fs::write(path, "").unwrap();
 }
 
+#[test]
+fn compressed_rollouts_survive_repeated_sync_and_bidirectional_provider_switches() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir_all(home.join("sqlite")).unwrap();
+    write_provider_config_with_tables(&home, "openai", &["custom"]);
+    let plain_path = home.join("sessions/rollout-thread-compressed.jsonl");
+    let compressed_path = plain_path.with_extension("jsonl.zst");
+    let body = concat!(
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-compressed\",\"model_provider\":\"openai\",\"cwd\":\"C:/workspace\"}}\r\n",
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"保留原始正文\"}}\r\n",
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"call-1\",\"arguments\":\"{}\"}}\n",
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-1\",\"output\":\"ok\"}}"
+    );
+    fs::create_dir_all(plain_path.parent().unwrap()).unwrap();
+    let compressed = zstd::stream::encode_all(body.as_bytes(), 3).unwrap();
+    fs::write(&compressed_path, &compressed).unwrap();
+    let state_db = home.join("state_5.sqlite");
+    let db = Connection::open(&state_db).unwrap();
+    db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT, archived INTEGER, has_user_event INTEGER, cwd TEXT, title TEXT, rollout_path TEXT, source TEXT, created_at_ms INTEGER, updated_at_ms INTEGER, thread_source TEXT, git_branch TEXT);").unwrap();
+    db.execute("INSERT INTO threads VALUES ('thread-compressed', 'openai', 0, 1, 'C:/workspace', 'Compressed Thread', ?1, 'cli', 100000, 200000, 'user', 'main')", [plain_path.to_string_lossy().as_ref()]).unwrap();
+    drop(db);
+    let catalog_db = home.join("sqlite/codex-dev.db");
+    create_local_thread_catalog_db(&catalog_db, &["thread-compressed"]);
+
+    for target in ["openai", "openai", "custom", "custom", "openai"] {
+        let result = run_provider_sync_with_target(Some(&home), Some(target));
+        assert_eq!(result.status, ProviderSyncStatus::Synced, "{result:?}");
+        if target == "openai" && result.changed_session_files == 0 {
+            assert_eq!(fs::read(&compressed_path).unwrap(), compressed);
+        }
+        assert!(!plain_path.exists(), "sync must preserve the compressed storage format");
+        let decoded = zstd::stream::decode_all(fs::File::open(&compressed_path).unwrap()).unwrap();
+        let expected = body.replace("\"model_provider\":\"openai\"", &format!("\"model_provider\":\"{target}\""));
+        assert_eq!(decoded, expected.as_bytes(), "only provider metadata may change");
+        let db = Connection::open(&catalog_db).unwrap();
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id='thread-compressed' AND model_provider=?1", [target], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1, "compressed session must stay in the sidebar after every startup sync");
+        assert_eq!(db.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)).unwrap(), "ok");
+    }
+}
+
+#[test]
+fn compressed_rollout_sync_restores_content_when_database_update_fails() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir_all(home.join("sessions")).unwrap();
+    write_provider_config_with_tables(&home, "custom", &["openai"]);
+    let path = home.join("sessions/rollout-rollback.jsonl.zst");
+    let body = b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-rollback\",\"model_provider\":\"openai\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\"}}\n";
+    fs::write(&path, zstd::stream::encode_all(body.as_slice(), 3).unwrap()).unwrap();
+    let db = Connection::open(home.join("state_5.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT, archived INTEGER, has_user_event INTEGER, cwd TEXT); INSERT INTO threads VALUES ('thread-rollback','openai',0,1,'C:/workspace'); CREATE TRIGGER fail_sync BEFORE UPDATE ON threads BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
+    drop(db);
+    let result = run_provider_sync(Some(&home));
+    assert_ne!(result.status, ProviderSyncStatus::Synced);
+    assert_eq!(zstd::stream::decode_all(fs::File::open(&path).unwrap()).unwrap(), body);
+}
+
+#[test]
+fn compressed_rollout_decode_failure_does_not_remove_catalog_rows() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir_all(home.join("sessions")).unwrap();
+    fs::create_dir_all(home.join("sqlite")).unwrap();
+    write_provider_config(&home, "openai");
+    let path = home.join("sessions/rollout-broken.jsonl.zst");
+    fs::write(&path, b"not a zstd frame").unwrap();
+    let catalog_db = home.join("sqlite/codex-dev.db");
+    create_local_thread_catalog_db(&catalog_db, &["thread-broken"]);
+    let before = fs::read(&path).unwrap();
+    let result = run_provider_sync(Some(&home));
+    assert_ne!(result.status, ProviderSyncStatus::Synced);
+    let db = Connection::open(&catalog_db).unwrap();
+    assert_eq!(db.query_row("SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id='thread-broken'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
 fn catalog_eligibility_thread_snapshot(path: &Path) -> Vec<serde_json::Value> {
     let db = Connection::open(path).unwrap();
     db.prepare(
