@@ -1,8 +1,6 @@
 name: Compressed session fix Windows verification
 
 on:
-  push:
-    branches: [codex/compressed-session-sync-fix-20261015]
   workflow_dispatch:
 
 permissions:
@@ -60,7 +58,9 @@ jobs:
           npm run check
           npm run vite:build
       - name: Build patched Windows application
-        run: cargo build --release --locked -p codex-plus-manager --bin codex-plus-plus
+        run: |
+          cargo build --release --locked -p codex-plus-manager --bin codex-plus-plus
+          cargo build --release --locked -p codex-plus-data --example provider_sync_probe
       - name: Hash application
         shell: pwsh
         run: Get-FileHash -Algorithm SHA256 -LiteralPath target/release/codex-plus-plus.exe | Format-List | Out-File -Encoding utf8 patched-application-sha256.txt
@@ -74,4 +74,5 @@ jobs:
             launcher-regression.log
             patched-application-sha256.txt
             target/release/codex-plus-plus.exe
+            target/release/examples/provider_sync_probe.exe
           if-no-files-found: error
