@@ -1911,12 +1911,8 @@ pub fn validate_provider_sync_routing(codex_home: Option<&Path>) -> anyhow::Resu
     if pending_recovery_journal(&home).is_some() {
         anyhow::bail!("供应商同步有未完成的恢复作业；请先完成恢复后再启动。");
     }
-    let mut providers = HashSet::new();
     let sqlite_paths = provider_sync_db_paths(&home);
-    for path in &sqlite_paths {
-        providers.extend(sqlite_provider_ids(&path)?);
-    }
-    let kinds = sqlite_provider_sync_thread_kinds(&sqlite_paths)?;
+    let mut kinds = sqlite_provider_sync_thread_kinds(&sqlite_paths)?;
     let scan = scan_bulk_session_rewrites(
         &home,
         &snapshot.target_provider,
@@ -1924,9 +1920,22 @@ pub fn validate_provider_sync_routing(codex_home: Option<&Path>) -> anyhow::Resu
         &kinds.explicit_user_thread_ids,
         &mut |_| {},
     )?;
+    kinds.subagent_thread_ids.extend(scan.subagent_thread_ids);
+    let mut sqlite_needs_sync = false;
+    for path in &sqlite_paths {
+        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        for (table, id_column) in [("threads", "id"), ("local_thread_catalog", "thread_id")] {
+            let columns = table_columns(&db, table)?;
+            if columns.contains(id_column) && columns.contains("model_provider") {
+                sqlite_needs_sync |= !provider_update_thread_ids(
+                    &db, table, id_column, &snapshot.target_provider, &kinds.subagent_thread_ids,
+                )?.is_empty();
+            }
+        }
+    }
     if !scan.rewrite_plans.is_empty()
         || !scan.skipped_locked_rollout_files.is_empty()
-        || providers.iter().any(|provider| provider != &snapshot.target_provider)
+        || sqlite_needs_sync
     {
         anyhow::bail!(
             "供应商切换尚未完成：历史路由与当前配置不一致，继续启动可能出现 Model provider not found 或错误认证；请修复历史供应商同步后重试。"
@@ -5140,7 +5149,7 @@ fn sqlite_provider_sync_thread_kinds(paths: &[PathBuf]) -> anyhow::Result<Provid
         if !path.exists() {
             continue;
         }
-        let db = Connection::open(path)?;
+        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         for (table, column) in [
             ("thread_spawn_edges", "child_thread_id"),
             ("agent_job_items", "assigned_thread_id"),

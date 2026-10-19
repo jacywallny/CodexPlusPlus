@@ -62,6 +62,23 @@ fn degraded_routing_check_rejects_previous_provider_even_when_its_table_exists()
 }
 
 #[test]
+fn routing_check_uses_rollout_subagent_exclusions_for_sqlite() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path();
+    fs::write(home.join("config.toml"), "# official provider\n").unwrap();
+    fs::create_dir(home.join("sessions")).unwrap();
+    fs::write(home.join("sessions/rollout-child.jsonl"), concat!(
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"model_provider\":\"custom\",\"source\":{\"subagent\":{\"thread_spawn\":{\"depth\":1}}}}}\n"
+    )).unwrap();
+    create_state_db_with_providers(&home.join("state_5.sqlite"), &[("child", "custom", 0)]);
+    codex_plus_data::validate_provider_sync_routing(Some(home)).unwrap();
+    let db = Connection::open(home.join("state_5.sqlite")).unwrap();
+    db.execute("INSERT INTO threads (id, model_provider, archived) VALUES ('user', 'custom', 0)", []).unwrap();
+    drop(db);
+    assert!(codex_plus_data::validate_provider_sync_routing(Some(home)).is_err());
+}
+
+#[test]
 fn pending_full_sync_journal_blocks_both_remote_control_writers_without_changes() {
     let temp=tempdir().unwrap();let home=temp.path().join("home");fs::create_dir_all(&home).unwrap();write_provider_config(&home,"apigather");
     let db=home.join("state_5.sqlite");create_state_db_with_providers(&db,&[("thread-1","openai",0)]);
