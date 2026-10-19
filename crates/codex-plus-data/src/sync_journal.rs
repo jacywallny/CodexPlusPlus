@@ -273,7 +273,7 @@ impl SyncJournal {
     }
     pub(crate) fn persist(&self) -> anyhow::Result<()> {
         crate::backup::private_atomic_write(&self.path, &serde_json::to_vec(self)?)?;
-        File::open(&self.path)?.sync_all()?;
+        crate::backup::sync_file(&self.path)?;
         Ok(())
     }
     pub(crate) fn commit(

@@ -154,7 +154,7 @@ impl BackupStore {
             &serde_json::to_vec_pretty(&payload)?,
         )?;
         pending.committed = true;
-        File::open(self.path_for(&token))?.sync_all()?;
+        sync_file(&self.path_for(&token))?;
         Ok((token, entries))
     }
 
@@ -358,6 +358,19 @@ pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Flush an existing file on every supported platform.
+///
+/// Windows rejects `FlushFileBuffers` for a read-only handle with
+/// `ERROR_ACCESS_DENIED`; opening the file read-write keeps the durability
+/// barrier valid for provider-sync backups and journals.
+pub(crate) fn sync_file(path: &Path) -> std::io::Result<()> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()
+}
+
 fn copy_hashed(
     reader: &mut impl Read,
     writer: &mut impl Write,
@@ -389,6 +402,15 @@ fn hash_file(path: &Path) -> anyhow::Result<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_file_flushes_an_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("flush-test.bin");
+        std::fs::write(&path, b"provider-sync").unwrap();
+        sync_file(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"provider-sync");
+    }
     #[test]
     fn copy_is_bounded_and_writer_failure_is_propagated() {
         struct Large {
