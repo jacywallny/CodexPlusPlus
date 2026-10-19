@@ -1923,6 +1923,9 @@ pub fn validate_provider_sync_routing(codex_home: Option<&Path>) -> anyhow::Resu
     kinds.subagent_thread_ids.extend(scan.subagent_thread_ids);
     let mut sqlite_needs_sync = false;
     for path in &sqlite_paths {
+        if !path.exists() {
+            continue;
+        }
         let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         for (table, id_column) in [("threads", "id"), ("local_thread_catalog", "thread_id")] {
             let columns = table_columns(&db, table)?;

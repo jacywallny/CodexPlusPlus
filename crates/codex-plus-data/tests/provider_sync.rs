@@ -62,6 +62,14 @@ fn degraded_routing_check_rejects_previous_provider_even_when_its_table_exists()
 }
 
 #[test]
+fn routing_check_accepts_a_new_official_home_without_creating_a_database() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("config.toml"), "# official provider\n").unwrap();
+    codex_plus_data::validate_provider_sync_routing(Some(tmp.path())).unwrap();
+    assert!(!tmp.path().join("state_5.sqlite").exists());
+}
+
+#[test]
 fn routing_check_uses_rollout_subagent_exclusions_for_sqlite() {
     let tmp = tempdir().unwrap();
     let home = tmp.path();
