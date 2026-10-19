@@ -1078,16 +1078,18 @@ impl LaunchHooks for LauncherHooks {
     }
 
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
-        // issue #2160：同步失败不再中断启动。前置读取（典型是 .codex-global-state.json
-        // 为空或被截断）失败时，provider sync 返回 Skipped 并带上底层 serde_json 原文；
-        // 以前这里用 `?` 把它变成致命的，用户看到一句无从下手的英文就直接退出了。
-        // 口径与 run_activation_provider_sync 一致：失败只记诊断日志，不阻断启动。
+        // #2160 的非路由故障仍可降级，但 #2612 失败不能留下缺少 provider 的旧路由。
+        // 已运行 App 的保护性跳过不应中断激活流程，也不能绕过活跃写入保护。
         self.index_repair_due.store(true, Ordering::SeqCst);
         let started = std::time::Instant::now();
-        let outcome =
-            tokio::task::spawn_blocking(|| codex_plus_data::run_provider_sync(None)).await;
+        let outcome = tokio::task::spawn_blocking(|| {
+            let desktop_running = !codex_plus_core::watcher::find_session_index_cleanup_blocking_processes().is_empty();
+            let result = codex_plus_data::run_provider_sync(None);
+            let routing = validate_startup_provider_sync_routing(&result, None, desktop_running);
+            (result, routing)
+        }).await;
         match outcome {
-            Ok(result) => {
+            Ok((result, routing)) => {
                 let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
                     "launcher.startup_phase",
                     json!({
@@ -1106,6 +1108,7 @@ impl LaunchHooks for LauncherHooks {
                         }),
                     );
                 }
+                routing?;
             }
             Err(error) => {
                 let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
@@ -1120,6 +1123,7 @@ impl LaunchHooks for LauncherHooks {
                     "launcher.provider_sync.degraded",
                     json!({ "message": format!("provider sync task failed: {error}") }),
                 );
+                return Err(anyhow::anyhow!("供应商同步任务异常终止，未启动 Codex：{error}"));
             }
         }
         // The pending repair survives degraded sync and runs after injection,
@@ -1417,6 +1421,25 @@ fn require_completed_provider_sync(
         return Ok(());
     }
     anyhow::bail!("provider sync did not complete ({status:?}): {message}")
+}
+
+fn validate_startup_provider_sync_routing(
+    result: &codex_plus_data::ProviderSyncResult,
+    home: Option<&std::path::Path>,
+    desktop_running: bool,
+) -> anyhow::Result<()> {
+    if desktop_running {
+        return Ok(());
+    }
+    if result.status == codex_plus_data::ProviderSyncStatus::PartialFailure {
+        anyhow::bail!("供应商同步未完整回滚，未启动 Codex；请先恢复同步作业。");
+    }
+    if result.status != codex_plus_data::ProviderSyncStatus::Synced
+        || !result.skipped_locked_rollout_files.is_empty()
+    {
+        codex_plus_data::validate_provider_sync_routing(home)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -2083,10 +2106,9 @@ mod tests {
         }
     }
 
-    /// issue #2160：判定函数仍然把不完整同步视作失败，但启动路径必须把它降级成
-    /// 一条诊断日志——.codex-global-state.json 坏掉不能把整次启动带下去。
+    /// #2160 的降级保留，但必须先验证路由，不能吞掉 #2612 的迁移失败。
     #[test]
-    fn startup_provider_sync_failure_is_non_fatal() {
+    fn startup_provider_sync_failure_checks_routing_before_launch() {
         let source = include_str!("main.rs");
         let start = source
             .find("async fn run_provider_sync(&self)")
@@ -2097,11 +2119,8 @@ mod tests {
             .expect("next method after the hook");
         let body = &source[start..end];
 
-        // 不再用 `?` 把同步失败变成致命错误。
-        assert!(
-            !body.contains("require_completed_provider_sync(&result.status, &result.message)?"),
-            "provider sync 失败不得中断启动"
-        );
+        assert!(body.contains("validate_startup_provider_sync_routing(&result, None, desktop_running)"));
+        assert!(body.contains("routing?;"));
         assert!(
             body.contains("launcher.provider_sync.degraded"),
             "降级要留下诊断日志"
@@ -2110,6 +2129,35 @@ mod tests {
         assert!(body.contains("self.index_repair_due.store(true, Ordering::SeqCst)"));
         assert!(!body.contains("repair_session_index_automatically("));
         assert!(body.trim_end().ends_with("Ok(())\n    }"));
+    }
+
+    #[test]
+    fn failed_sync_with_missing_custom_blocks_cold_launch_but_preserves_active_app() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        std::fs::write(home.join("config.toml"), "# official provider\n").unwrap();
+        std::fs::write(home.join(".codex-global-state.json"), "{").unwrap();
+        std::fs::create_dir(home.join("sessions")).unwrap();
+        std::fs::write(home.join("sessions/rollout-fixture.jsonl"), concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"fixture\",\"model_provider\":\"custom\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\"}}\n"
+        )).unwrap();
+        let result = codex_plus_data::run_provider_sync(Some(home));
+        assert_ne!(result.status, codex_plus_data::ProviderSyncStatus::Synced);
+        let error = validate_startup_provider_sync_routing(&result, Some(home), false).unwrap_err();
+        assert!(error.to_string().contains("Model provider not found"));
+        assert!(validate_startup_provider_sync_routing(&result, Some(home), true).is_ok());
+    }
+
+    #[test]
+    fn corrupt_global_state_can_still_degrade_when_provider_routing_is_consistent() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        std::fs::write(home.join("config.toml"), "# official provider\n").unwrap();
+        std::fs::write(home.join(".codex-global-state.json"), "{").unwrap();
+        let result = codex_plus_data::run_provider_sync(Some(home));
+        assert_ne!(result.status, codex_plus_data::ProviderSyncStatus::Synced);
+        assert!(validate_startup_provider_sync_routing(&result, Some(home), false).is_ok());
     }
 
     #[test]

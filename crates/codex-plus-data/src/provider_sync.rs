@@ -1892,6 +1892,43 @@ pub fn validate_provider_sync_target(
         .map(|snapshot| snapshot.target_provider)
 }
 
+/// 同步降级后只读核验路由，避免启动后才报 `Model provider ... not found`。
+/// 即使旧 provider 仍有表定义，也不能把它当作已切到当前供应商。
+pub fn validate_provider_sync_routing(codex_home: Option<&Path>) -> anyhow::Result<()> {
+    let home = codex_home
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_codex_home_dir);
+    let config_path = home.join("config.toml");
+    let snapshot = resolve_provider_sync_target_snapshot(&config_path, None)
+        .map_err(anyhow::Error::msg)?;
+    if pending_recovery_journal(&home).is_some() {
+        anyhow::bail!("供应商同步有未完成的恢复作业；请先完成恢复后再启动。");
+    }
+    let mut providers = HashSet::new();
+    let sqlite_paths = provider_sync_db_paths(&home);
+    for path in &sqlite_paths {
+        providers.extend(sqlite_provider_ids(&path)?);
+    }
+    let kinds = sqlite_provider_sync_thread_kinds(&sqlite_paths)?;
+    let scan = scan_bulk_session_rewrites(
+        &home,
+        &snapshot.target_provider,
+        &kinds.subagent_thread_ids,
+        &kinds.explicit_user_thread_ids,
+        &mut |_| {},
+    )?;
+    if !scan.rewrite_plans.is_empty()
+        || !scan.skipped_locked_rollout_files.is_empty()
+        || providers.iter().any(|provider| provider != &snapshot.target_provider)
+    {
+        anyhow::bail!(
+            "供应商切换尚未完成：历史路由与当前配置不一致，继续启动可能出现 Model provider not found 或错误认证；请修复历史供应商同步后重试。"
+        );
+    }
+    revalidate_provider_sync_target_snapshot(&config_path, None, &snapshot)
+        .map_err(anyhow::Error::msg)
+}
+
 pub fn load_provider_sync_targets(codex_home: Option<&Path>) -> ProviderSyncTargetList {
     let home = codex_home
         .map(Path::to_path_buf)
@@ -2531,12 +2568,14 @@ fn scan_bulk_session_rewrites_with_parser(
             Err(error) => return Err(error.into()),
         };
 
-        let mut reader = BufReader::with_capacity(64 * 1024, file);
+        let compressed = is_compressed_rollout(path);
+        // 压缩流不可 seek；扫描时直接计算解压内容的摘要。
+        let mut reader = rollout_reader_from_file(path, file)?;
         let (facts, mut original_sha256) = scan_bulk_rollout(
             &mut reader,
             target_provider,
             &parse_record,
-            hash_all_sources,
+            hash_all_sources || compressed,
         )?;
         let is_explicit_user = facts
             .thread_id
@@ -2549,6 +2588,7 @@ fn scan_bulk_session_rewrites_with_parser(
                     .as_ref()
                     .is_some_and(|id| excluded_thread_ids.contains(id)));
         if facts.rewrite_needed && !excluded && original_sha256.is_none() {
+            let mut reader = BufReader::new(File::open(path)?);
             original_sha256 = Some(hash_bulk_rollout_plan(
                 &mut reader,
                 target_provider,
@@ -2743,7 +2783,7 @@ fn resolve_active_rollout_path(home: &Path, value: &str) -> Option<PathBuf> {
     // issue #1424：WSL 智能体环境下 codex 写进 threads.rollout_path 的是 WSL 视角
     // 路径（/mnt/c/...），Windows 侧进程按原样读不到；删除链路早已做视角互转（#162），
     // 会话修复这里也要回退一次，否则 WSL 下找不到 rollout 直接判定会话不可修复。
-    for candidate in rollout_path_candidates(home, raw) {
+    for candidate in rollout_storage_path_candidates(home, raw) {
         let Some(canonical) = fs::canonicalize(&candidate).ok() else {
             continue;
         };
@@ -2778,6 +2818,61 @@ fn rollout_path_candidates(home: &Path, raw: &str) -> Vec<PathBuf> {
     candidates
 }
 
+fn is_compressed_rollout(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".jsonl.zst"))
+}
+
+/// 索引可能仍记录压缩前的 .jsonl 路径；保留原有路径视角转换，再补查压缩文件。
+fn rollout_storage_path_candidates(home: &Path, raw: &str) -> Vec<PathBuf> {
+    rollout_path_candidates(home, raw)
+        .into_iter()
+        .flat_map(|path| {
+            let compressed = (path.extension().is_some_and(|ext| ext == "jsonl"))
+                .then(|| path.with_extension("jsonl.zst"));
+            std::iter::once(path).chain(compressed)
+        })
+        .collect()
+}
+
+fn rollout_reader_from_file(path: &Path, file: File) -> std::io::Result<Box<dyn BufRead>> {
+    if is_compressed_rollout(path) {
+        Ok(Box::new(BufReader::with_capacity(
+            64 * 1024,
+            zstd::stream::read::Decoder::new(file)?,
+        )))
+    } else {
+        Ok(Box::new(BufReader::with_capacity(64 * 1024, file)))
+    }
+}
+
+fn open_rollout_reader(path: &Path) -> std::io::Result<Box<dyn BufRead>> {
+    rollout_reader_from_file(path, File::open(path)?)
+}
+
+fn read_rollout_text(path: &Path) -> std::io::Result<String> {
+    let mut text = String::new();
+    open_rollout_reader(path)?.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// 摘要与回滚都基于解压后的精确内容；写回时保持原路径及压缩存储格式。
+fn with_rollout_writer<T>(
+    path: &Path,
+    file: &mut File,
+    write: impl FnOnce(&mut dyn Write) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    if is_compressed_rollout(path) {
+        let mut encoder = zstd::stream::write::Encoder::new(file, 3)?;
+        let result = write(&mut encoder)?;
+        encoder.finish()?.flush()?;
+        Ok(result)
+    } else {
+        write(file)
+    }
+}
+
 /// 判断某一路径视角是否本身就是绝对路径（issue #1424）。
 ///
 /// 不能直接用 `Path::is_absolute()`：它按**当前宿主**的规则判断，而这里两种视角
@@ -2795,7 +2890,7 @@ fn rollout_view_is_absolute(view: &str) -> bool {
 fn rollout_provider_state_for_path(
     path: &Path,
 ) -> anyhow::Result<Option<(String, HashSet<String>)>> {
-    let text = match fs::read_to_string(path) {
+    let text = match read_rollout_text(path) {
         Ok(text) => text,
         Err(error) if is_locked_io_error(&error) => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -2810,7 +2905,7 @@ fn collect_session_change_for_path(
     thread_id: &str,
 ) -> anyhow::Result<SessionChanges> {
     let mut collected = SessionChanges::default();
-    let text = match fs::read_to_string(path) {
+    let text = match read_rollout_text(path) {
         Ok(text) => text,
         Err(error) if is_locked_io_error(&error) => {
             collected
@@ -2963,7 +3058,7 @@ fn collect_live_thread_ids(
             Err(error) if is_locked_io_error(&error) => continue,
             Err(error) => return Err(error.into()),
         };
-        let mut reader = BufReader::new(file);
+        let mut reader = rollout_reader_from_file(&path, file)?;
         let mut line = String::new();
         loop {
             line.clear();
@@ -2995,6 +3090,7 @@ fn collect_live_thread_ids(
 }
 
 fn rollout_thread_id_from_filename(name: &str) -> Option<String> {
+    let name = name.strip_suffix(".zst").unwrap_or(name);
     let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
     let bytes = stem.as_bytes();
     if bytes.len() < 36 {
@@ -4144,7 +4240,7 @@ fn rollout_provider_ids(home: &Path) -> anyhow::Result<Vec<String>> {
             Err(error) if is_locked_io_error(&error) => continue,
             Err(error) => return Err(error.into()),
         };
-        let mut reader = BufReader::new(file);
+        let mut reader = rollout_reader_from_file(&path, file)?;
         let mut line = String::new();
         loop {
             line.clear();
@@ -4182,9 +4278,13 @@ fn collect_rollout_files(root: &Path, files: &mut Vec<PathBuf>) -> anyhow::Resul
         } else if path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+            .is_some_and(|name| name.starts_with("rollout-")
+                && (name.ends_with(".jsonl") || name.ends_with(".jsonl.zst")))
         {
-            files.push(path);
+            // 如果压缩前后的文件同时存在，沿用原生的未压缩文件，避免重复迁移同一会话。
+            if !is_compressed_rollout(&path) || !path.with_extension("").is_file() {
+                files.push(path);
+            }
         }
     }
     Ok(())
@@ -4591,18 +4691,19 @@ fn rewrite_bulk_session_plan(
 
     let mut rewritten_sha256 = None;
     let write_result = codex_plus_core::settings::atomic_write_with(&plan.path, |file| {
-        let mut writer = HashingWriter::new(BufWriter::new(file));
-        let source_sha256 = stream_rewrite_rollout_session_meta_providers(
-            &plan.path,
-            target_provider,
-            &mut writer,
-        )?;
-        writer.flush()?;
+        let (source_sha256, written_sha256) = with_rollout_writer(&plan.path, file, |output| {
+            let mut writer = HashingWriter::new(BufWriter::new(output));
+            let source_sha256 = stream_rewrite_rollout_session_meta_providers(
+                &plan.path, target_provider, &mut writer,
+            )?;
+            writer.flush()?;
+            Ok((source_sha256, writer.sha256_hex()))
+        })?;
         if source_sha256 != plan.original_sha256 || sha256_file(&plan.path)? != plan.original_sha256
         {
             return Err(std::io::Error::other(BULK_SESSION_SOURCE_CHANGED_ERROR));
         }
-        rewritten_sha256 = Some(writer.sha256_hex());
+        rewritten_sha256 = Some(written_sha256);
         Ok(())
     });
     match write_result {
@@ -4617,8 +4718,7 @@ fn stream_rewrite_rollout_session_meta_providers<W: Write>(
     target_provider: &str,
     writer: &mut W,
 ) -> std::io::Result<String> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let mut reader = open_rollout_reader(path)?;
     let mut line = String::new();
     let mut hasher = Sha256::new();
     loop {
@@ -4673,19 +4773,20 @@ fn restore_bulk_session_rewrite(change: &AppliedBulkSessionRewrite) -> anyhow::R
     }
 
     codex_plus_core::settings::atomic_write_with(&change.plan.path, |file| {
-        let mut writer = HashingWriter::new(BufWriter::new(file));
-        let source_sha256 = stream_restore_rollout_session_meta_lines(
-            &change.plan.path,
-            &change.plan.original_session_meta_lines,
-            &mut writer,
-        )?;
-        writer.flush()?;
+        let (source_sha256, restored_sha256) = with_rollout_writer(&change.plan.path, file, |output| {
+            let mut writer = HashingWriter::new(BufWriter::new(output));
+            let source_sha256 = stream_restore_rollout_session_meta_lines(
+                &change.plan.path, &change.plan.original_session_meta_lines, &mut writer,
+            )?;
+            writer.flush()?;
+            Ok((source_sha256, writer.sha256_hex()))
+        })?;
         if source_sha256 != change.rewritten_sha256
             || sha256_file(&change.plan.path)? != change.rewritten_sha256
         {
             return Err(std::io::Error::other(BULK_SESSION_SOURCE_CHANGED_ERROR));
         }
-        if writer.sha256_hex() != change.plan.original_sha256 {
+        if restored_sha256 != change.plan.original_sha256 {
             return Err(std::io::Error::other("rollout rollback hash mismatch"));
         }
         Ok(())
@@ -4716,8 +4817,7 @@ fn stream_restore_rollout_session_meta_lines<W: Write>(
     original_session_meta_lines: &[String],
     writer: &mut W,
 ) -> std::io::Result<String> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let mut reader = open_rollout_reader(path)?;
     let mut line = String::new();
     let mut hasher = Sha256::new();
     let mut originals = original_session_meta_lines.iter();
@@ -4761,7 +4861,7 @@ fn stream_restore_rollout_session_meta_lines<W: Write>(
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut reader = BufReader::new(File::open(path)?);
+    let mut reader = open_rollout_reader(path)?;
     let mut buffer = [0_u8; 64 * 1024];
     let mut hasher = Sha256::new();
     loop {
@@ -4932,19 +5032,32 @@ fn replace_session_text_if_unchanged(
     let mut file = open_session_file_for_update(path)?;
     file.try_lock()?;
     let mut current_text = String::new();
-    file.read_to_string(&mut current_text)?;
+    if is_compressed_rollout(path) {
+        zstd::stream::read::Decoder::new(&mut file)?.read_to_string(&mut current_text)?;
+    } else {
+        file.read_to_string(&mut current_text)?;
+    }
     if current_text != expected_text {
         return Ok(false);
     }
 
+    let next_bytes = if is_compressed_rollout(path) {
+        zstd::stream::encode_all(next_text.as_bytes(), 3)?
+    } else {
+        next_text.as_bytes().to_vec()
+    };
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;
-    file.write_all(next_text.as_bytes())?;
+    file.write_all(&next_bytes)?;
     file.flush()?;
 
     file.seek(SeekFrom::Start(0))?;
     let mut persisted_text = String::new();
-    file.read_to_string(&mut persisted_text)?;
+    if is_compressed_rollout(path) {
+        zstd::stream::read::Decoder::new(&mut file)?.read_to_string(&mut persisted_text)?;
+    } else {
+        file.read_to_string(&mut persisted_text)?;
+    }
     if persisted_text != next_text {
         return Err(std::io::Error::other(
             "rollout changed while provider metadata was being written",
@@ -4987,7 +5100,7 @@ fn sqlite_provider_ids(path: &Path) -> anyhow::Result<Vec<String>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let db = Connection::open(path)?;
+    let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let mut ids = HashSet::new();
     for table in ["threads", "local_thread_catalog"] {
         let columns = table_columns(&db, table)?;
@@ -5850,7 +5963,7 @@ fn catalog_rollout_path_exists(home: &Path, rollout_path: &str) -> bool {
     }
     // issue #1424：WSL 视角路径（/mnt/c/...）在 Windows 侧读不到，放宽到两种视角
     // 都试一次。这个函数只影响「会话是否算可修复候选」，放宽只会多保留记录、不删数据。
-    rollout_path_candidates(home, rollout_path)
+    rollout_storage_path_candidates(home, rollout_path)
         .iter()
         .any(|path| path.is_file())
 }
@@ -7557,6 +7670,41 @@ mod lock_state_tests {
 #[cfg(test)]
 mod rollout_path_view_tests {
     use super::*;
+
+    #[test]
+    fn compressed_catalog_path_and_active_rollout_resolve_from_plain_index_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let plain = home.join("sessions/rollout-compressed.jsonl");
+        fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        let compressed = plain.with_extension("jsonl.zst");
+        fs::write(&compressed, zstd::stream::encode_all(b"{}\n".as_slice(), 3).unwrap()).unwrap();
+        assert!(catalog_rollout_path_exists(home, plain.to_str().unwrap()));
+        assert!(catalog_rollout_path_exists(home, compressed.to_str().unwrap()));
+        assert_eq!(resolve_active_rollout_path(home, plain.to_str().unwrap()), Some(fs::canonicalize(&compressed).unwrap()));
+        assert_eq!(rollout_files(home).unwrap(), vec![compressed.clone()]);
+        fs::write(&plain, "{}\n").unwrap();
+        assert_eq!(rollout_files(home).unwrap(), vec![plain]);
+    }
+
+    #[test]
+    fn compressed_thread_repair_preserves_body_and_detects_concurrent_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rollout-thread.jsonl.zst");
+        let original = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"t\",\"model_provider\":\"openai\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\"}}\n";
+        fs::write(&path, zstd::stream::encode_all(original.as_bytes(), 3).unwrap()).unwrap();
+        let changes = collect_session_change_for_path(&path, "custom", "openai", "t").unwrap();
+        assert_eq!(changes.changes.len(), 1);
+        let applied = apply_session_changes(&changes.changes).unwrap();
+        assert_eq!(applied.changes.len(), 1);
+        assert!(rollout_file_matches_provider(&path, "t", "custom").unwrap());
+        let updated = read_rollout_text(&path).unwrap();
+        assert_eq!(updated, original.replace("openai", "custom"));
+        let concurrent = updated.replace("custom", "other1");
+        fs::write(&path, zstd::stream::encode_all(concurrent.as_bytes(), 3).unwrap()).unwrap();
+        assert!(!replace_session_text_if_unchanged(&path, &updated, original).unwrap());
+        assert_eq!(read_rollout_text(&path).unwrap(), concurrent);
+    }
 
     /// issue #1424：rollout 路径要按「原样 → 另一种视角」给候选，两种都试。
     #[test]
