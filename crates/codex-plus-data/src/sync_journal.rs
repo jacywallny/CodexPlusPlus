@@ -1,7 +1,6 @@
 //! 同步补偿日志：只恢复本操作改过且仍等于本操作后值的行/列，不恢复整份数据库。
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
     path::{Path, PathBuf},
 };
 

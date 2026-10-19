@@ -1120,14 +1120,33 @@ fn provider_sync_continues_rollback_after_a_conflicted_rollout() {
 #[cfg(windows)]
 #[test]
 fn provider_sync_skips_rollout_locked_after_planning() {
+    assert_rollout_locked_after_planning_is_skipped(false);
+}
+
+#[cfg(windows)]
+#[test]
+fn provider_sync_skips_compressed_rollout_locked_after_planning() {
+    assert_rollout_locked_after_planning_is_skipped(true);
+}
+
+#[cfg(windows)]
+fn assert_rollout_locked_after_planning_is_skipped(compressed: bool) {
     use std::os::windows::fs::OpenOptionsExt;
 
     let tmp = tempdir().unwrap();
     let home = tmp.path().join(".codex");
     fs::create_dir(&home).unwrap();
     write_provider_config(&home, "apigather");
-    let rollout = home.join("sessions/rollout-locked.jsonl");
-    write_rollout(&rollout, "openai", "thread-1", "C:/workspace");
+    let plain = home.join("sessions/rollout-locked.jsonl");
+    write_rollout(&plain, "openai", "thread-1", "C:/workspace");
+    let rollout = if compressed {
+        let path = plain.with_extension("jsonl.zst");
+        fs::write(&path, zstd::stream::encode_all(fs::read(&plain).unwrap().as_slice(), 3).unwrap()).unwrap();
+        fs::remove_file(&plain).unwrap();
+        path
+    } else {
+        plain
+    };
     let original_rollout = fs::read(&rollout).unwrap();
     let mut held_rollout: Option<fs::File> = None;
 
@@ -1145,7 +1164,7 @@ fn provider_sync_skips_rollout_locked_after_planning() {
 
     assert!(held_rollout.is_some());
     drop(held_rollout);
-    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert_eq!(result.status, ProviderSyncStatus::Synced, "{result:?}");
     assert!(result.skipped_locked_rollout_files.contains(&rollout));
     assert_eq!(fs::read(&rollout).unwrap(), original_rollout);
 }
