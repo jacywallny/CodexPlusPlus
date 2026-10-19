@@ -666,6 +666,7 @@ type RelaySwitchResult = CommandResult<{
   settingsPath: string;
   user_scripts: unknown;
   relay: RelayPayload;
+  requiresRestart: boolean;
 }>;
 
 type SettingsBackfillResult = CommandResult<{
@@ -3120,11 +3121,17 @@ export function App() {
     });
     setRelaySwitching(true);
     try {
-      const result = await run(() =>
+      let result = await run(() =>
         call<RelaySwitchResult>("switch_relay_profile", {
           request: { settings: switchSettings, previousActiveRelayId },
         }),
       );
+      if (result?.requiresRestart && !isSuccessStatus(result.status)) {
+        if (!window.confirm(t("切换供应商需要重启 Codex，正在进行的任务会中断。是否继续？"))) return;
+        result = await run(() => call<RelaySwitchResult>("switch_relay_profile", {
+          request: { settings: switchSettings, previousActiveRelayId, confirmedRestart: true },
+        }));
+      }
       if (!result) {
         logDiagnostic("switchRelayProfile.apply_no_result", {
           targetRelayId: selectedAfterSave.id,
@@ -3162,6 +3169,9 @@ export function App() {
         targetRelayId: currentSelected.id,
         status: result.status,
       });
+      if (result.requiresRestart) {
+        await restart(true);
+      }
     } finally {
       setRelaySwitching(false);
     }

@@ -5,6 +5,43 @@ use codex_plus_core::settings::{
 };
 
 #[test]
+fn prepared_switch_preserves_live_provider_and_auth_until_after_app_exit() {
+    use codex_plus_core::relay_switch::prepare_relay_profile_switch_in_home;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let store = SettingsStore::new(temp.path().join("settings.json"));
+    let api = pure_profile("api", "https://example.invalid/v1", "test-only-key");
+    let official = RelayProfile { id: "official".into(), name: "Official".into(), relay_mode: RelayMode::Official, auth_contents: "{}".into(), ..RelayProfile::default() };
+    let original = BackendSettings { relay_profiles_enabled: true, active_relay_id: "api".into(), relay_profiles: vec![api, official], ..BackendSettings::default() };
+    store.save(&original).unwrap();
+    let mut initial = store.load().unwrap();
+    initial.settings_revision = store.revision().unwrap();
+    switch_relay_profile_in_home(&store, &home, initial, "").unwrap();
+
+    for target in ["official", "api"] {
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+        let auth_before = std::fs::read(home.join("auth.json")).unwrap();
+        let mut selected = store.load().unwrap();
+        let previous = selected.active_relay_id.clone();
+        selected.active_relay_id = target.into();
+        selected.settings_revision = store.revision().unwrap();
+        let staged = prepare_relay_profile_switch_in_home(&store, &home, selected, &previous).unwrap();
+        assert_eq!(staged.settings.active_relay_id, target);
+        assert_eq!(std::fs::read(home.join("config.toml")).unwrap(), config_before);
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth_before);
+        assert!(staged.backup_path.is_none());
+
+        // 停 App 后走既有 apply 路径，之前不能删除运行中会话依赖的 custom 表。
+        let mut applied = staged.settings;
+        applied.settings_revision = store.revision().unwrap();
+        switch_relay_profile_in_home(&store, &home, applied, "").unwrap();
+        let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert_eq!(config.contains("[model_providers.custom]"), target == "api");
+    }
+}
+
+#[test]
 fn switch_rolls_back_active_settings_when_live_write_fails() {
     let temp = tempfile::tempdir().unwrap();
     let store = SettingsStore::new(temp.path().join("settings.json"));

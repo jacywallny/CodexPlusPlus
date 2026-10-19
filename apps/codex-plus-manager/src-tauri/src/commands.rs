@@ -351,6 +351,7 @@ pub struct RelaySwitchPayload {
     pub relay: RelayPayload,
     pub settings_path: String,
     pub user_scripts: Value,
+    pub requires_restart: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6324,6 +6325,8 @@ pub struct RelayProfileSwitchRequest {
     pub settings: BackendSettings,
     #[serde(default)]
     pub previous_active_relay_id: String,
+    #[serde(default)]
+    pub confirmed_restart: bool,
 }
 
 #[tauri::command]
@@ -6345,6 +6348,16 @@ pub fn switch_relay_profile(
     let store = SettingsStore::default();
     let previous_active_relay_id = request.previous_active_relay_id;
     let settings = normalize_settings_before_save(request.settings);
+    let requires_restart = !codex_plus_core::watcher::find_session_index_cleanup_blocking_processes().is_empty();
+    if requires_restart && !request.confirmed_restart {
+        let mut payload = relay_switch_payload(
+            store.load().unwrap_or_default(),
+            codex_plus_core::relay_config::relay_status_from_home(&home),
+            None,
+        );
+        payload.requires_restart = true;
+        return failed("切换供应商需要重启 Codex；当前配置尚未更改。", payload);
+    }
     log_manager_event(
         "manager.switch_relay_profile.start",
         json!({
@@ -6352,7 +6365,12 @@ pub fn switch_relay_profile(
             "targetRelayId": settings.active_relay_id
         }),
     );
-    match codex_plus_core::relay_switch::switch_relay_profile_in_home(
+    let switch = if requires_restart {
+        codex_plus_core::relay_switch::prepare_relay_profile_switch_in_home
+    } else {
+        codex_plus_core::relay_switch::switch_relay_profile_in_home
+    };
+    match switch(
         &store,
         &home,
         settings,
@@ -6368,10 +6386,9 @@ pub fn switch_relay_profile(
                     "backupPath": result.backup_path.as_ref()
                 }),
             );
-            ok(
-                "供应商已切换。",
-                relay_switch_payload(result.settings, status, result.backup_path),
-            )
+            let mut payload = relay_switch_payload(result.settings, status, result.backup_path);
+            payload.requires_restart = requires_restart;
+            ok(if requires_restart { "目标供应商已保存，等待重启应用。" } else { "供应商已切换。" }, payload)
         }
         Err(error) => {
             let status = codex_plus_core::relay_config::relay_status_from_home(&home);
@@ -7778,6 +7795,7 @@ fn relay_switch_payload(
             .to_string_lossy()
             .to_string(),
         user_scripts: user_script_inventory(),
+        requires_restart: false,
     }
 }
 

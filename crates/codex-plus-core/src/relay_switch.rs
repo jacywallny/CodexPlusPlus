@@ -21,6 +21,26 @@ pub fn switch_relay_profile_in_home(
     next_settings: BackendSettings,
     previous_active_relay_id: &str,
 ) -> anyhow::Result<RelaySwitchResult> {
+    switch_relay_profile_in_home_with_live_apply(store, home, next_settings, previous_active_relay_id, true)
+}
+
+/// 运行中的 Codex 仍依赖旧 provider 与认证；先保存目标，停 App 后再应用。
+pub fn prepare_relay_profile_switch_in_home(
+    store: &SettingsStore,
+    home: &Path,
+    next_settings: BackendSettings,
+    previous_active_relay_id: &str,
+) -> anyhow::Result<RelaySwitchResult> {
+    switch_relay_profile_in_home_with_live_apply(store, home, next_settings, previous_active_relay_id, false)
+}
+
+fn switch_relay_profile_in_home_with_live_apply(
+    store: &SettingsStore,
+    home: &Path,
+    next_settings: BackendSettings,
+    previous_active_relay_id: &str,
+    apply_live: bool,
+) -> anyhow::Result<RelaySwitchResult> {
     let mut selected_settings = next_settings;
     if !selected_settings.relay_profiles_enabled {
         anyhow::bail!("供应商配置总开关已关闭，未写入 config.toml / auth.json。");
@@ -42,12 +62,28 @@ pub fn switch_relay_profile_in_home(
     {
         backfill_profile_before_switch(home, &mut selected_settings, previous_active_relay_id)?;
     }
-    crate::codex_app_state::capture_app_state_snapshot_nonfatal(home, "relay_switch.before");
+    if !apply_live {
+        let mut profile = selected_settings.active_relay_profile();
+        crate::relay_config::normalize_relay_profile_for_storage(&mut profile)?;
+        if profile.relay_mode != RelayMode::Official || profile.official_mix_api_key {
+            validate_switch_profile_files(&profile)?;
+        }
+    } else {
+        crate::codex_app_state::capture_app_state_snapshot_nonfatal(home, "relay_switch.before");
+    }
 
     let committed_revision = store
         .save_versioned(&selected_settings)
         .context("保存供应商设置失败")?;
     let selected_settings = store.load().context("读取供应商设置失败")?;
+
+    if !apply_live {
+        return Ok(RelaySwitchResult {
+            settings: selected_settings,
+            configured: relay_config_status_from_home(home).configured,
+            backup_path: None,
+        });
+    }
 
     match apply_selected_relay_profile(home, &selected_settings) {
         Ok(result) => {
