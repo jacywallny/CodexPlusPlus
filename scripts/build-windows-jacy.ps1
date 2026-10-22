@@ -25,7 +25,10 @@ function Invoke-Check([string]$Name, [string]$Executable, [string[]]$Arguments) 
 try {
     Import-Module 'D:\DevTools\VSBuildTools\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
     Enter-VsDevShell -VsInstallPath 'D:\DevTools\VSBuildTools' -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
-    $env:PATH = 'D:\Git\bin;D:\Git\usr\bin;D:\DevTools\Rust\cargo\bin;E:\Tools\nodejs;' + $env:PATH
+    $msvcLinker = (Get-Command link.exe -ErrorAction Stop).Source
+    if ($msvcLinker -notlike 'D:\DevTools\VSBuildTools\*') { throw "MSVC linker was not selected: $msvcLinker" }
+    $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $msvcLinker
+    $env:PATH = 'D:\Git\bin;D:\DevTools\Rust\cargo\bin;E:\Tools\nodejs;' + $env:PATH
     $env:CARGO_TARGET_DIR = 'D:\github\CodexPlusPlus-compressed-session-fix-20261015\target'
     $env:CODEX_GATE_TEST_POWERSHELL = (Get-Command pwsh.exe).Source
     Set-Location -LiteralPath $SourceRoot
@@ -35,7 +38,7 @@ try {
     $lock = Get-Content -LiteralPath 'apps\codex-plus-manager\package-lock.json' -Raw | ConvertFrom-Json -AsHashtable
     $tauri = Get-Content -LiteralPath 'apps\codex-plus-manager\src-tauri\tauri.conf.json' -Raw | ConvertFrom-Json
     if ($package.version -ne $Version -or $lock.version -ne $Version -or $lock.packages[''].version -ne $Version -or $tauri.version -ne $Version) { throw 'Manifest version mismatch' }
-    @{source=$ExpectedCommit; linker=(Get-Command link.exe).Source; rustc=(& rustc --version); node=(& node --version); target=$env:CARGO_TARGET_DIR} |
+    @{source=$ExpectedCommit; linker=$msvcLinker; rustc=(& rustc --version); node=(& node --version); target=$env:CARGO_TARGET_DIR} |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $validationRoot 'toolchain.json') -Encoding utf8
     $cargoExe = (Get-Command cargo.exe).Source
     Invoke-Check 'core-tests' $cargoExe @('test','--locked','-p','codex-plus-core','--lib','--test','relay_switch','--test','relay_config','--test','protocol_proxy','--test','resident_helper','--test','helper_body_limit_settings','--test','proxy_auto_retry_settings','--test','issue_20261018_compat')
