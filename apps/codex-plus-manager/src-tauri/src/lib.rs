@@ -1,5 +1,6 @@
 mod auto_takeover;
 mod agent_collaboration_commands;
+mod global_dictation;
 pub mod commands;
 pub mod install;
 mod runtime_health;
@@ -56,20 +57,30 @@ pub fn run() {
             }
         }
     }
-    if let Ok(settings) = codex_plus_core::settings::SettingsStore::default().load()
-        && let Err(error) = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
+    if let Ok(settings) = codex_plus_core::settings::SettingsStore::default().load() {
+        // 请求体上限是运行期策略：管理器启动即按设置应用，之后启动的 helper 直接继承，
+        // 不必等完整启动流程。环境变量仍由 launcher 侧统一优先。
+        codex_plus_core::launcher::set_http_body_limit_bytes(
+            settings.helper_max_request_body_bytes(),
+        );
+        if let Err(error) = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
             settings.enhancements_enabled
                 && settings.codex_app_dream_skin_enabled
                 && !settings.codex_app_dream_skin_paused,
             &settings.codex_app_dream_skin_theme_config,
-        )
-    {
-        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-            "manager.dream_skin_base_theme_sync_failed",
-            serde_json::json!({ "message": error.to_string() }),
-        );
+        ) {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.dream_skin_base_theme_sync_failed",
+                serde_json::json!({ "message": error.to_string() }),
+            );
+        }
     }
     let show_update = commands::startup_should_show_update();
+    let autostart = std::env::args().any(|arg| arg == "--autostart");
+    let start_minimized = autostart
+        && codex_plus_core::watcher::watcher_start_minimized();
+    let start_codex_at_login = autostart && codex_plus_core::watcher::watcher_start_codex();
+    let start_codex_on_open = !autostart && codex_plus_core::watcher::watcher_start_codex_on_open();
     let app_result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
@@ -81,8 +92,8 @@ pub fn run() {
             let mut main_window_builder =
                 tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.into()))
                     .title("Codex++")
-                    .visible(true)
-                    .focused(true)
+                    .visible(!start_minimized)
+                    .focused(!start_minimized)
                     .inner_size(1180.0, 820.0)
                     .min_inner_size(960.0, 720.0);
             if let Some(icon) = app.default_window_icon().cloned() {
@@ -90,6 +101,9 @@ pub fn run() {
             }
             let main_window = main_window_builder.build()?;
             install_tray(app)?;
+            if start_minimized {
+                set_manager_activation_policy(app.handle(), false);
+            }
             let navigation_app = app.handle().clone();
             codex_plus_launcher::set_navigation_handler(move |_payload| {
                 let app = navigation_app.clone();
@@ -102,9 +116,18 @@ pub fn run() {
             start_window_activation_listener(app.handle().clone());
             commands::start_weixin_connect_from_saved_settings();
             register_main_window_events(main_window);
-            commands::resume_existing_codex_background(app.handle().clone());
+            commands::resume_existing_codex_background(
+                app.handle().clone(),
+                start_codex_at_login || start_codex_on_open,
+            );
             // 自动接管官方 App（默认关闭）：设置里开着才起守护线程。
             auto_takeover::start_supervisor();
+            if let Err(error) = global_dictation::apply_config() {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "dictation.global_hotkey_start_failed",
+                    serde_json::json!({ "message": error.to_string() }),
+                );
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -120,12 +143,17 @@ pub fn run() {
             commands::restart_codex_multi_instance,
             commands::restart_codex_plus,
             commands::load_settings,
+            commands::load_request_logs,
+            commands::clear_request_logs,
             commands::dictation_local_model_status,
             commands::download_dictation_local_model,
+            commands::load_global_dictation_hotkey,
+            commands::set_global_dictation_hotkey,
             commands::claude_localization_status,
             commands::claude_localization_action,
             commands::claude_localization_set_voice_input,
             commands::claude_localization_set_localization,
+            commands::claude_localization_set_computer_use,
             commands::native_browser_status,
             commands::save_settings,
             commands::list_tools,
@@ -170,7 +198,9 @@ pub fn run() {
             commands::confirm_pending_provider_import,
             commands::dismiss_pending_provider_import,
             commands::list_local_sessions,
+            commands::list_project_sessions,
             commands::delete_local_session,
+            commands::archive_local_sessions,
             commands::load_provider_sync_targets,
             commands::repair_session_index,
             commands::load_session_index_repair_report,
@@ -189,6 +219,7 @@ pub fn run() {
             commands::reload_user_scripts,
             commands::install_market_script,
             commands::set_user_scripts_enabled,
+            commands::set_user_scripts_skip_next_start,
             commands::set_user_script_enabled,
             commands::delete_user_script,
             commands::refresh_skill_catalog,
@@ -209,6 +240,13 @@ pub fn run() {
             commands::perform_update,
             commands::load_watcher_state,
             commands::set_watcher_enabled,
+            commands::set_watcher_start_minimized,
+            commands::set_watcher_start_codex,
+            commands::set_watcher_start_codex_on_open,
+            commands::load_relay_proxy,
+            commands::set_relay_proxy,
+            commands::load_relay_feature,
+            commands::set_relay_feature,
             // 自动接管官方 App：前端 invoke 找不到命令时是运行期静默失败，
             // 没有编译期兜底，所以这三个必须注册在这里（契约测试会守）。
             commands::load_auto_takeover_state,
@@ -219,6 +257,10 @@ pub fn run() {
             commands::scan_agent_cache,
             commands::clean_agent_cache,
             commands::copy_diagnostics,
+            commands::export_settings,
+            commands::preview_import_settings,
+            commands::set_settings_path,
+            commands::reset_settings_path,
             commands::reset_settings,
             commands::reset_image_overlay_settings,
             commands::relay_status,
@@ -235,6 +277,7 @@ pub fn run() {
             commands::upsert_context_entry,
             commands::delete_context_entry,
             commands::parse_mcp_entry,
+            commands::inspect_mcp_startup,
             commands::build_mcp_entry,
             commands::preview_mcp_servers_json,
             commands::import_mcp_servers_json,
@@ -273,6 +316,9 @@ pub fn run() {
                                     serde_json::json!({ "message": error.to_string() }),
                                 );
                             }
+                            // 常驻本地代理只在 Codex++ 退出时停止；Codex 会话结束
+                            // 不会关它（见 core::resident_helper）。
+                            codex_plus_core::resident_helper::stop_resident_helper();
                             SHUTDOWN_COMPLETE.store(true, Ordering::SeqCst);
                             app.exit(0);
                         });
@@ -416,6 +462,11 @@ fn register_main_window_events<R: tauri::Runtime>(window: tauri::WebviewWindow<R
             }
 
             api.prevent_close();
+            // Windows 上 Tao 的 VISIBLE 标记可能停在 false（窗口曾被 Win32 直接显示
+            // 或隐藏），此时 hide() 会被框架当成重复操作跳过，窗口既不关闭也不隐藏
+            // （issue #1542）。先强制同步为可见再隐藏，保证 hide() 真正执行。
+            #[cfg(windows)]
+            let _ = close_event_window.show();
             let _ = close_event_window.hide();
             set_manager_activation_policy(&close_event_app, false);
         }
