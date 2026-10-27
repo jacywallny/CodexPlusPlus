@@ -98,6 +98,21 @@ const HELPER_BIND_RETRY_TIMEOUT_MS: u64 = 6_000;
 const PROTOCOL_PROXY_BIND_RETRY_TIMEOUT_MS: u64 = 10_000;
 const HELPER_BIND_RETRY_INTERVAL_MS: u64 = 200;
 
+/// 注入重试的总时长预算（issue #2681）。
+///
+/// 过去这里只有「最多 120 次」这一个上限，而单次失败本身还要等 CDP 连接超时
+/// （实测约 92 秒），于是 Codex 根本没监听调试端口时，启动器会空转三个多小时，
+/// 期间界面上一直停在「启动中」。改成按总时长收敛：预算耗尽即判失败并降级，
+/// 由上层写入 `running_degraded` 让用户知道增强没生效。
+const INJECTION_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+/// 两次注入尝试之间的间隔；失败很快时用它避免忙等。
+const INJECTION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// 注入失败日志的节流周期：只在第 1 次和之后每隔这么多次各记一条。
+///
+/// 每次失败都记完整错误串会把诊断日志刷到十几 MB（issue #2681），
+/// 而这些记录内容彼此相同，保留首末与次数就够了。
+const INJECTION_LOG_EVERY_ATTEMPTS: u32 = 10;
+
 /// Asynchronous callback used by the bridge watchdog to restore a launcher-specific bridge.
 ///
 /// Callers that install a custom [`crate::routes::BridgeContext`] should configure this callback
@@ -433,29 +448,44 @@ pub trait LaunchHooks: Send + Sync {
         self.inject(debug_port, helper_port).await
     }
     async fn ensure_injection(&self, debug_port: u16, helper_port: u16, app_dir: &Path) -> bool {
-        for attempt in 1..=120 {
-            let result = match self.bridge_context(debug_port, app_dir).await {
-                Ok(Some(ctx)) => self.inject_bridge(debug_port, helper_port, ctx).await,
-                Ok(None) => self.inject(debug_port, helper_port).await,
-                Err(error) => Err(error),
-            };
-            match result {
-                Ok(()) => return true,
-                Err(error) => {
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "launcher.ensure_injection_retry_failed",
-                        serde_json::json!({
-                            "debug_port": debug_port,
-                            "helper_port": helper_port,
-                            "attempt": attempt,
-                            "message": error.to_string()
-                        }),
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let outcome = run_injection_attempts(
+            INJECTION_TOTAL_BUDGET,
+            INJECTION_RETRY_INTERVAL,
+            INJECTION_LOG_EVERY_ATTEMPTS,
+            |attempt, message| {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.ensure_injection_retry_failed",
+                    serde_json::json!({
+                        "debug_port": debug_port,
+                        "helper_port": helper_port,
+                        "attempt": attempt,
+                        "message": message,
+                    }),
+                );
+            },
+            |_attempt| async move {
+                match self.bridge_context(debug_port, app_dir).await {
+                    Ok(Some(ctx)) => self.inject_bridge(debug_port, helper_port, ctx).await,
+                    Ok(None) => self.inject(debug_port, helper_port).await,
+                    Err(error) => Err(error),
                 }
-            }
-        }
-        false
+            },
+        )
+        .await;
+        // 只在结束时记一条结论，避免每次失败都刷一整条 JSON（issue #2681）。
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.ensure_injection_done",
+            serde_json::json!({
+                "debug_port": debug_port,
+                "helper_port": helper_port,
+                "ready": outcome.ready,
+                "attempts": outcome.attempts,
+                "elapsed_ms": outcome.elapsed_ms,
+                "reason": outcome.reason.as_str(),
+                "last_error": outcome.last_error,
+            }),
+        );
+        outcome.ready
     }
     /// 初次启动初始化结束时固定身份（包含注入降级）；watchdog 不能重新绑定实例。
     async fn capture_injected_launch_identity(&self, _debug_port: u16) {}
@@ -533,6 +563,116 @@ fn error_is_bind_forbidden(error: &anyhow::Error) -> bool {
             .downcast_ref::<std::io::Error>()
             .is_some_and(crate::ports::port_bind_forbidden)
     })
+}
+
+/// 一次注入重试过程为什么停下（issue #2681）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectionStopReason {
+    /// 注入成功，可以继续启动流程。
+    Succeeded,
+    /// 总时长预算耗尽，按失败降级处理。
+    BudgetExhausted,
+}
+
+impl InjectionStopReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::BudgetExhausted => "budget_exhausted",
+        }
+    }
+}
+
+/// 注入重试的结果，供调用方写一条结论日志。
+#[derive(Debug, Clone)]
+struct InjectionOutcome {
+    ready: bool,
+    attempts: u32,
+    elapsed_ms: u128,
+    reason: InjectionStopReason,
+    last_error: Option<String>,
+}
+
+/// 带总时长预算的注入重试循环（issue #2681）。
+///
+/// 单次注入失败往往要等 CDP 连接超时（实测约 92 秒），只按次数封顶会让启动器
+/// 空转数小时。这里改成到点即停，并把失败日志按 `log_every_attempts` 节流，
+/// 既保证「注入失败」能很快反映到界面，也不会把诊断日志刷爆。
+///
+/// `log_failure` 由调用方注入，是为了让节流行为能在测试里直接数调用次数，
+/// 而不必去动进程级的诊断日志路径（那是全局状态，并发测试会互相干扰）。
+async fn run_injection_attempts<F, Fut, L>(
+    budget: std::time::Duration,
+    retry_interval: std::time::Duration,
+    log_every_attempts: u32,
+    mut log_failure: L,
+    mut attempt: F,
+) -> InjectionOutcome
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+    L: FnMut(u32, &str),
+{
+    let started = std::time::Instant::now();
+    let deadline = started + budget;
+    let log_every_attempts = log_every_attempts.max(1);
+    let mut attempts = 0u32;
+    let mut last_error: Option<String> = None;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return InjectionOutcome {
+                ready: false,
+                attempts,
+                elapsed_ms: started.elapsed().as_millis(),
+                reason: InjectionStopReason::BudgetExhausted,
+                last_error,
+            };
+        }
+        attempts += 1;
+        match tokio::time::timeout(remaining, attempt(attempts)).await {
+            Ok(Ok(())) => {
+                return InjectionOutcome {
+                    ready: true,
+                    attempts,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    reason: InjectionStopReason::Succeeded,
+                    last_error: None,
+                };
+            }
+            Ok(Err(error)) => last_error = Some(error.to_string()),
+            // 单次尝试把剩余预算耗光：算超时，不再往下重试。
+            Err(_) => {
+                last_error = Some(format!(
+                    "injection attempt timed out after {} ms of the total budget",
+                    budget.as_millis()
+                ));
+                return InjectionOutcome {
+                    ready: false,
+                    attempts,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    reason: InjectionStopReason::BudgetExhausted,
+                    last_error,
+                };
+            }
+        }
+        // 首次失败立刻记一条，之后每隔 N 次记一条，避免 100+ 条同内容记录。
+        if attempts == 1 || attempts % log_every_attempts == 0 {
+            log_failure(attempts, last_error.as_deref().unwrap_or_default());
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return InjectionOutcome {
+                ready: false,
+                attempts,
+                elapsed_ms: started.elapsed().as_millis(),
+                reason: InjectionStopReason::BudgetExhausted,
+                last_error,
+            };
+        }
+        tokio::time::sleep(remaining.min(retry_interval)).await;
+    }
 }
 
 /// 把 helper 端口 bind 失败翻译成用户能照着处理的提示。
@@ -759,6 +899,42 @@ where
             }
         }
         timeline.mark("sanitize_historical_model_suffixes_done", 50);
+        // issue #2081：切换时只记录了待迁移项，这里 Codex 尚未启动，再回填旧会话模型。
+        match crate::codex_sqlite::apply_pending_thread_model_migration(
+            &home,
+            settings.thread_model_follow_switch_enabled,
+        ) {
+            Ok(0) => {}
+            Ok(updated) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.thread_model_migration",
+                    serde_json::json!({ "updated": updated }),
+                );
+            }
+            Err(error) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.thread_model_migration_failed",
+                    serde_json::json!({ "error": error.to_string() }),
+                );
+            }
+        }
+        // issue #2632：纯 API 供应商下 Work 视图要求 ChatGPT 账号身份，发送即失败。
+        // 开关打开时在 Codex 启动前把详情模式写回 Codex 视图；失败不阻断启动。
+        match crate::work_view::apply_detail_mode_preference(&home, &settings) {
+            Ok(Some(previous)) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.work_view_disabled",
+                    serde_json::json!({ "previous": previous }),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.work_view_disable_failed",
+                    serde_json::json!({ "error": error.to_string() }),
+                );
+            }
+        }
         let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings)
             || remote_control_provider_proxy_enabled(&settings);
         // issue #2264：重启链路上的模型漂移修复。launcher 不重放完整 apply（那会
@@ -958,27 +1134,17 @@ fn active_relay_profile_is_official_mix(settings: &BackendSettings) -> bool {
     profile.relay_mode == crate::settings::RelayMode::Official && profile.official_mix_api_key
 }
 #[cfg(windows)]
-fn apply_codexplusplus_window_icon_after_launch(process_id: u32) {
-    let icon_resource_path =
-        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("codex-plus-plus.exe"));
+fn apply_codexplusplus_taskbar_after_launch(process_id: u32) {
     tokio::spawn(async move {
-        let mut state = crate::windows_integration::WindowIconApplyState::default();
         for attempt in 1..=30 {
-            if crate::windows_integration::apply_codexplusplus_icon_attempt(
-                process_id,
-                &icon_resource_path,
-                &mut state,
-            ) {
+            if crate::windows_integration::apply_codexplusplus_taskbar_to_process_window(process_id) {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             if attempt == 30 {
                 let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "launcher.window_icon.apply_failed",
-                    serde_json::json!({
-                        "process_id": process_id,
-                        "icon_resource_path": icon_resource_path.to_string_lossy()
-                    }),
+                    "launcher.taskbar.apply_failed",
+                    serde_json::json!({ "process_id": process_id }),
                 );
             }
         }
@@ -986,7 +1152,7 @@ fn apply_codexplusplus_window_icon_after_launch(process_id: u32) {
 }
 
 #[cfg(not(windows))]
-fn apply_codexplusplus_window_icon_after_launch(_process_id: u32) {}
+fn apply_codexplusplus_taskbar_after_launch(_process_id: u32) {}
 
 pub trait IntoLaunchHooks {
     fn into_launch_hooks(self) -> Arc<dyn LaunchHooks>;
@@ -1262,7 +1428,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                             *self.packaged_activation_process.lock().await = process;
                             *self.packaged_launch_identity.lock().await = None;
                         }
-                        apply_codexplusplus_window_icon_after_launch(process_id);
+                        apply_codexplusplus_taskbar_after_launch(process_id);
                         return Ok(match activation {
                             CodexLaunch::PackagedActivation {
                                 app_user_model_id,
@@ -1761,6 +1927,17 @@ async fn handle_helper_connection(
         }),
     );
 
+    if crate::gateway::is_gateway_path(path) {
+        return crate::gateway::server::handle(
+            &mut stream,
+            method,
+            path,
+            &request_headers,
+            &request.body,
+            remote_addr_text,
+        )
+        .await;
+    }
     if matches!(path, "/dictation/transcribe" | "/dictation/status") {
         return handle_dictation_connection(
             &mut stream,
@@ -1877,6 +2054,7 @@ async fn handle_helper_connection(
             method,
             path,
             remote_addr_text,
+            ProxyOpener::Legacy,
         )
         .await;
     }
@@ -2037,7 +2215,7 @@ async fn handle_helper_connection(
     Ok(())
 }
 
-fn decode_protocol_proxy_request_body(
+pub(crate) fn decode_protocol_proxy_request_body(
     body: &[u8],
     content_encoding: Option<&str>,
 ) -> anyhow::Result<String> {
@@ -2296,18 +2474,31 @@ async fn handle_models_proxy_connection(
 ///
 /// 用 Drop 兜底写盘：这个函数分支很多（错误、非 2xx、原生压缩、流式、协议转换），
 /// 每个分支都手写一遍落盘容易漏；字段在分支里按需补齐，析构时统一写一条记录。
-struct ProxyRequestLog {
+pub(crate) struct ProxyRequestLog {
     started: std::time::Instant,
-    entry: crate::request_log::RequestLogEntry,
+    pub(crate) entry: crate::request_log::RequestLogEntry,
     written: bool,
+    /// 不进请求日志：Codex 以官方身份接入网关时，本地代理这一跳只是转给网关，
+    /// 网关那一跳会记一条带 Agent 与路由的，这里不重复记。
+    silent: bool,
 }
 
 impl ProxyRequestLog {
-    fn begin(
+    pub(crate) fn begin(
         method: &str,
         path: &str,
         request: Option<&Value>,
         thread_id: Option<String>,
+    ) -> Self {
+        Self::begin_with(method, path, request, thread_id, false)
+    }
+
+    pub(crate) fn begin_with(
+        method: &str,
+        path: &str,
+        request: Option<&Value>,
+        thread_id: Option<String>,
+        silent: bool,
     ) -> Self {
         let started_at_ms = current_time_ms();
         let model = request
@@ -2345,14 +2536,48 @@ impl ProxyRequestLog {
                 stream_outcome: None,
                 usage: None,
                 cache_hit_ratio: None,
+                agent: None,
             },
             written: false,
+            silent,
         };
-        crate::request_log::start_request(&log.entry);
+        if !silent {
+            crate::request_log::start_request(&log.entry);
+        }
         log
     }
 
-    fn record_upstream(&mut self, upstream: &crate::protocol_proxy::UpstreamProxyResponse) {
+    pub(crate) fn set_agent(&mut self, agent: &crate::tools::ToolId) {
+        self.entry.agent = Some(agent.as_str().to_string());
+        self.update_running();
+    }
+
+    /// 网关自己写出响应（不经 `UpstreamProxyResponse`）时记录路由痕迹。
+    pub(crate) fn record_trace(
+        &mut self,
+        trace: &crate::request_log::RequestTrace,
+        status_code: u16,
+        stream: bool,
+    ) {
+        self.entry.status_code = status_code;
+        self.entry.success = (200..300).contains(&status_code);
+        self.entry.stream = stream;
+        self.entry.relay_id = trace.relay_id.clone();
+        self.entry.relay_name = trace.relay_name.clone();
+        self.entry.upstream_model = trace.upstream_model.clone();
+        self.entry.wire_api = trace.wire_api.clone();
+        self.entry.attempts = trace.attempts;
+        self.entry.auto_retries = trace.auto_retries;
+        self.entry.retry_reasons = trace.retry_reasons.clone();
+        self.entry.attempt_details = trace.attempt_details.clone();
+        if let Some(first_output_at_ms) = trace.first_output_at_ms {
+            self.entry.first_token_ms =
+                Some(first_output_at_ms.saturating_sub(self.entry.started_at_ms));
+        }
+        self.update_running();
+    }
+
+    pub(crate) fn record_upstream(&mut self, upstream: &crate::protocol_proxy::UpstreamProxyResponse) {
         self.entry.status_code = upstream.status_code;
         self.entry.success = upstream.is_success();
         self.entry.stream = upstream.is_stream;
@@ -2370,10 +2595,10 @@ impl ProxyRequestLog {
                     Some(first_output_at_ms.saturating_sub(self.entry.started_at_ms));
             }
         }
-        crate::request_log::update_running(&self.entry);
+        self.update_running();
     }
 
-    fn record_error(&mut self, status: &str, error: String) {
+    pub(crate) fn record_error(&mut self, status: &str, error: String) {
         self.entry.status_code = status
             .split_whitespace()
             .next()
@@ -2383,13 +2608,13 @@ impl ProxyRequestLog {
         self.entry.error = Some(error);
     }
 
-    fn record_usage_json(&mut self, body: &[u8]) {
+    pub(crate) fn record_usage_json(&mut self, body: &[u8]) {
         if self.entry.usage.is_none() {
             self.entry.usage = crate::request_log::usage_from_body_bytes(body);
         }
     }
 
-    fn record_stream(
+    pub(crate) fn record_stream(
         &mut self,
         failure: Option<&str>,
         usage: Option<crate::request_log::RequestUsage>,
@@ -2414,17 +2639,23 @@ impl ProxyRequestLog {
     }
 
     /// 记录首字耗时（从请求开始到第一段上游输出）。只记第一次。
-    fn mark_first_token_at(&mut self, first_output_at_ms: u64) {
+    pub(crate) fn mark_first_token_at(&mut self, first_output_at_ms: u64) {
         if self.entry.first_token_ms.is_none() {
             self.entry.first_token_ms =
                 Some(first_output_at_ms.saturating_sub(self.entry.started_at_ms));
             self.entry.phase = Some("generating".to_string());
+            self.update_running();
+        }
+    }
+
+    fn update_running(&self) {
+        if !self.silent {
             crate::request_log::update_running(&self.entry);
         }
     }
 
     fn write(&mut self) {
-        if self.written {
+        if self.written || self.silent {
             return;
         }
         self.written = true;
@@ -2445,14 +2676,21 @@ impl Drop for ProxyRequestLog {
     }
 }
 
-fn current_time_ms() -> u64 {
+pub(crate) fn current_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
 }
 
-async fn handle_protocol_proxy_connection(
+/// 协议代理请求由谁选上游：Codex 直连代理读当前供应商；网关按 Agent 绑定选。
+#[derive(Debug, Clone)]
+pub(crate) enum ProxyOpener {
+    Legacy,
+    Gateway(crate::tools::ToolId),
+}
+
+pub(crate) async fn handle_protocol_proxy_connection(
     stream: &mut tokio::net::TcpStream,
     request_body: &str,
     request_user_agent: Option<&str>,
@@ -2461,6 +2699,7 @@ async fn handle_protocol_proxy_connection(
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
+    opener: ProxyOpener,
 ) -> anyhow::Result<()> {
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
     let request_thread_id = session_headers
@@ -2469,19 +2708,45 @@ async fn handle_protocol_proxy_connection(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let mut request_log =
-        ProxyRequestLog::begin(method, path, request_json.as_ref(), request_thread_id);
+    let quiet = matches!(opener, ProxyOpener::Legacy)
+        && crate::gateway::apply::codex_hops_through_gateway();
+    let mut request_log = ProxyRequestLog::begin_with(
+        method,
+        path,
+        request_json.as_ref(),
+        request_thread_id,
+        quiet,
+    );
     let live_request_id = request_log.entry.id.clone();
+    // 经网关的非 Codex 客户端（Grok 等）不认识 ChatGPT 订阅后端的私有事件。
+    let foreign_client =
+        matches!(&opener, ProxyOpener::Gateway(agent) if *agent != crate::tools::ToolId::Codex);
+    let opened = match &opener {
+        ProxyOpener::Legacy => {
+            crate::protocol_proxy::open_responses_proxy_request_for_path_with_session_headers_and_live_id(
+                request_body,
+                request_user_agent,
+                path,
+                request_beta_features,
+                session_headers,
+                Some(live_request_id.as_str()),
+            )
+            .await
+        }
+        ProxyOpener::Gateway(agent) => {
+            request_log.set_agent(agent);
+            crate::gateway::server::open_responses_for_agent(
+                agent,
+                request_body,
+                request_user_agent,
+                session_headers,
+                Some(live_request_id.as_str()),
+            )
+            .await
+        }
+    };
     let mut upstream =
-        match crate::protocol_proxy::open_responses_proxy_request_for_path_with_session_headers_and_live_id(
-            request_body,
-            request_user_agent,
-            path,
-            request_beta_features,
-            session_headers,
-            Some(live_request_id.as_str()),
-        )
-        .await
+        match opened
         {
             Ok(upstream) => upstream,
             Err(error) => {
@@ -2575,7 +2840,8 @@ async fn handle_protocol_proxy_connection(
         if let Some(body) = upstream.buffered_body.take() {
             // buffered 模式：整段 SSE 已由协议代理收齐并重试完成，这里一次性转发。
             let mut transformer =
-                crate::protocol_proxy::ResponsesSseTransformer::for_request(request_json.as_ref());
+                crate::protocol_proxy::ResponsesSseTransformer::for_request(request_json.as_ref())
+                    .stripping_backend_events(foreign_client);
             let out = transformer.push_bytes(&body);
             stream.write_all(&out).await?;
             let usage = transformer.take_usage();
@@ -2699,14 +2965,17 @@ async fn handle_protocol_proxy_connection(
             return Ok(());
         }
         let stream_prefix = std::mem::take(&mut upstream.stream_prefix);
-        let (failure, usage, failure_detail, first_output_at_ms) = forward_protocol_proxy_stream(
-            stream,
-            &stream_prefix,
-            upstream.take_response()?,
-            upstream.wire_api,
-            request_json.as_ref(),
-        )
-        .await?;
+        let (failure, usage, failure_detail, first_output_at_ms) =
+            forward_protocol_proxy_stream_for_client(
+                stream,
+                &stream_prefix,
+                upstream.take_response()?,
+                upstream.wire_api,
+                request_json.as_ref(),
+                session_headers.thread_id,
+                foreign_client,
+            )
+            .await?;
         if let Some(first_output_at_ms) = first_output_at_ms {
             request_log.mark_first_token_at(first_output_at_ms);
         }
@@ -2820,28 +3089,11 @@ async fn handle_protocol_proxy_connection(
         stream.shutdown().await?;
         return Ok(());
     }
-    let upstream_json: serde_json::Value = serde_json::from_slice(&upstream_body)?;
-    // Anthropic 上游先落成 chat 响应体，再复用同一份 chat → Responses 映射；
-    // 签名思考块要挂回 Responses 的 reasoning item，下一轮才能原样回放。
-    let (chat_json, thinking_blocks) =
-        if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
-            let blocks =
-                crate::anthropic_bridge::thinking_blocks_from_anthropic_message(&upstream_json);
-            (
-                crate::anthropic_bridge::anthropic_message_to_chat_completion(upstream_json)?,
-                blocks,
-            )
-        } else {
-            (upstream_json, Vec::new())
-        };
-    let mut response_json = if let Some(request_json) = request_json.as_ref() {
-        crate::protocol_proxy::chat_completion_to_response_with_request(chat_json, request_json)?
-    } else {
-        crate::protocol_proxy::chat_completion_to_response(chat_json)?
-    };
-    if !thinking_blocks.is_empty() {
-        crate::anthropic_bridge::attach_thinking_to_responses(&mut response_json, &thinking_blocks);
-    }
+    let response_json = non_stream_body_to_responses(
+        upstream.wire_api,
+        &upstream_body,
+        request_json.as_ref(),
+    )?;
     let body = serde_json::to_vec(&response_json)?;
     request_log.record_usage_json(&body);
     write_http_response(stream, "200 OK", "application/json; charset=utf-8", &body).await?;
@@ -2855,6 +3107,48 @@ async fn handle_protocol_proxy_connection(
     stream.shutdown().await?;
     Ok(())
 }
+/// 非流式的 Chat / Anthropic 上游响应体 → Responses 响应 JSON。
+pub(crate) fn non_stream_body_to_responses(
+    wire_api: crate::protocol_proxy::UpstreamWireApi,
+    upstream_body: &[u8],
+    request_json: Option<&Value>,
+) -> anyhow::Result<Value> {
+    if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+        // ChatGPT 订阅后端只回流式结果：客户端要非流式时，从 response.completed 里取完整响应。
+        if let Ok(upstream_json) = serde_json::from_slice::<serde_json::Value>(upstream_body) {
+            return Ok(upstream_json);
+        }
+        if let Some(response) =
+            crate::gateway::chatgpt_backend::responses_json_from_sse(upstream_body)
+        {
+            return Ok(response);
+        }
+    }
+    let upstream_json: serde_json::Value = serde_json::from_slice(upstream_body)?;
+    // Anthropic 上游先落成 chat 响应体，再复用同一份 chat → Responses 映射；
+    // 签名思考块要挂回 Responses 的 reasoning item，下一轮才能原样回放。
+    let (chat_json, thinking_blocks) =
+        if wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
+            let blocks =
+                crate::anthropic_bridge::thinking_blocks_from_anthropic_message(&upstream_json);
+            (
+                crate::anthropic_bridge::anthropic_message_to_chat_completion(upstream_json)?,
+                blocks,
+            )
+        } else {
+            (upstream_json, Vec::new())
+        };
+    let mut response_json = if let Some(request_json) = request_json {
+        crate::protocol_proxy::chat_completion_to_response_with_request(chat_json, request_json)?
+    } else {
+        crate::protocol_proxy::chat_completion_to_response(chat_json)?
+    };
+    if !thinking_blocks.is_empty() {
+        crate::anthropic_bridge::attach_thinking_to_responses(&mut response_json, &thinking_blocks);
+    }
+    Ok(response_json)
+}
+
 async fn handle_dictation_connection(
     stream: &mut tokio::net::TcpStream,
     method: &str,
@@ -3293,7 +3587,7 @@ async fn handle_chat_completions_proxy_connection(
     Ok(())
 }
 
-async fn write_http_response(
+pub(crate) async fn write_http_response(
     stream: &mut tokio::net::TcpStream,
     status: &str,
     content_type: &str,
@@ -3308,7 +3602,7 @@ async fn write_http_response(
     Ok(())
 }
 
-async fn write_http_stream_headers(
+pub(crate) async fn write_http_stream_headers(
     stream: &mut tokio::net::TcpStream,
     status: &str,
     content_type: &str,
@@ -3320,13 +3614,50 @@ async fn write_http_stream_headers(
     Ok(())
 }
 
+/// 协议代理流式输出的落点。
+///
+/// 默认直接写 TCP 连接；网关模式把它换成「Responses SSE → 客户端协议 SSE」的转换器，
+/// 上游 → Responses 的整条归一化链路（Chat / Anthropic / 原生 Responses）因此只有一份。
+pub(crate) trait SseSink {
+    async fn send(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+}
+
+impl SseSink for tokio::net::TcpStream {
+    async fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_all(bytes).await
+    }
+}
+
 // 返回流失败原因与（可选的）usage；HTTP 响应头已经发送，不能再把失败伪装成第二个 HTTP 502。
-async fn forward_protocol_proxy_stream(
-    stream: &mut tokio::net::TcpStream,
+pub(crate) async fn forward_protocol_proxy_stream<S: SseSink>(
+    stream: &mut S,
     prefix: &[u8],
     response: reqwest::Response,
     wire_api: crate::protocol_proxy::UpstreamWireApi,
     request: Option<&Value>,
+    thread_id: Option<&str>,
+) -> anyhow::Result<(
+    Option<String>,
+    Option<crate::request_log::RequestUsage>,
+    Option<String>,
+    Option<u64>,
+)> {
+    forward_protocol_proxy_stream_for_client(
+        stream, prefix, response, wire_api, request, thread_id, false,
+    )
+    .await
+}
+
+/// 同 `forward_protocol_proxy_stream`；`foreign_client` 为真时下游不是 Codex，
+/// Responses 流里去掉 ChatGPT 订阅后端的私有事件。
+pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
+    stream: &mut S,
+    prefix: &[u8],
+    response: reqwest::Response,
+    wire_api: crate::protocol_proxy::UpstreamWireApi,
+    request: Option<&Value>,
+    thread_id: Option<&str>,
+    foreign_client: bool,
 ) -> anyhow::Result<(
     Option<String>,
     Option<crate::request_log::RequestUsage>,
@@ -3336,11 +3667,12 @@ async fn forward_protocol_proxy_stream(
     let mut chunks = response.bytes_stream();
     let mut first_output_at_ms = None;
     if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
-        let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::for_request(request);
+        let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::for_request(request)
+            .stripping_backend_events(foreign_client);
         // 代理预读过的开头必须先原样补写，否则 Codex 会丢掉 response.created 等事件。
         if !prefix.is_empty() {
             let out = transformer.push_bytes(prefix);
-            stream.write_all(&out).await?;
+            stream.send(&out).await?;
             if transformer.has_failed() {
                 let usage = transformer.take_usage();
                 let detail = transformer.take_failure_detail();
@@ -3354,7 +3686,7 @@ async fn forward_protocol_proxy_stream(
                         first_output_at_ms = Some(current_time_ms());
                     }
                     let out = transformer.push_bytes(&bytes);
-                    stream.write_all(&out).await?;
+                    stream.send(&out).await?;
                     // 超限等终态失败要立即结束流，不能等上游 EOF；
                     // 否则上游保持连接时失败迟迟不上报，残片也会继续被转发。
                     if transformer.has_failed() {
@@ -3392,7 +3724,7 @@ async fn forward_protocol_proxy_stream(
                     }
                     let converted = converter.push_bytes(&bytes);
                     if !converted.is_empty() {
-                        stream.write_all(&converted).await?;
+                        stream.send(&converted).await?;
                     }
                     if converter.has_failed() {
                         return Ok((
@@ -3408,7 +3740,7 @@ async fn forward_protocol_proxy_stream(
                         "上游响应流读取失败".to_string(),
                         Some("stream_error".to_string()),
                     );
-                    stream.write_all(&failed).await?;
+                    stream.send(&failed).await?;
                     return Ok((
                         Some(error.without_url().to_string()),
                         None,
@@ -3425,7 +3757,7 @@ async fn forward_protocol_proxy_stream(
                 "上游在完成事件前结束了响应流".to_string(),
                 Some("stream_incomplete".to_string()),
             );
-            stream.write_all(&failed).await?;
+            stream.send(&failed).await?;
             return Ok((
                 Some("上游缺少完成事件".to_string()),
                 None,
@@ -3433,7 +3765,7 @@ async fn forward_protocol_proxy_stream(
                 first_output_at_ms,
             ));
         }
-        stream.write_all(&converter.finish()).await?;
+        stream.send(&converter.finish()).await?;
         return Ok((None, None, None, first_output_at_ms));
     }
     let mut converter = request
@@ -3446,7 +3778,7 @@ async fn forward_protocol_proxy_stream(
                     first_output_at_ms = Some(current_time_ms());
                 }
                 let converted = converter.push_bytes(&bytes);
-                stream.write_all(&converted).await?;
+                stream.send(&converted).await?;
                 if converter.has_failed() {
                     return Ok((
                         Some("上游返回了流式错误事件".to_string()),
@@ -3461,7 +3793,7 @@ async fn forward_protocol_proxy_stream(
                     "上游响应流读取失败".to_string(),
                     Some("stream_error".to_string()),
                 );
-                stream.write_all(&failed).await?;
+                stream.send(&failed).await?;
                 return Ok((
                     Some(error.without_url().to_string()),
                     None,
@@ -3477,7 +3809,7 @@ async fn forward_protocol_proxy_stream(
             "上游在完成事件前结束了响应流".to_string(),
             Some("stream_incomplete".to_string()),
         );
-        stream.write_all(&failed).await?;
+        stream.send(&failed).await?;
         return Ok((
             Some("上游缺少完成事件".to_string()),
             None,
@@ -3485,11 +3817,21 @@ async fn forward_protocol_proxy_stream(
             first_output_at_ms,
         ));
     }
-    stream.write_all(&converter.finish()).await?;
+    stream.send(&converter.finish()).await?;
+    record_chat_converter_usage(thread_id, &converter);
     Ok((None, None, None, first_output_at_ms))
 }
 
-fn log_helper_response(
+fn record_chat_converter_usage(
+    thread_id: Option<&str>,
+    converter: &crate::protocol_proxy::ChatSseToResponsesConverter,
+) {
+    if let Some(usage) = converter.latest_usage() {
+        crate::context_usage::record_usage(thread_id, converter.model(), usage);
+    }
+}
+
+pub(crate) fn log_helper_response(
     event: &str,
     method: &str,
     path: &str,
@@ -3514,7 +3856,7 @@ fn log_helper_response(
 /// 日志里也查不到为什么（issue #2385）。原因必须落进日志，否则
 /// 「上游不可达 / 没配可用中转 / 请求体解析失败」这几种完全不同的故障
 /// 在现场长得一模一样。
-fn log_helper_proxy_failure(
+pub(crate) fn log_helper_proxy_failure(
     event: &str,
     method: &str,
     path: &str,
@@ -4025,7 +4367,7 @@ fn scan_chunked_body(encoded: &[u8]) -> Result<ChunkedBodyScan, HttpRequestReadE
     ChunkedScanState::default().advance(encoded)
 }
 
-fn header_value_from_headers(headers: &str, header_name: &str) -> Option<String> {
+pub(crate) fn header_value_from_headers(headers: &str, header_name: &str) -> Option<String> {
     headers
         .lines()
         .skip(1)
@@ -7252,7 +7594,7 @@ mod proxy_stream_tests {
         let (mut writer, _) = downstream.accept().await.unwrap();
         let forwarded = tokio::spawn(async move {
             let (result, _usage, _detail, first_output_at_ms) =
-                forward_protocol_proxy_stream(&mut writer, &prefix, response, wire, None)
+                forward_protocol_proxy_stream(&mut writer, &prefix, response, wire, None, None)
                     .await
                     .unwrap();
             writer.shutdown().await.unwrap();
@@ -7502,7 +7844,14 @@ mod proxy_stream_tests {
 
         let forwarded = timeout(
             Duration::from_secs(20),
-            forward_protocol_proxy_stream(&mut writer, &[], response, UpstreamWireApi::Responses, None),
+            forward_protocol_proxy_stream(
+                &mut writer,
+                &[],
+                response,
+                UpstreamWireApi::Responses,
+                None,
+                None,
+            ),
         )
         .await
         .expect("上游发完终止块后转发必须结束")
@@ -7515,5 +7864,102 @@ mod proxy_stream_tests {
         assert!(forwarded_bytes.len() > 5 * 1024 * 1024, "超大事件必须完整转发，收到 {} 字节", forwarded_bytes.len());
         assert!(forwarded_bytes.ends_with(b"data:{\"type\":\"response.completed\"}\n\n"));
         upstream_task.abort();
+    }
+}
+
+#[cfg(test)]
+mod injection_budget_tests {
+    use super::{InjectionStopReason, run_injection_attempts};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn injection_stops_when_total_budget_is_exhausted() {
+        // 每次尝试都卡住：总预算耗尽后必须返回，而不是跑满次数上限（issue #2681）。
+        let outcome = run_injection_attempts(
+            Duration::from_millis(120),
+            Duration::from_millis(10),
+            10,
+            |_attempt, _message| {},
+            |_attempt| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                anyhow::bail!("should never finish");
+            },
+        )
+        .await;
+
+        assert!(!outcome.ready);
+        assert_eq!(outcome.reason, InjectionStopReason::BudgetExhausted);
+        assert_eq!(outcome.attempts, 1, "单次尝试吃光预算后不应再重试");
+        assert!(
+            outcome
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("timed out"),
+            "应记录超时原因，实际 {:?}",
+            outcome.last_error
+        );
+        assert!(
+            outcome.elapsed_ms < 3_000,
+            "总耗时必须收敛到预算量级，实际 {} ms",
+            outcome.elapsed_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn injection_succeeds_on_later_attempt() {
+        let mut calls = 0;
+        let outcome = run_injection_attempts(
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            10,
+            |_attempt, _message| {},
+            |_attempt| {
+                calls += 1;
+                let attempt = calls;
+                async move {
+                    if attempt < 3 {
+                        anyhow::bail!("cdp not ready yet");
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .await;
+
+        assert!(outcome.ready);
+        assert_eq!(outcome.reason, InjectionStopReason::Succeeded);
+        assert_eq!(outcome.attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn injection_failure_logging_is_throttled() {
+        let logged_attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+        let logged = logged_attempts.clone();
+
+        let outcome = run_injection_attempts(
+            Duration::from_millis(400),
+            Duration::from_millis(1),
+            10,
+            |attempt, message| {
+                assert!(message.contains("connect refused"));
+                logged.lock().unwrap().push(attempt);
+            },
+            |_attempt| async { anyhow::bail!("connect refused") },
+        )
+        .await;
+
+        assert!(!outcome.ready);
+        assert!(outcome.attempts >= 20, "失败很快时应尝试足够多次");
+        let logged = logged_attempts.lock().unwrap();
+        // 首次 + 每 10 次一条；关键是不能随尝试次数线性增长。
+        assert_eq!(logged.first().copied(), Some(1));
+        assert_eq!(logged.len(), 1 + (outcome.attempts as usize / 10));
+        assert!(
+            logged.len() * 5 < outcome.attempts as usize,
+            "{} 次尝试只应记少量日志，实际 {} 条",
+            outcome.attempts,
+            logged.len()
+        );
     }
 }

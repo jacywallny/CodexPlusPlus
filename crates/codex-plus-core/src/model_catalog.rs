@@ -29,6 +29,8 @@ struct ModelSource {
     api_key: String,
     /// 供应商自定义请求头（issue #1685）。非供应商来源为空。
     headers: Vec<crate::settings::RelayHeaderKeyValue>,
+    /// Anthropic Messages 协议：模型列表要 `x-api-key` + `anthropic-version`，且默认只返回 20 条。
+    anthropic: bool,
 }
 
 #[derive(Debug, Default)]
@@ -233,13 +235,28 @@ fn relay_profile_model_ui_metadata_map(profile: &RelayProfile, models: &[String]
             .unwrap_or_default();
     let fallback = crate::model_suffix::parse_window_token(&profile.context_window);
     for model in models {
-        let window = crate::model_suffix::lookup_model_map(&windows, model)
-            .and_then(|token| crate::model_suffix::parse_window_token(token))
-            .or(fallback);
-        if let Some(window) = window {
+        let manual = crate::model_suffix::lookup_model_map(&windows, model)
+            .and_then(|token| crate::model_suffix::parse_window_token(token));
+        if let Some(window) = manual {
+            // 逐模型手工窗口优先级最高，覆盖内置模板。
             let entry = metadata.entry(model.clone()).or_insert_with(|| json!({}));
             for field in ["contextWindow", "maxContextWindow", "context_window", "max_context_window"] {
                 entry[field] = json!(window);
+            }
+            continue;
+        }
+        // 没有手工窗口时，供应商级「上下文大小」只作兜底：模型模板里已经声明了
+        // 自己的窗口就别拿全局值盖掉它。否则多模型列表 + 全局窗口会把每个模型都
+        // 压成同一个数，模型自身的真实窗口反而丢失（issue #2590）。
+        let Some(fallback) = fallback else { continue };
+        let entry = metadata.entry(model.clone()).or_insert_with(|| json!({}));
+        for field in ["contextWindow", "maxContextWindow", "context_window", "max_context_window"] {
+            let missing = entry
+                .get(field)
+                .and_then(Value::as_u64)
+                .is_none_or(|existing| existing == 0);
+            if missing {
+                entry[field] = json!(fallback);
             }
         }
     }
@@ -263,6 +280,26 @@ mod window_override_tests {
             assert_eq!(metadata["gpt-5.5"][field], 1_000_000);
             assert_eq!(metadata["vendor-model"][field], 128_000);
         }
+
+        // issue #2590：全局窗口只兜底，不能盖掉模型模板自带的窗口。
+        // 同一份列表里 gpt-5.5 有内置模板、vendor-model 没有，前者应保持模板值。
+        let builtin_only = relay_profile_model_ui_metadata_map(&RelayProfile::default(), &models);
+        let builtin_window = builtin_only["gpt-5.5"]["contextWindow"]
+            .as_u64()
+            .expect("gpt-5.5 应有内置窗口");
+        assert_ne!(builtin_window, 128_000, "前置条件：内置窗口不应恰好等于全局值");
+        assert_eq!(metadata["gpt-5.5"]["contextWindow"], 1_000_000);
+        let global_only = RelayProfile {
+            context_window: "128K".into(),
+            ..Default::default()
+        };
+        let with_global = relay_profile_model_ui_metadata_map(&global_only, &models);
+        assert_eq!(
+            with_global["gpt-5.5"]["contextWindow"], builtin_window,
+            "全局窗口不应压过内置模板"
+        );
+        assert_eq!(with_global["vendor-model"]["contextWindow"], 128_000);
+
         let metadata = relay_profile_model_ui_metadata_map(&RelayProfile::default(), &models);
         assert!(metadata["gpt-5.5"]["contextWindow"].as_u64().is_some());
         assert!(metadata.get("vendor-model").is_none());
@@ -546,6 +583,7 @@ fn model_sources_from_environment(
             api_key
         },
         headers: Vec::new(),
+        anthropic: false,
     }]
 }
 
@@ -583,6 +621,7 @@ fn model_source_from_config(
         base_url,
         api_key,
         headers: Vec::new(),
+        anthropic: false,
     })
 }
 
@@ -642,7 +681,12 @@ async fn fetch_models_from_source_with_timeout(
     source: &ModelSource,
     timeout: std::time::Duration,
 ) -> (Vec<String>, Value) {
-    let endpoint = models_endpoint(&source.base_url);
+    let mut endpoint = models_endpoint(&source.base_url);
+    if source.anthropic && !endpoint.is_empty() {
+        // Anthropic 的 /v1/models 默认一页 20 条，一次取满（上限 1000）。
+        endpoint.push(if endpoint.contains('?') { '&' } else { '?' });
+        endpoint.push_str("limit=1000");
+    }
     let mut safe_source = json!({
         "id": source.source_id,
         "type": source.source_type,
@@ -662,8 +706,19 @@ async fn fetch_models_from_source_with_timeout(
         .get(&endpoint)
         .header(reqwest::header::ACCEPT, "application/json");
     // 与协议代理、供应商测试共用 relay_headers：显式 Authorization 优先于 API Key。
-    if !source.api_key.is_empty() && !crate::relay_headers::has_authorization(&source.headers) {
+    let has_header = |name: &str| source.headers.iter().any(|header| header.key.trim().eq_ignore_ascii_case(name));
+    let official_anthropic = source.anthropic && endpoint.contains("anthropic.com");
+    if !source.api_key.is_empty() && !crate::relay_headers::has_authorization(&source.headers) && !official_anthropic {
         request = request.bearer_auth(&source.api_key);
+    }
+    if source.anthropic {
+        // 官方只认 x-api-key；第三方中转常常两种都收，Bearer 已在上面带上。
+        if !source.api_key.is_empty() && !has_header("x-api-key") {
+            request = request.header("x-api-key", &source.api_key);
+        }
+        if !has_header("anthropic-version") {
+            request = request.header("anthropic-version", crate::anthropic_bridge::ANTHROPIC_VERSION);
+        }
     }
     request = crate::relay_headers::apply_headers(request, &source.headers);
 
@@ -855,12 +910,13 @@ pub async fn fetch_relay_profile_model_ids(
         },
         api_key: crate::relay_config::relay_profile_api_key(profile),
         headers: profile.custom_headers.clone(),
+        anthropic: profile.protocol == crate::settings::RelayProtocol::AnthropicMessages,
     };
     if source.base_url.is_empty() {
         anyhow::bail!("Base URL 不能为空");
     }
     let endpoint = models_endpoint(&source.base_url);
-    let client = crate::http_client::proxied_client_for_profile(&profile.user_agent, &profile.id)?;
+    let client = crate::http_client::proxied_client_for_relay(&profile.user_agent, &profile)?;
     let (models, status) = fetch_models_from_source(&client, &source).await;
     if models.is_empty() {
         let message = status
@@ -873,7 +929,7 @@ pub async fn fetch_relay_profile_model_ids(
 }
 
 /// 官方模型目录的客户端版本参数；与 Codex CLI 的取值保持一致。
-const OFFICIAL_MODELS_CLIENT_VERSION: &str = "0.159.0";
+pub(crate) const OFFICIAL_MODELS_CLIENT_VERSION: &str = "0.159.0";
 
 /// 官方登录 profile 的模型列表：带账号 OAuth 凭据请求 chatgpt.com 官方目录。
 async fn fetch_official_login_model_ids(
@@ -882,7 +938,7 @@ async fn fetch_official_login_model_ids(
     let credential = crate::official_login::resolve_official_credential(profile, false).await?;
     let base = crate::official_login::official_base_url();
     let endpoint = format!("{}/models", base.trim().trim_end_matches('/'));
-    let client = crate::http_client::proxied_client_for_profile(&profile.user_agent, &profile.id)?;
+    let client = crate::http_client::proxied_client_for_relay(&profile.user_agent, &profile)?;
     let mut request = client
         .get(&endpoint)
         .query(&[("client_version", OFFICIAL_MODELS_CLIENT_VERSION)])
@@ -1424,6 +1480,7 @@ mod model_fetch_tests {
             base_url: format!("http://{address}"),
             api_key: "key".to_string(),
             headers: Vec::new(),
+            anthropic: false,
         };
         let (_, status) = fetch_models_from_source_with_timeout(
             &client,

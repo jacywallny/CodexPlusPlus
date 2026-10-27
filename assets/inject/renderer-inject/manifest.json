@@ -3,7 +3,7 @@
     {
       "name": "00-prelude.js",
       "description": "IIFE 开头、环境守卫、平台探测、常量与图片覆盖层",
-      "lines": 1790
+      "lines": 1784
     },
     {
       "name": "01-registry.js",
@@ -13,7 +13,7 @@
     {
       "name": "10-style.js",
       "description": "样式注入、默认设置、后端设置映射、梦皮主题变量与持久化",
-      "lines": 2728
+      "lines": 2749
     },
     {
       "name": "20-menu.js",
@@ -23,7 +23,7 @@
     {
       "name": "30-service-tier.js",
       "description": "供应商会话适配、请求桥接与原生状态模块定位",
-      "lines": 891
+      "lines": 894
     },
     {
       "name": "31-config-read-deadline.js",
@@ -32,8 +32,8 @@
     },
     {
       "name": "40-backend-settings.js",
-      "description": "后端设置读写、心跳同步、用户脚本与市场状态、拓展 UI",
-      "lines": 1959
+      "description": "后端设置读写、心跳同步、按清单生成的设置页、用户脚本与市场状态、拓展 UI",
+      "lines": 2087
     },
     {
       "name": "50-navigation.js",
@@ -58,7 +58,7 @@
     {
       "name": "70-model-catalog.js",
       "description": "全局状态、模型目录、模型白名单与解锁",
-      "lines": 1150
+      "lines": 1157
     },
     {
       "name": "71-model-picker-groups.js",
@@ -68,7 +68,7 @@
     {
       "name": "80-session-share.js",
       "description": "会话运行时工具；分享入口已撤出管理器扫描",
-      "lines": 756
+      "lines": 768
     },
     {
       "name": "81-capacity-auto-retry.js",
@@ -91,14 +91,29 @@
       "lines": 280
     },
     {
+      "name": "85-turn-rewind-controller.js",
+      "description": "本地轮次回退执行、恢复记录与失败保护",
+      "lines": 259
+    },
+    {
+      "name": "86-turn-rewind-menu.js",
+      "description": "默认关闭的回答菜单回退入口与原生导出适配",
+      "lines": 318
+    },
+    {
+      "name": "85-side-chat-save.js",
+      "description": "本地旁支保存：主历史读取引用、原生缓存采集与普通会话恢复",
+      "lines": 333
+    },
+    {
       "name": "90-action-groups.js",
       "description": "会话行操作按钮布局、更多菜单、工具提示",
-      "lines": 890
+      "lines": 1062
     },
     {
       "name": "91-extension-api.js",
       "description": "对外接口层 window.codexPlus：路由白名单、UI 注册、toast",
-      "lines": 272
+      "lines": 275
     },
     {
       "name": "92-extension-host.js",
@@ -118,22 +133,17 @@
     {
       "name": "95-conversation-view.js",
       "description": "会话视图运行时、官方用量策略重写、扫描主循环",
-      "lines": 938
+      "lines": 620
     },
     {
-      "name": "96-whale-compat.js",
-      "description": "Codex full whale host and bridge adapters",
-      "lines": 533
-    },
-    {
-      "name": "97-whale-widget.js",
-      "description": "Full whale engine opt-in lifecycle",
-      "lines": 64
+      "name": "97-agent-pet.js",
+      "description": "Agent 桌宠：可拖动角色、按压压扁回弹与按压音效",
+      "lines": 297
     },
     {
       "name": "98-scan-schedule.js",
       "description": "扫描相关性判定与调度，启动重试",
-      "lines": 174
+      "lines": 178
     },
     {
       "name": "98-avatar-overlay-layout.js",
@@ -143,7 +153,7 @@
     {
       "name": "99-startup.js",
       "description": "启动序列：resize 处理、MutationObserver 与事件绑定",
-      "lines": 96
+      "lines": 95
     },
     {
       "name": "99-tail.js",

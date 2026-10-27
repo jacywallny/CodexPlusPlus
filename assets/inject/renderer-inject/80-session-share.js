@@ -524,9 +524,17 @@
       style.setAttribute("data-codex-plus-ext", "deleted-session-rows");
       document.head.appendChild(style);
     }
-    style.textContent = Array.from(deletedSessionRowIds)
-      .map((id) => `[data-app-action-sidebar-thread-id="${CSS.escape(id)}"]{display:none !important}`)
-      .join("\n");
+    // Codex 的行属性是带前缀的编码值（`local:<thread>`），React 重建时同一会话
+    // 可能换成另一种写法（裸 id / 带前缀 / 带 host 作用域）。只按删除时读到的原值
+    // 精确匹配会漏掉这些变体，行就会重新出现（#2671）。thread uuid 全局唯一，
+    // 用后缀匹配覆盖全部写法；拿不到 uuid 时才退回精确匹配原值。
+    const rules = new Set();
+    for (const id of deletedSessionRowIds) {
+      const uuid = normalizedCodexThreadUuid(id);
+      if (uuid) rules.add(`[data-app-action-sidebar-thread-id$="${CSS.escape(uuid)}"]{display:none !important}`);
+      else rules.add(`[data-app-action-sidebar-thread-id="${CSS.escape(id)}"]{display:none !important}`);
+    }
+    style.textContent = Array.from(rules).join("\n");
   }
 
   function hideDeletedSessionRows(rawThreadId) {
@@ -556,13 +564,23 @@
     if (shouldLeave) {
       // 已审 native 的 New chat 按钮以 aria-label/newChatMessage 调用 onStartChat。
       // 只走唯一可见的原生 sidebar 控件；不猜内部路由，也不强制 reload。
-      const navigation = Array.from(document.querySelectorAll("aside.app-shell-left-panel button, nav[data-app-navigation-rail] button"))
-        .filter((candidate) => visibleElement(candidate) && !candidate.disabled && !isExtensionUiNode(candidate)
+      const newChatButtons = Array.from(document.querySelectorAll("aside.app-shell-left-panel button, nav[data-app-navigation-rail] button"))
+        .filter((candidate) => !candidate.disabled && !isExtensionUiNode(candidate)
           && candidate.closest("aside.app-shell-left-panel, nav[data-app-navigation-rail]")
           && /^(新聊天|新对话|New chat|New thread)$/i.test((candidate.getAttribute("aria-label") || candidate.textContent || "").trim()));
+      // 先只用可见的候选；侧栏折叠或被隐藏时新聊天按钮不可见，再退回不判可见的
+      // 唯一候选——按钮还在 DOM 里，React 的 onClick 照样能触发（#2671）。
+      const visibleNewChat = newChatButtons.filter(visibleElement);
+      const navigation = visibleNewChat.length === 1 ? visibleNewChat : newChatButtons;
       if (navigation.length === 1) {
         navigation[0].click();
         navigated = true;
+        if (!visibleElement(navigation[0])) {
+          sendCodexPlusDiagnostic("delete_session_new_chat_fallback", {
+            candidateCount: newChatButtons.length,
+            visibleCount: visibleNewChat.length,
+          });
+        }
       }
     }
     // 原生导航也可能同步重建行，移除前再确认一次，保护被复用的节点。
@@ -714,22 +732,16 @@
         const native = nativeButtons.map(button => ({ button, rect: button.getBoundingClientRect() }))
           .filter(({ rect }) => rect.width > 0 && rect.height > 0)
           .sort((a, b) => a.rect.left - b.rect.left)[0];
-        const nativeStyle = native && getComputedStyle(native.button);
         const right = native ? Math.max(28, Math.round(rowRect.right - native.rect.left + 8)) : 28;
         const titleLeft = row.querySelector(selectors.threadTitle)?.getBoundingClientRect().left || rowRect.left + 40;
         const renderScale = row.offsetWidth > 0 ? rowRect.width / row.offsetWidth : 1;
         return { row, group, native, right, effectiveRight: right, titleLeft, renderScale,
-          groupWidth: Math.ceil(group.getBoundingClientRect().width || 96),
-          color: nativeStyle?.color, background: nativeStyle?.backgroundColor };
+          groupWidth: Math.ceil(group.getBoundingClientRect().width || 96) };
       });
     for (const layout of layouts) {
-      const { group, right, native, color, background } = layout;
-      group.style.setProperty("--codex-session-actions-right", `${right}px`);
-      if (native) {
-        group.style.setProperty("--codex-session-action-color", color);
-        group.style.setProperty("--codex-session-action-hover-color", color);
-        group.style.setProperty("--codex-session-action-hover-background", background);
-      }
+      // 颜色与悬停态不再从原生按钮的计算样式抄：那样拿到的是静止态，悬停时
+      // 既不提亮也不变底色。外观改由按钮直接套用原生类名（syncNativeSessionActionStyle）。
+      layout.group.style.setProperty("--codex-session-actions-right", `${layout.right}px`);
     }
     for (const layout of layouts) {
       if (!layout.native) continue;

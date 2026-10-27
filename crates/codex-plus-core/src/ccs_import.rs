@@ -312,11 +312,13 @@ pub fn relay_profile_from_ccs(
         web_search_history_compat: false,
         trust_upstream_catalog_lite: false,
         strict_responses_reasoning: false,
+        auto_review_model: String::new(),
         anthropic_auth_header: String::new(),
         anthropic_max_tokens: 0,
         anthropic_prompt_cache: true,
         anthropic_impersonate_claude_code: false,
         anthropic_thinking_mode: String::new(),
+        gateway_proxy: None,
     }
 }
 

@@ -40,9 +40,14 @@ test("native Fast renderer preference defaults off, follows backend settings and
 });
 
 test("in-app settings expose native Fast unlock without the retired service tier badge", () => {
-  assert.match(settingsPage, /data-codex-plus-setting="nativeFastUnlock"/);
-  assert.match(settingsPage, /原生 Fast 强制解锁/);
-  assert.match(settingsPage, /纯 API Key 模式恢复原生 Fast 开关；保存后重新启动 Codex 生效，实际支持与计费由供应商决定。/);
+  // 设置页按清单生成：原生 Fast 在 Codex 侧可见，并映射到本页的 nativeFastUnlock。
+  const catalog = JSON.parse(readFileSync(new URL("../../../crates/codex-plus-core/assets/enhancement-settings.json", import.meta.url), "utf8"));
+  const nativeFast = catalog.items.find((item: { key: string }) => item.key === "codexAppNativeFastUnlock");
+  assert.ok(nativeFast?.surfaces.includes("codex"));
+  assert.equal(nativeFast.title, "原生 Fast 强制解锁");
+  assert.match(nativeFast.description, /纯 API Key 模式恢复原生 Fast 开关；重新启动 Codex 后生效，实际支持与计费由供应商决定。/);
+  assert.match(source, /nativeFastUnlock: "codexAppNativeFastUnlock"/);
+  assert.ok(!catalog.items.some((item: { key: string }) => /ServiceTier/.test(item.key)));
   assert.doesNotMatch(settingsPage, /data-codex-plus-setting="serviceTierControls"/);
 });
 
@@ -54,7 +59,7 @@ test("backend loads and saves publish only native Fast policy flags and tolerate
   };
   for (const surface of ["absent-window", "absent-helper", "helper"]) {
     const publications: Array<Record<string, boolean>> = [];
-    let response = { enhancementsEnabled: true, codexAppNativeFastUnlock: true, privateField: "fixture-only" };
+    let response = { enhancementsEnabled: true, codexAppNativeFastUnlock: true, nativeFastLocalApiConfigured: true, privateField: "fixture-only" };
     const window = {
       __CODEX_PLUS_TEST_SERVICE_TIER__: true,
       ...(surface === "helper" ? { __codexPlusNativeFastUnlock: { runtime: { update: (value: Record<string, boolean>) => publications.push({ ...value }) } } } : {}),
@@ -74,12 +79,12 @@ test("backend loads and saves publish only native Fast policy flags and tolerate
     assert.equal(await context.loadBackendSettingsState(), true);
     if (surface === "absent-window") delete context.window;
     await context.setBackendSetting("codexAppNativeFastUnlock", true);
-    response = { ...response, enhancementsEnabled: false, codexAppNativeFastUnlock: false };
+    response = { ...response, enhancementsEnabled: false, codexAppNativeFastUnlock: false, nativeFastLocalApiConfigured: false };
     await context.setBackendSetting("codexAppNativeFastUnlock", false);
     assert.deepEqual(publications, surface === "helper" ? [
-      { enhancementsEnabled: true, codexAppNativeFastUnlock: true },
-      { enhancementsEnabled: true, codexAppNativeFastUnlock: true },
-      { enhancementsEnabled: false, codexAppNativeFastUnlock: false },
+      { enhancementsEnabled: true, codexAppNativeFastUnlock: true, nativeFastLocalApiConfigured: true },
+      { enhancementsEnabled: true, codexAppNativeFastUnlock: true, nativeFastLocalApiConfigured: true },
+      { enhancementsEnabled: false, codexAppNativeFastUnlock: false, nativeFastLocalApiConfigured: false },
     ] : []);
   }
 });
