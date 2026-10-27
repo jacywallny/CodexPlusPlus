@@ -68,6 +68,43 @@ pub fn switch_relay_profile_in_home(
     .map(|(result, _)| result)
 }
 
+/// 运行中的 Codex 仍依赖旧 provider 与认证；先保存目标，停 App 后再应用。
+/// 该入口保留给管理器的“准备切换”流程，绝不改写实时 config.toml / auth.json。
+pub fn prepare_relay_profile_switch_in_home(
+    store: &SettingsStore,
+    home: &Path,
+    next_settings: BackendSettings,
+    previous_active_relay_id: &str,
+) -> anyhow::Result<RelaySwitchResult> {
+    let mut selected_settings = next_settings;
+    if !selected_settings.relay_profiles_enabled {
+        anyhow::bail!("供应商配置总开关已关闭，未写入 config.toml / auth.json。");
+    }
+    let saved_settings = store
+        .load()
+        .context("读取当前供应商设置失败，已中止切换以免覆盖用户配置")?;
+    restore_missing_saved_profiles(&mut selected_settings, &saved_settings);
+    if !previous_active_relay_id.trim().is_empty()
+        && previous_active_relay_id != selected_settings.active_relay_id
+    {
+        backfill_profile_before_switch(home, &mut selected_settings, previous_active_relay_id)?;
+        let mut profile = selected_settings.active_relay_profile();
+        crate::relay_config::normalize_relay_profile_for_storage(&mut profile)?;
+        if profile.relay_mode != RelayMode::Official || profile.official_mix_api_key {
+            validate_switch_profile_files(&profile)?;
+        }
+    }
+    store
+        .save_versioned(&selected_settings)
+        .context("保存供应商设置失败")?;
+    let selected_settings = store.load().context("读取供应商设置失败")?;
+    Ok(RelaySwitchResult {
+        settings: selected_settings,
+        configured: relay_config_status_from_home(home).configured,
+        backup_path: None,
+    })
+}
+
 pub fn switch_relay_profile_in_home_resolving_conflict(
     store: &SettingsStore,
     home: &Path,
