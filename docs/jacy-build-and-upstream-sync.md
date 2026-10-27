@@ -9,7 +9,7 @@
 - 官方远端：`origin` → `https://github.com/BigPizzaV3/CodexPlusPlus.git`
 - 个人远端：`fork` → `https://github.com/jacywallny/CodexPlusPlus.git`
 - 当前已验证构建提交：`19190433764a4c2d7e10e43e14faa181c771e14d`
-- 当前源码文档/部署脚本提交：`bcbb098c2e7213ae45d5959a3bdde742f331bc10`
+- 当前源码文档/部署脚本提交：`6e5f75f8`（本指南当前提交）
 - 当前验证版本：`2.0.0`
 - Jacy 源码目录：`D:\github\CodexPlusPlus-rollout-compression-toggle-20261027`
 - Jacy 持久 Rust 编译目录：`D:\github\CodexPlusPlus-rollout-compression-toggle-20261027\target-jacy`

@@ -4,7 +4,7 @@
 
 - 当前融合工作树：`D:\github\CodexPlusPlus-rollout-compression-toggle-20261027`
 - 当前已验证提交：`19190433764a4c2d7e10e43e14faa181c771e14d`
-- 当前源码文档/部署脚本提交：`bcbb098c2e7213ae45d5959a3bdde742f331bc10`
+- 当前源码文档/部署脚本提交：`6e5f75f8`
 - 当前版本：`2.0.0`
 - 官方远端：`origin` → `BigPizzaV3/CodexPlusPlus`
 - 个人远端：`fork` → `jacywallny/CodexPlusPlus`
