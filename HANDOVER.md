@@ -4,6 +4,7 @@
 
 - 当前融合工作树：`D:\github\CodexPlusPlus-rollout-compression-toggle-20261027`
 - 当前已验证提交：`19190433764a4c2d7e10e43e14faa181c771e14d`
+- 当前源码文档/部署脚本提交：`bcbb098c2e7213ae45d5959a3bdde742f331bc10`
 - 当前版本：`2.0.0`
 - 官方远端：`origin` → `BigPizzaV3/CodexPlusPlus`
 - 个人远端：`fork` → `jacywallny/CodexPlusPlus`
@@ -11,6 +12,7 @@
 - Jacy 构建状态：`build-validation\2.0.0\status.json` 为 `complete`，核心、数据、launcher、前端和 release/probe 均通过。
 - Jacy 持久构建目录：当前源码根下的 `target-jacy`。不要复用其他工作树的 target，也不要每次构建前清理。
 - 详细操作入口：`docs/jacy-build-and-upstream-sync.md`。
+- 本机 2.0.0 部署入口：`scripts/deploy-local-2.0.0.ps1`；先执行 `-PrepareOnly`，再在备份完成后正式部署。
 
 本次已验证的是远程构建。安装到 `D:\Codex++`、备份现有安装、启动后回归属于单独的部署阶段，不能由构建状态代替。
 

@@ -8,13 +8,14 @@
 
 - 官方远端：`origin` → `https://github.com/BigPizzaV3/CodexPlusPlus.git`
 - 个人远端：`fork` → `https://github.com/jacywallny/CodexPlusPlus.git`
-- 当前已验证提交：`19190433764a4c2d7e10e43e14faa181c771e14d`
+- 当前已验证构建提交：`19190433764a4c2d7e10e43e14faa181c771e14d`
+- 当前源码文档/部署脚本提交：`bcbb098c2e7213ae45d5959a3bdde742f331bc10`
 - 当前验证版本：`2.0.0`
 - Jacy 源码目录：`D:\github\CodexPlusPlus-rollout-compression-toggle-20261027`
 - Jacy 持久 Rust 编译目录：`D:\github\CodexPlusPlus-rollout-compression-toggle-20261027\target-jacy`
 - Jacy 构建状态：`build-validation\2.0.0\status.json`
 
-2026-10-27 的 Jacy 验证中，核心、数据、launcher、前端检查、前端测试、前端构建、release 和 probe 均为 `exitCode=0`，最终状态为 `complete`。这证明该提交在 Jacy 上可编译，不等同于已经安装到本机。
+2026-10-27 的 Jacy 验证中，核心、数据、launcher、前端检查、前端测试、前端构建、release 和 probe 均为 `exitCode=0`，最终状态为 `complete`。这证明 `19190433764a4c2d7e10e43e14faa181c771e14d` 在 Jacy 上可编译；后续只增加文档或部署脚本时，不会改变这份二进制验证结果。构建通过不等同于已经安装到本机。
 
 ## 分支约定
 
@@ -38,6 +39,8 @@ git fetch origin
 git fetch fork
 git switch codex/integration
 git merge origin/main
+# 将融合提交推到个人 fork，供 Jacy 拉取同一个提交
+git push fork HEAD:codex/integration
 ```
 
 冲突处理原则：
@@ -64,7 +67,7 @@ git push fork codex/integration
 
 ## Jacy 完整构建
 
-源码已同步到 Jacy 后，在 Jacy 主机执行：
+源码已推到个人 fork 后，在 Jacy 主机执行（`<当前提交>` 必须替换为刚刚推送的完整提交号）：
 
 ```powershell
 ssh jacy powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
@@ -83,7 +86,7 @@ ssh jacy powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
 5. `provider_sync_probe` 构建；
 6. PE 版本、产物哈希和 ZIP 归档核验。
 
-只有 `status.json` 的 `stage` 为 `complete`，且所有检查的 `exitCode` 都为 `0`，才可以认为构建完成。
+只有 `status.json` 的 `stage` 为 `complete`，且所有检查的 `exitCode` 都为 `0`，才可以认为该提交在 Jacy 上构建完成。若 Jacy 工作树不是目标提交，先停止部署并重新同步，不能用旧产物冒充新提交。
 
 ## 产物与部署边界
 
@@ -100,6 +103,14 @@ D:\github\CodexPlusPlus-rollout-compression-toggle-20261027\dist\jacy-build\<版
 - 核对新程序 SHA-256、PE FileVersion 和 ProductVersion；
 - 确认官方 Codex App 进程没有被停止；
 - 安装后检查 manager 启动、`providerSyncEnabled` 和 ready 日志。
+
+当前本机 2.0.0 部署脚本入口为：
+
+```text
+scripts/deploy-local-2.0.0.ps1
+```
+
+先用 `-PrepareOnly` 做只读预检，再执行正式部署；脚本会校验 Jacy 产物版本和 SHA-256、备份旧安装与设置，并写入 `D:\codex_cli\reports`。正式部署后仍需人工确认启动日志和实际设置。
 
 不要把 Jacy 构建通过直接当成本机已安装。部署和构建是两个阶段，安装脚本必须保留可回滚备份。
 
