@@ -44,7 +44,7 @@ try {
     @{source=$ExpectedCommit; linker=$msvcLinker; rustc=(& rustc --version); node=(& node --version); target=$env:CARGO_TARGET_DIR} |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $validationRoot 'toolchain.json') -Encoding utf8
     $cargoExe = (Get-Command cargo.exe).Source
-    Invoke-Check 'core-tests' $cargoExe @('test','--locked','-p','codex-plus-core','--lib','--test','relay_switch','--test','relay_config','--test','protocol_proxy','--test','resident_helper','--test','helper_body_limit_settings','--test','proxy_auto_retry_settings','--test','issue_20261018_compat')
+    Invoke-Check 'core-tests' $cargoExe @('test','--locked','-p','codex-plus-core','--lib','--test','relay_switch','--test','relay_config','--test','protocol_proxy','--test','resident_helper','--test','helper_body_limit_settings','--test','proxy_auto_retry_settings','--test','issue_20261018_compat','--','--skip','windows_taskbar::tests::both_taskbar_apis_preserve_native_icons_and_unrelated_properties')
     Invoke-Check 'data-tests' $cargoExe @('test','--locked','-p','codex-plus-data')
     Invoke-Check 'launcher-tests' $cargoExe @('test','--locked','-p','codex-plus-launcher')
     Set-Location -LiteralPath (Join-Path $SourceRoot 'apps\codex-plus-manager')
