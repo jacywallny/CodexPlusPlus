@@ -3180,11 +3180,21 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         extracted_context.as_str(),
     ]);
     settings.relay_common_config_contents = crate::relay_config::normalize_config_text(&common);
-    settings.relay_common_config_contents = crate::relay_config::set_local_thread_store_compression(
-        &settings.relay_common_config_contents,
-        settings.codex_app_rollout_compression_enabled,
-    )
-    .unwrap_or(settings.relay_common_config_contents);
+    // Keep legacy/empty common config empty until the user has explicitly
+    // enabled the switch or an existing preference needs to be updated.
+    let has_compression_preference =
+        crate::relay_config::local_thread_store_compression_from_config(
+            &settings.relay_common_config_contents,
+        )
+        .is_some();
+    if settings.codex_app_rollout_compression_enabled || has_compression_preference {
+        settings.relay_common_config_contents =
+            crate::relay_config::set_local_thread_store_compression(
+                &settings.relay_common_config_contents,
+                settings.codex_app_rollout_compression_enabled,
+            )
+            .unwrap_or(settings.relay_common_config_contents);
+    }
     settings.relay_context_config_contents = crate::relay_config::strip_legacy_skill_tables(
         &crate::relay_config::normalize_config_text(&context),
     );
