@@ -93,3 +93,7 @@
 - 默认直接提交并合入 `main`。
 - 仅在用户明确要求时创建 PR。
 - 提交信息、PR 描述里不加 `Co-Authored-By: Claude …` 等 AI 署名；本地 `.git/hooks/commit-msg` 也会自动删掉这一行。
+
+## 官方更新与 Jacy 构建
+
+本仓库的 Windows 融合与远程构建流程见 `docs/jacy-build-and-upstream-sync.md`。涉及官方更新时，先从 `origin/main` 吸收，再在个人 fork 的融合分支完成测试；Jacy 使用当前源码根目录下的持久 `target-jacy`，避免与其他工作树共享旧 target。构建脚本的 `status.json=complete` 且全部检查为 0 后，才允许进入部署阶段。构建通过不代表本机已经安装。
