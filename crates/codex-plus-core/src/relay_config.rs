@@ -174,6 +174,26 @@ fn table_mut_if_exists<'a>(doc: &'a mut DocumentMut, key: &str) -> Option<&'a mu
     doc.get_mut(key).and_then(Item::as_table_mut)
 }
 
+/// Update Codex's local session-store compression preference while preserving
+/// the rest of the shared config and feature flags.
+pub fn set_local_thread_store_compression(
+    common_config: &str,
+    enabled: bool,
+) -> anyhow::Result<String> {
+    let mut doc = parse_toml_document(common_config)?;
+    let features = table_mut_or_insert(&mut doc, "features")?;
+    features["local_thread_store_compression"] = toml_edit::value(enabled);
+    Ok(normalize_optional_toml(doc))
+}
+
+pub fn local_thread_store_compression_from_config(common_config: &str) -> Option<bool> {
+    let doc = parse_toml_document(common_config).ok()?;
+    doc.get("features")
+        .and_then(Item::as_table_like)
+        .and_then(|features| features.get("local_thread_store_compression"))
+        .and_then(Item::as_bool)
+}
+
 pub fn relay_status_from_home(home: &Path) -> RelayStatus {
     let auth = chatgpt_auth_status_from_home(home);
     let config = relay_config_status_from_home(home);
@@ -6344,6 +6364,23 @@ command = \"pwsh -File end.ps1\"
                 .unwrap();
         let doc = merged.parse::<DocumentMut>().unwrap();
         assert_eq!(doc["features"]["goals"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn local_thread_store_compression_preserves_other_feature_flags() {
+        let updated = set_local_thread_store_compression(
+            "model = \"gpt-5\"\n\n[features]\ngoals = true\n",
+            false,
+        )
+        .unwrap();
+        let doc = updated.parse::<DocumentMut>().unwrap();
+        assert_eq!(doc["model"].as_str(), Some("gpt-5"));
+        assert_eq!(doc["features"]["goals"].as_bool(), Some(true));
+        assert_eq!(
+            doc["features"]["local_thread_store_compression"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(local_thread_store_compression_from_config(&updated), Some(false));
     }
 
     #[test]

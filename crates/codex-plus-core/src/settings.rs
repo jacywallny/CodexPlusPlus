@@ -920,6 +920,10 @@ pub struct BackendSettings {
     pub relay_profiles_enabled: bool,
     #[serde(rename = "enhancementsEnabled", default = "default_true")]
     pub enhancements_enabled: bool,
+    /// Whether Codex may compress local session JSONL files into `.jsonl.zst`.
+    /// The default is off so local history remains directly inspectable.
+    #[serde(rename = "codexAppRolloutCompressionEnabled", default)]
+    pub codex_app_rollout_compression_enabled: bool,
     #[serde(rename = "codexAppStandaloneQuotaUnlock", default)]
     pub codex_app_standalone_quota_unlock: bool,
     /// 纯 API 供应商下启动前把详情模式写回 Codex 视图，避开 Work 视图要求 ChatGPT 账号（#2632）。
@@ -1240,6 +1244,7 @@ impl Default for BackendSettings {
             ccs_import_sources: BTreeMap::new(),
             relay_profiles_enabled: true,
             enhancements_enabled: true,
+            codex_app_rollout_compression_enabled: false,
             codex_app_standalone_quota_unlock: false,
             codex_app_disable_work_view: false,
             codex_app_plugin_marketplace_unlock: true,
@@ -3175,6 +3180,11 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         extracted_context.as_str(),
     ]);
     settings.relay_common_config_contents = crate::relay_config::normalize_config_text(&common);
+    settings.relay_common_config_contents = crate::relay_config::set_local_thread_store_compression(
+        &settings.relay_common_config_contents,
+        settings.codex_app_rollout_compression_enabled,
+    )
+    .unwrap_or(settings.relay_common_config_contents);
     settings.relay_context_config_contents = crate::relay_config::strip_legacy_skill_tables(
         &crate::relay_config::normalize_config_text(&context),
     );

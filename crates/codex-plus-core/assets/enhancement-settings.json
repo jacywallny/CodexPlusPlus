@@ -57,6 +57,14 @@
       "surfaces": ["manager", "codex"]
     },
     {
+      "key": "codexAppRolloutCompressionEnabled",
+      "group": "chat",
+      "control": "bool",
+      "title": "历史会话自动压缩为 zst",
+      "description": "关闭后本地会话保留为可直接查看的 JSONL，避免同步工具漏掉压缩会话；修改后需重新启动 Codex。默认关闭。",
+      "surfaces": ["manager", "codex"]
+    },
+    {
       "key": "codexAppNativeBrowserRequireIdentification",
       "group": "plugins",
       "control": "bool",

@@ -399,6 +399,7 @@ type BackendSettings = {
   relayProfilesEnabled: boolean;
   localConfigProviderImported: boolean;
   enhancementsEnabled: boolean;
+  codexAppRolloutCompressionEnabled: boolean;
   codexAppStandaloneQuotaUnlock: boolean;
   codexAppPluginMarketplaceUnlock: boolean;
   codexAppModelWhitelistUnlock: boolean;
@@ -1347,6 +1348,7 @@ const defaultSettings: BackendSettings = {
   relayProfilesEnabled: true,
   localConfigProviderImported: false,
   enhancementsEnabled: true,
+  codexAppRolloutCompressionEnabled: false,
   codexAppStandaloneQuotaUnlock: false,
   codexAppPluginMarketplaceUnlock: true,
   codexAppModelWhitelistUnlock: true,

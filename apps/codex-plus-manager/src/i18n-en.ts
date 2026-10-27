@@ -1486,6 +1486,8 @@ export const EN_PLAIN: Record<string, string> = {
   "启动 Codex": "Launch Codex",
   "启动任务": "Launch task",
   "启动前自动修复历史会话": "Auto-repair historical sessions before launch",
+  "历史会话自动压缩为 zst": "Automatically compress historical sessions to zst",
+  "关闭后本地会话保留为可直接查看的 JSONL，避免同步工具漏掉压缩会话；修改后需重新启动 Codex。默认关闭。": "When disabled, local sessions remain directly viewable JSONL so sync tools do not miss compressed sessions. Restart Codex after changing this setting. Disabled by default.",
   "纯 API 模式禁用 Work 视图": "Disable Work view in Pure API mode",
   "Work 视图要求 ChatGPT 账号身份，纯 API Key 下发送消息会报 Work browser access requires an authenticated account。开启后每次启动 Codex 前把详情模式写回 Codex；重新启动 Codex 后生效。": "Work view requires a ChatGPT account identity; with a Pure API key, sending a message fails with \"Work browser access requires an authenticated account\". When enabled, the detail mode is switched back to Codex before each launch. Restart Codex to apply.",
   "自动审批模型": "Auto-review model",
