@@ -29,7 +29,8 @@ try {
     if ($msvcLinker -notlike 'D:\DevTools\VSBuildTools\*') { throw "MSVC linker was not selected: $msvcLinker" }
     $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $msvcLinker
     $env:PATH = 'D:\Git\bin;D:\DevTools\Rust\cargo\bin;E:\Tools\nodejs;' + $env:PATH
-    $env:CARGO_TARGET_DIR = 'D:\github\CodexPlusPlus-compressed-session-fix-20261015\target'
+    # Keep this validation isolated from older worktrees and concurrent Jacy builds.
+    $env:CARGO_TARGET_DIR = Join-Path $SourceRoot 'target-jacy'
     $env:CODEX_GATE_TEST_POWERSHELL = (Get-Command pwsh.exe).Source
     Set-Location -LiteralPath $SourceRoot
     if ((git rev-parse HEAD) -ne $ExpectedCommit) { throw 'Wrong source commit' }
