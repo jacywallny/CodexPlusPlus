@@ -35,9 +35,11 @@ try {
     if ((git rev-parse HEAD) -ne $ExpectedCommit) { throw 'Wrong source commit' }
     git diff --quiet HEAD
     $package = Get-Content -LiteralPath 'apps\codex-plus-manager\package.json' -Raw | ConvertFrom-Json
-    $lock = Get-Content -LiteralPath 'apps\codex-plus-manager\package-lock.json' -Raw | ConvertFrom-Json -AsHashtable
+    # Windows PowerShell 5.1 on Jacy has no ConvertFrom-Json -AsHashtable.
+    $lock = Get-Content -LiteralPath 'apps\codex-plus-manager\package-lock.json' -Raw | ConvertFrom-Json
+    $lockRoot = $lock.packages.PSObject.Properties | Where-Object Name -eq '' | Select-Object -First 1 -ExpandProperty Value
     $tauri = Get-Content -LiteralPath 'apps\codex-plus-manager\src-tauri\tauri.conf.json' -Raw | ConvertFrom-Json
-    if ($package.version -ne $Version -or $lock.version -ne $Version -or $lock.packages[''].version -ne $Version -or $tauri.version -ne $Version) { throw 'Manifest version mismatch' }
+    if ($package.version -ne $Version -or $lock.version -ne $Version -or $lockRoot.version -ne $Version -or $tauri.version -ne $Version) { throw 'Manifest version mismatch' }
     @{source=$ExpectedCommit; linker=$msvcLinker; rustc=(& rustc --version); node=(& node --version); target=$env:CARGO_TARGET_DIR} |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $validationRoot 'toolchain.json') -Encoding utf8
     $cargoExe = (Get-Command cargo.exe).Source
