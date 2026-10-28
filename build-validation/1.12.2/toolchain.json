@@ -1,0 +1,7 @@
+{
+  "target": "D:\\github\\CodexPlusPlus-compressed-session-fix-20261015\\target",
+  "node": "v24.17.0",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "source": "ef58c7d50c8b01fd042e7f884e711278282329c8",
+  "linker": "D:\\DevTools\\VSBuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\HostX64\\x64\\link.exe"
+}

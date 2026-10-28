@@ -1,0 +1,14 @@
+{
+  "updatedAt": "2026-10-28T11:58:53.7002373+08:00",
+  "checks": {
+    "core-tests": {
+      "exitCode": 101
+    }
+  },
+  "version": "1.12.2",
+  "source": "ef58c7d50c8b01fd042e7f884e711278282329c8",
+  "stage": "failed",
+  "detail": {
+    "error": "Check failed: core-tests, exit=101"
+  }
+}

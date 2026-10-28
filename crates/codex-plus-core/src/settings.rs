@@ -4182,9 +4182,11 @@ experimental_bearer_token = "sk-existing""#
 
         let mut expected = settings;
         expected.settings_revision = store.revision().unwrap();
-        expected.tools.insert(ToolId::Codex, ToolConfig::default());
-        expected.relay_common_config_contents =
-            "[features]\nlocal_thread_store_compression = false\n".to_string();
+        let compression_config = "[features]\nlocal_thread_store_compression = false\n";
+        expected.relay_common_config_contents = compression_config.to_string();
+        let mut codex_tool = ToolConfig::default();
+        codex_tool.relay_common_config_contents = compression_config.to_string();
+        expected.tools.insert(ToolId::Codex, codex_tool);
         assert_eq!(store.load().unwrap(), expected);
     }
 
@@ -4820,7 +4822,7 @@ experimental_bearer_token = "sk-existing""#
 
         assert_eq!(
             updated.relay_common_config_contents,
-            "model_reasoning_effort = \"high\"\n\n[features]\nlocal_thread_store_compression = false\n"
+            "model_reasoning_effort = \"high\"\n[features]\nlocal_thread_store_compression = false\n"
         );
         assert!(
             updated
