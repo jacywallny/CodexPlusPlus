@@ -4822,7 +4822,7 @@ experimental_bearer_token = "sk-existing""#
 
         assert_eq!(
             updated.relay_common_config_contents,
-            "model_reasoning_effort = \"high\"\n[features]\nlocal_thread_store_compression = false\n"
+            "model_reasoning_effort = \"high\"\n\n[features]\nlocal_thread_store_compression = false\n"
         );
         assert!(
             updated
