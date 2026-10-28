@@ -421,19 +421,6 @@ pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Flush an existing file on every supported platform.
-///
-/// Windows rejects `FlushFileBuffers` for a read-only handle with
-/// `ERROR_ACCESS_DENIED`; opening the file read-write keeps the durability
-/// barrier valid for provider-sync backups and journals.
-pub(crate) fn sync_file(path: &Path) -> std::io::Result<()> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)?
-        .sync_all()
-}
-
 fn copy_hashed(
     reader: &mut impl Read,
     writer: &mut impl Write,
