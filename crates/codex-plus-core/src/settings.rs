@@ -4833,7 +4833,23 @@ experimental_bearer_token = "sk-existing""#
                 .relay_context_config_contents
                 .contains("[plugins.\"superpowers@openai-curated\"]")
         );
-        assert_eq!(store.load().unwrap(), updated);
+        let mut loaded = store.load().unwrap();
+        // 保存和重读可能调整 TOML 空行；配置语义和其余设置仍须完全一致。
+        let parse_config = |text: &str| toml::from_str::<toml::Value>(text).unwrap();
+        assert_eq!(
+            parse_config(&loaded.relay_common_config_contents),
+            parse_config(&updated.relay_common_config_contents)
+        );
+        loaded.relay_common_config_contents = updated.relay_common_config_contents.clone();
+        for (id, tool) in &mut loaded.tools {
+            let expected = updated.tools.get(id).unwrap();
+            assert_eq!(
+                parse_config(&tool.relay_common_config_contents),
+                parse_config(&expected.relay_common_config_contents)
+            );
+            tool.relay_common_config_contents = expected.relay_common_config_contents.clone();
+        }
+        assert_eq!(loaded, updated);
     }
 
     #[test]
