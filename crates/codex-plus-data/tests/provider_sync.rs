@@ -278,7 +278,7 @@ fn compressed_rollouts_survive_repeated_sync_and_bidirectional_provider_switches
     db.execute("INSERT INTO threads VALUES ('thread-compressed', 'openai', 0, 1, 'C:/workspace', 'Compressed Thread', ?1, 'cli', 100000, 200000, 'user', 'main')", [plain_path.to_string_lossy().as_ref()]).unwrap();
     drop(db);
     let catalog_db = home.join("sqlite/codex-dev.db");
-    create_local_thread_catalog_db(&catalog_db, &["thread-compressed"]);
+    create_local_thread_catalog_db(&catalog_db, &[("thread-compressed", "openai")]);
 
     for target in ["openai", "openai", "custom", "custom", "openai"] {
         let result = run_provider_sync_with_target(Some(&home), Some(target));
@@ -324,7 +324,7 @@ fn compressed_rollout_decode_failure_does_not_remove_catalog_rows() {
     let path = home.join("sessions/rollout-broken.jsonl.zst");
     fs::write(&path, b"not a zstd frame").unwrap();
     let catalog_db = home.join("sqlite/codex-dev.db");
-    create_local_thread_catalog_db(&catalog_db, &["thread-broken"]);
+    create_local_thread_catalog_db(&catalog_db, &[("thread-broken", "openai")]);
     let before = fs::read(&path).unwrap();
     let result = run_provider_sync(Some(&home));
     assert_ne!(result.status, ProviderSyncStatus::Synced);
