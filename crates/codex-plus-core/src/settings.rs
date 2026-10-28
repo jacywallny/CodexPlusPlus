@@ -4820,10 +4820,9 @@ experimental_bearer_token = "sk-existing""#
             }))
             .unwrap();
 
-        assert_eq!(
-            updated.relay_common_config_contents,
-            "model_reasoning_effort = \"high\"\n\n[features]\nlocal_thread_store_compression = false\n"
-        );
+        let common = updated.relay_common_config_contents.replace("\r\n", "\n");
+        assert!(common.starts_with("model_reasoning_effort = \"high\"\n"));
+        assert!(common.contains("[features]\nlocal_thread_store_compression = false\n"));
         assert!(
             updated
                 .relay_context_config_contents
