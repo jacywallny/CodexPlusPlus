@@ -1,0 +1,77 @@
+name: Compressed session fix Windows verification
+
+on:
+  push:
+    branches: [codex/compressed-session-sync-fix-20261015]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-verification:
+    runs-on: windows-latest
+    timeout-minutes: 55
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: compressed-session-fix
+      - name: Reproduce compressed session disappearance on unpatched source
+        shell: pwsh
+        run: |
+          $sourcePath = 'crates/codex-plus-data/src/provider_sync.rs'
+          $patched = [IO.File]::ReadAllBytes($sourcePath)
+          try {
+            $original = git show "a5f531d0:$sourcePath"
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot read the pinned baseline source' }
+            [IO.File]::WriteAllText($sourcePath, ($original -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+            cargo test -p codex-plus-data --locked --test provider_sync compressed_rollouts_survive_repeated_sync_and_bidirectional_provider_switches -- --nocapture 2>&1 | Tee-Object baseline-regression.log
+            $baselineExit = $LASTEXITCODE
+            if ($baselineExit -eq 0) { throw 'Unpatched baseline unexpectedly passed' }
+            if (-not (Select-String -LiteralPath baseline-regression.log -SimpleMatch 'compressed_rollouts_survive_repeated_sync_and_bidirectional_provider_switches ... FAILED' -Quiet)) { throw 'Baseline did not reach the expected regression assertion' }
+          } finally {
+            [IO.File]::WriteAllBytes($sourcePath, $patched)
+          }
+          $global:LASTEXITCODE = 0
+      - name: Data regression suite
+        shell: pwsh
+        run: |
+          cargo test -p codex-plus-data --locked 2>&1 | Tee-Object data-regression.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Launcher regression suite
+        shell: pwsh
+        run: |
+          $env:CODEX_GATE_TEST_POWERSHELL = (Get-Command pwsh).Source
+          cargo test -p codex-plus-launcher --locked 2>&1 | Tee-Object launcher-regression.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build frontend
+        working-directory: apps/codex-plus-manager
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run check
+          npm run vite:build
+      - name: Build patched Windows application
+        run: cargo build --release --locked -p codex-plus-manager --bin codex-plus-plus
+      - name: Hash application
+        shell: pwsh
+        run: Get-FileHash -Algorithm SHA256 -LiteralPath target/release/codex-plus-plus.exe | Format-List | Out-File -Encoding utf8 patched-application-sha256.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compressed-session-fix-windows
+          path: |
+            baseline-regression.log
+            data-regression.log
+            launcher-regression.log
+            patched-application-sha256.txt
+            target/release/codex-plus-plus.exe
+          if-no-files-found: error
