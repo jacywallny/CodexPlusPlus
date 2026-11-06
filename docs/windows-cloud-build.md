@@ -6,30 +6,31 @@
 
 - 上游版本：`BigPizzaV3/CodexPlusPlus` 的 `v2.3.1`。
 - 上游源码提交：`7d7832edfb93afbcc9759c8d970b07cbcb27ae44`。
-- 云端验证分支：`ci/windows-v2.3.1-20261106`。
+- 当前维护分支：`main`，源码基线为已验证的 `2.3.1`。
+- 首次云端验证分支：`ci/windows-v2.3.1-20261106`，已在分支收敛时归档。
 - 首次 CI 提交：`432beedc2fbaee18fb085596e46624184b2c5d84`。
 - 本地检出：`D:\github\CodexPlusPlus-2.3.1-project-state-repair`。
 
-同步时发现 fork 的 `main` 与上游已经分叉：上游领先 1527 个提交，fork 有 8 个独立提交。因此使用独立验证分支，没有强推或覆盖 `main`。该分支的 Rust、前端及注入脚本与上游 `v2.3.1` 相同，构建能力的调整位于 `.github/workflows/pr-build.yml`。旧分支上的定制功能尚未逐项移植到这个源码基线。
+首次同步时 fork 的旧 `main` 与上游已经分叉：上游领先 1527 个提交，fork 有 8 个独立提交，当时使用独立验证分支。发布成功后，按用户确认，将已验证的 `2.3.1` 和 CI 优化整理为唯一维护分支 `main`；通过保留旧 `main` 为合并父提交的方式正常推进，没有强推改写历史。当前 Rust、前端及注入脚本与已验证构建相同；旧分支上的定制功能保存在归档中，尚未逐项移植到这个源码基线。
 
 ## 触发 Windows 构建
 
 前提是 GitHub CLI 已登录，且对仓库有运行 Actions 的权限。下面的 `gh` 表示 PATH 中可用的 GitHub CLI；本机本次使用 `D:\DevTools\GitHubCLI\bin\gh.exe`。
 
 ```powershell
-gh workflow run pr-build.yml --repo jacywallny/CodexPlusPlus --ref ci/windows-v2.3.1-20261106 -f platform=windows
+gh workflow run pr-build.yml --repo jacywallny/CodexPlusPlus --ref main -f platform=windows
 ```
 
-`platform` 支持 `windows`、`macos`、`linux`、`all`，默认 `all`。需要通过 `--ref` 指定包含平台选择配置的分支；旧 `main` 尚没有这个新增参数。日常 Windows 验证使用 `windows`，避免同时启动其他平台的构建。
+`platform` 支持 `windows`、`macos`、`linux`、`all`，默认 `all`。配置已经并入 `main`。日常手动 Windows 验证使用 `--ref main -f platform=windows`，避免同时启动其他平台的构建。
 
-该分支当前仅手动触发。后续修改推送到此分支后，需再次运行上面的命令；仅推送此分支不会自动构建。
+`main` 的普通推送会按现有配置自动触发各平台构建；需要仅验证 Windows 时使用上述手动命令。本次分支收敛仅涉及历史整理和文档，应用源码未变，提交带 `[skip ci]`，没有重复触发完整构建。
 
 ## 跟踪结果
 
 触发命令返回本次 Actions 运行链接。获取和跟踪运行时，保留明确的运行编号与提交 SHA，避免误读其他版本的历史成功记录：
 
 ```powershell
-gh run list --repo jacywallny/CodexPlusPlus --branch ci/windows-v2.3.1-20261106 --event workflow_dispatch --limit 5 --json databaseId,headSha,status,conclusion,url
+gh run list --repo jacywallny/CodexPlusPlus --branch main --event workflow_dispatch --limit 5 --json databaseId,headSha,status,conclusion,url
 gh run view <RUN_ID> --repo jacywallny/CodexPlusPlus
 gh run watch <RUN_ID> --repo jacywallny/CodexPlusPlus --exit-status --interval 30
 ```
@@ -122,7 +123,7 @@ GitHub 在 Artifacts 列表显示的 digest 是产物压缩包的摘要，与这
 本 fork 的发布流程支持仅发布 Windows，并直接复用同仓库成功的 `PR build artifacts` 运行，免于再次编译 Rust 和前端。完整测试运行编号、版本、提交及 EXE 的 SHA-256 必须全部匹配；使用过 Rust 测试筛选的产物会被拒绝。正式 NSIS 安装包会用已校验的 EXE 重新打包，确保安装登记版本使用正式版本号。
 
 ```powershell
-gh workflow run release-assets.yml --repo jacywallny/CodexPlusPlus --ref ci/windows-v2.3.1-20261106 -f tag=v2.3.1 -f platform=windows -f publish=true -f windows_build_run_id=42233898399
+gh workflow run release-assets.yml --repo jacywallny/CodexPlusPlus --ref main -f tag=v2.3.1 -f platform=windows -f publish=true -f windows_build_run_id=42233898399
 ```
 
 该命令会公开发布版本，只有确认需要发版时才执行。日常仅验证构建时使用前面的 `pr-build.yml` 命令。
@@ -177,3 +178,22 @@ a579f539bee7940bc18356069f9a4492d5dddb43481a4547777ba18a29c3e4f9  CodexPlusPlus-
 已下载公开 Release 的5个附件：安装包与 ZIP 的本地 SHA-256 均与清单一致，ZIP 只包含一个 Windows x64 的 `codex-plus-plus.exe`，其 SHA-256 与首次 CI 的 `33446f5ec26fdcee7869757e783cfe4dcd9f11903d17a865bcaeec31de9ad0bf` 一致。`build-info.json` 的源提交、版本和两个运行编号均匹配；`latest.json` 的版本、说明、正式页面地址及附件列表一致。
 
 这些副本仅用于核验，没有执行或安装。本地证据为任务工作目录 `work/release-2.3.1/verification-summary.json` 与 `verify-release.py`。
+
+## 分支收敛与恢复
+
+2026-11-06 以已发布的 `2.3.1` 和云端构建优化作为 `main`，其他14个远程分支清理前，已为全部15个原分支建立并验证恢复标签：
+
+```text
+archive/branches/20261106-233558/<原分支名>
+```
+
+其中旧 `main` 为 `ea39facf149487fcd44553595cf1a0b28372c98c`，归档标签为 `archive/branches/20261106-233558/main`；验证分支归档保留整理前的提交 `4545c9786e4382e7c344ecad706db9a4709dd5f4`。这些是恢复标签，不作为新的发布版本，也不触发 `v*` 发版工作流。
+
+要检查旧代码，可从标签恢复到单独的本地分支，再决定后续处理：
+
+```powershell
+git fetch fork tag archive/branches/20261106-233558/main
+git switch -c recovered-old-main archive/branches/20261106-233558/main
+```
+
+旧版 PR #1 的来源 `codex/provider-startup-repair` 同样已归档；PR 记录保留，按此次只保留新 `main` 的安排关闭。GitHub Release、版本标签、已发布附件和缓存均不主动删除；其他本地检出目录也不清理。本次没有重新编译，因此迁移到 `main` 后首次构建的缓存命中与耗时仍待实测。
