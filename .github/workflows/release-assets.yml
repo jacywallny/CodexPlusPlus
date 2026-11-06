@@ -90,7 +90,12 @@ jobs:
             } catch (error) {
               if (error.status !== 404) throw error;
               // GITHUB_TOKEN 创建的标签不会再触发另一轮 push 构建。
-              await github.rest.git.createRef({ ...context.repo, ref: `refs/tags/${tag}`, sha: run.head_sha });
+              try {
+                await github.rest.git.createRef({ ...context.repo, ref: `refs/tags/${tag}`, sha: run.head_sha });
+              } catch (createError) {
+                if (createError.status !== 403) throw createError;
+                throw new Error(`工作流令牌不能为此提交创建标签；请用维护者权限预建 ${tag} → ${run.head_sha}，再重新运行发布。无需增加仓库密钥。`);
+              }
             }
             core.notice(`复用成功运行 ${id}，标签 ${tag} 指向 ${run.head_sha}`);
 

@@ -131,6 +131,49 @@ gh workflow run release-assets.yml --repo jacywallny/CodexPlusPlus --ref ci/wind
 
 复用模式首次发版会用工作流的 `GITHUB_TOKEN` 创建缺失的 fork 标签，使标签精确指向成功构建的提交；此操作不会触发另一轮 tag push 构建。已有标签与构建不一致时会拒绝操作，禁止覆盖标签。
 
+如果目标提交含相对默认分支的工作流修改，GitHub 可能在创建标签时返回 `403 Resource not accessible by integration`；本次首轮运行 `42241055387` 即遇到这一限制。无需向仓库添加个人令牌密钥，可以用已登录维护者的 CLI 预建精确标签，再运行上面的命令。为避免预建标签另起默认双平台发版，暂挂的仅是 `Release assets`，并在 `finally` 中恢复：
+
+```powershell
+$releaseWorkflowDisabled = $false
+try {
+    gh workflow disable release-assets.yml --repo jacywallny/CodexPlusPlus
+    if ($LASTEXITCODE -ne 0) { throw '暂挂自动 tag 发布失败' }
+    $releaseWorkflowDisabled = $true
+    gh api --method POST repos/jacywallny/CodexPlusPlus/git/refs -f ref=refs/tags/v2.3.1 -f sha=432beedc2fbaee18fb085596e46624184b2c5d84
+    if ($LASTEXITCODE -ne 0) { throw '创建发布标签失败' }
+} finally {
+    if ($releaseWorkflowDisabled) {
+        gh workflow enable release-assets.yml --repo jacywallny/CodexPlusPlus
+        if ($LASTEXITCODE -ne 0) { throw '重新启用发布工作流失败' }
+    }
+}
+```
+
+标签已存在时跳过预建，不删除、移动或覆盖它。后续版本替换命令前，应先核对实际版本、成功运行编号与提交，不能照抄本次提交。
+
 本 fork 的 `v2.3.1` 标签对应已验证提交 `432beedc2fbaee18fb085596e46624184b2c5d84`，其中应用源码与上游 `v2.3.1` 相同，另含 CI 调整。上游同名标签仍指向 `7d7832edfb93afbcc9759c8d970b07cbcb27ae44`；从两个远端获取标签时注意区分来源，不强制覆盖本地标签。
 
 发布说明会注明仅提供 Windows，以及旧定制分支未逐项合入、此次未新增项目恢复修复等边界。该流程不会部署本机。
+
+## 本次正式发布结果
+
+2026-11-06 **23:17:36（Asia/Shanghai）**，`jacywallny/CodexPlusPlus` 的 `v2.3.1` 已公开发布，`draft=false`、`prerelease=false`，并标为 Latest。
+
+- Release：`https://github.com/jacywallny/CodexPlusPlus/releases/tag/v2.3.1`。
+- 成功发版运行：`https://github.com/jacywallny/CodexPlusPlus/actions/runs/42241273288`。
+- 工作流提交：`15dba0236f85095e776a3be53d1818a0d2dc6d5f`，运行 23:15:03–23:17:39，总耗时 **2分36秒**。
+- Windows 作业成功，macOS 按平台参数跳过；正式 NSIS 打包44秒。
+- 发布附件共5个：Windows 安装包、便携 ZIP、`SHA256SUMS.txt`、`build-info.json`、`latest.json`。
+
+本次复用了运行 `42233898399` 的 EXE，没有重新编译，也没有重跑该次已通过的完整测试；2分36秒是这次复用与重新打包发布的耗时，不能当作一次完整构建的耗时。
+
+正式发布文件 SHA-256：
+
+```text
+4acaa81fe1a04517d5ffc8360ab180eb1b5e6cfad075e960ec4ddc8a04db5c9e  CodexPlusPlus-2.3.1-windows-x64-setup.exe
+a579f539bee7940bc18356069f9a4492d5dddb43481a4547777ba18a29c3e4f9  CodexPlusPlus-2.3.1-windows-x64.zip
+```
+
+已下载公开 Release 的5个附件：安装包与 ZIP 的本地 SHA-256 均与清单一致，ZIP 只包含一个 Windows x64 的 `codex-plus-plus.exe`，其 SHA-256 与首次 CI 的 `33446f5ec26fdcee7869757e783cfe4dcd9f11903d17a865bcaeec31de9ad0bf` 一致。`build-info.json` 的源提交、版本和两个运行编号均匹配；`latest.json` 的版本、说明、正式页面地址及附件列表一致。
+
+这些副本仅用于核验，没有执行或安装。本地证据为任务工作目录 `work/release-2.3.1/verification-summary.json` 与 `verify-release.py`。
