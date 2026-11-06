@@ -6,6 +6,11 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      platform:
+        description: "构建平台；日常 Windows 验证无需等待其他平台"
+        default: all
+        type: choice
+        options: [all, windows, macos, linux]
       rust_test_filter:
         description: "只跑名字匹配的 Rust 用例并串行执行（留空跑全量），排查平台相关失败时用"
         default: ""
@@ -14,10 +19,16 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: pr-build-${{ github.event.pull_request.number || github.ref }}-${{ inputs.platform || 'all' }}
+  cancel-in-progress: true
+
 jobs:
   windows-artifacts:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows'
     name: Windows artifacts
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,9 +37,17 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/codex-plus-manager/package-lock.json
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-ci
+          cache-on-failure: true
 
       - name: Install NSIS
         shell: pwsh
@@ -91,13 +110,13 @@ jobs:
           RUST_TEST_FILTER: ${{ inputs.rust_test_filter }}
         run: |
           if ($env:RUST_TEST_FILTER) {
-            cargo test --workspace -- $env:RUST_TEST_FILTER --test-threads=1
+            cargo test --workspace --locked -- $env:RUST_TEST_FILTER --test-threads=1
           } else {
-            cargo test --workspace
+            cargo test --workspace --locked
           }
 
       - name: Build release application
-        run: cargo build --release
+        run: cargo build --release --locked -p codex-plus-manager
 
       - name: Stage Windows app files
         shell: pwsh
@@ -135,6 +154,33 @@ jobs:
             Pop-Location
           }
 
+      - name: Record build provenance and checksums
+        shell: pwsh
+        env:
+          RUST_TEST_FILTER: ${{ inputs.rust_test_filter }}
+        run: |
+          $appVersion = (Get-Content -LiteralPath apps/codex-plus-manager/package.json -Raw | ConvertFrom-Json).version
+          $buildInfo = [ordered]@{
+            version = $appVersion
+            commit = $env:GITHUB_SHA
+            ref = $env:GITHUB_REF
+            repository = $env:GITHUB_REPOSITORY
+            runId = $env:GITHUB_RUN_ID
+            runAttempt = $env:GITHUB_RUN_ATTEMPT
+            runnerOS = $env:RUNNER_OS
+            rustVersion = (rustc --version)
+            testFilter = $env:RUST_TEST_FILTER
+          }
+          $buildInfo | ConvertTo-Json | Set-Content -LiteralPath dist/windows/build-info.json -Encoding utf8NoBOM
+          $files = @('dist/windows/app/codex-plus-plus.exe') + @(Get-ChildItem -LiteralPath dist/windows -Filter *.exe | ForEach-Object FullName)
+          $checksums = foreach ($file in $files) {
+            $hash = Get-FileHash -LiteralPath $file -Algorithm SHA256
+            '{0}  {1}' -f $hash.Hash.ToLowerInvariant(), (Split-Path -Leaf $file)
+          }
+          $checksums | Set-Content -LiteralPath dist/windows/SHA256SUMS.txt -Encoding utf8NoBOM
+          "Windows build: version $appVersion, commit $env:GITHUB_SHA" >> $env:GITHUB_STEP_SUMMARY
+          Get-Content -LiteralPath dist/windows/SHA256SUMS.txt >> $env:GITHUB_STEP_SUMMARY
+
       - name: Upload Windows binaries
         uses: actions/upload-artifact@v4
         with:
@@ -149,7 +195,17 @@ jobs:
           path: dist/windows/*.exe
           if-no-files-found: error
 
+      - name: Upload Windows build metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-plus-plus-windows-build-info
+          path: |
+            dist/windows/build-info.json
+            dist/windows/SHA256SUMS.txt
+          if-no-files-found: error
+
   macos-dmg:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos'
     # PR 构建也出通用包，跟发版产物保持一致，避免只在发版时才暴露问题。
     # 没有签名密钥，所以这里走 ad-hoc（脚本的默认行为）。
     name: macOS DMG (universal)
@@ -238,6 +294,7 @@ jobs:
           if-no-files-found: error
 
   linux-deb:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux'
     name: Linux DEB (Ubuntu 24.04, amd64)
     runs-on: ubuntu-24.04
     steps:
