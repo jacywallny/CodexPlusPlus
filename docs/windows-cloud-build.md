@@ -116,3 +116,21 @@ GitHub 在 Artifacts 列表显示的 digest 是产物压缩包的摘要，与这
 已将 EXE 与安装包下载到任务临时工作目录，并分别计算 SHA-256；两者均与上述 CI 清单一致。下载副本没有执行。
 
 本次证明该提交可在 GitHub Windows runner 上通过流程、编译和打包。没有运行或安装产物，没有验证供应商切换后的项目恢复行为，也没有执行第二轮缓存命中耗时对比。后续补充本文档的提交不改变本次已经核验的构建 SHA。
+
+## 发布已通过的 Windows 构建
+
+本 fork 的发布流程支持仅发布 Windows，并直接复用同仓库成功的 `PR build artifacts` 运行，免于再次编译 Rust 和前端。完整测试运行编号、版本、提交及 EXE 的 SHA-256 必须全部匹配；使用过 Rust 测试筛选的产物会被拒绝。正式 NSIS 安装包会用已校验的 EXE 重新打包，确保安装登记版本使用正式版本号。
+
+```powershell
+gh workflow run release-assets.yml --repo jacywallny/CodexPlusPlus --ref ci/windows-v2.3.1-20261106 -f tag=v2.3.1 -f platform=windows -f publish=true -f windows_build_run_id=42233898399
+```
+
+该命令会公开发布版本，只有确认需要发版时才执行。日常仅验证构建时使用前面的 `pr-build.yml` 命令。
+
+`windows_build_run_id` 留空时仍采用原有重新编译流程；默认 `platform=all` 的双平台完整性检查保持不变。显式选择 `windows` 时只要求 Windows 安装包、便携 ZIP 和校验清单齐备，再生成 `latest.json` 并自动发布。整个过程由 `Release assets` 工作流管理草稿和发布，不手工创建 Release。
+
+复用模式首次发版会用工作流的 `GITHUB_TOKEN` 创建缺失的 fork 标签，使标签精确指向成功构建的提交；此操作不会触发另一轮 tag push 构建。已有标签与构建不一致时会拒绝操作，禁止覆盖标签。
+
+本 fork 的 `v2.3.1` 标签对应已验证提交 `432beedc2fbaee18fb085596e46624184b2c5d84`，其中应用源码与上游 `v2.3.1` 相同，另含 CI 调整。上游同名标签仍指向 `7d7832edfb93afbcc9759c8d970b07cbcb27ae44`；从两个远端获取标签时注意区分来源，不强制覆盖本地标签。
+
+发布说明会注明仅提供 Windows，以及旧定制分支未逐项合入、此次未新增项目恢复修复等边界。该流程不会部署本机。
