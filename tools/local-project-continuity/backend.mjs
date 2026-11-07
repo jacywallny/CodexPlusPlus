@@ -82,7 +82,7 @@ export default function ({dataDir}) {
       if (!record) return {busy:true};
       const snapshot = currentSnapshot(record);
       const validThreadIds = existingThreads(record.home);
-      const filtered = core.sanitize(snapshot.globals, snapshot.atoms, validThreadIds);
+      const filtered = core.sanitize(snapshot.globals, snapshot.atoms, validThreadIds, snapshot.removedProjects);
       return {token:record.token, snapshot:{...snapshot,...filtered}, validThreadIds,
         backupDirectory:path.join(record.directory, 'backups')};
     },
@@ -99,9 +99,9 @@ export default function ({dataDir}) {
       const file = path.join(record.directory, 'shared-projects.json');
       const previous = currentSnapshot(record);
       if (previous.revision !== parameters.revision) throw Error('Snapshot changed; refusing stale commit');
-      const next = core.sanitize(parameters.current.globals, parameters.current.atoms, existingThreads(record.home));
-      if (same({globals:previous.globals,atoms:previous.atoms},next)) return {revision:previous.revision, changed:false};
-      atomic(file, {version:1, revision:previous.revision+1, updatedAt:new Date().toISOString(), ...next});
+      const next = core.advance(previous, parameters.current, existingThreads(record.home), parameters);
+      if (same({globals:previous.globals,atoms:previous.atoms,removedProjects:previous.removedProjects || {}},next)) return {revision:previous.revision, changed:false};
+      atomic(file, {version:2, revision:previous.revision+1, updatedAt:new Date().toISOString(), ...next});
       return {revision:previous.revision+1, changed:true};
     },
   };

@@ -3,7 +3,7 @@
   const core = window.__CodexLocalProjectContinuityCore;
   if (!core || !window.codexPlus?.extension) throw Error('Codex++ extension API is unavailable');
   window.codexPlus.extension(ctx => {
-    const status = {version:'0.1.0', phase:'starting', projects:0, assignments:0, error:null};
+    const status = {version:'0.2.0', phase:'starting', projects:0, assignments:0, removedProjects:0, error:null};
     window.__codexLocalProjectContinuity = status;
     let services, home, token, revision, prepared, busy=false, generation=null, ready=false;
     let stopped = false;
@@ -57,14 +57,24 @@
     }
     async function restore() {
       status.phase='checking';
-      const current=await readCurrent();
-      const plan=core.plan(prepared.snapshot,current);
+      let current=await readCurrent();
+      let plan=core.plan(prepared.snapshot,current);
       const orderChanged=JSON.stringify(plan.order)!==JSON.stringify(current.globals['project-order'] || []);
-      const changed=Object.keys(plan.updates).length || plan.assignments.length || orderChanged || plan.atomsChanged;
+      const changed=Object.keys(plan.updates).length || plan.assignments.length || orderChanged || plan.atomsChanged || plan.removedProjectIds.length;
       if(changed) {
         const backup=await ctx.backend.call('backup',{home,token,before:current,
           counts:{projects:plan.projectCount,assignments:plan.assignments.length,keys:Object.keys(plan.updates)}});
         status.backup=backup.file;
+        for(const id of plan.removedProjectIds) {
+          await assertIdentity();
+          if(typeof services.projects.removeLocal!=='function') throw Error('Native project removal is unavailable');
+          await within(services.projects.removeLocal(id));
+        }
+        if(plan.removedProjectIds.length) {
+          current=await readCurrent();
+          plan=core.plan(prepared.snapshot,current);
+          if(plan.removedProjectIds.length) throw Error('Native project readback still contains removed entries');
+        }
         for(const [key,value] of Object.entries(plan.updates)) await write(key,value);
         if(orderChanged) { await assertIdentity(); await within(services.projects.setProjectOrder(plan.order)); }
         for(let index=0;index<plan.assignments.length;index+=100) {
@@ -86,7 +96,7 @@
       status.projects=Object.keys(projects).length;
       status.assignments=Object.keys(actualAssignments).length;
       status.restoredAssignments=plan.assignments.length;
-      await ctx.backend.call('commit',{home,token,revision,current:actual});
+      await ctx.backend.call('commit',{home,token,revision,current:actual,mode:'restore'});
       ready=true;
       status.phase='ready';status.error=null;status.verifiedAt=new Date().toISOString();
       if(changed) ctx.toast(`本地项目已恢复：${status.projects} 个项目；切换后将自动检查`,{type:'success'});
@@ -101,6 +111,7 @@
         prepared=await ctx.backend.call('prepare',{home,windowId});
         if(prepared.busy) {status.phase='standby';return;}
         token=prepared.token;revision=prepared.snapshot.revision;
+        status.removedProjects=Object.keys(prepared.snapshot.removedProjects || {}).length;
         if(!ready) await restore();
         else {
           const current=await readCurrent();
@@ -122,6 +133,20 @@
     ctx.listen(window,'focus',tick);
     ctx.on('dispose',()=>{stopped=true;});
     status.check=tick;
+    status.rememberRemovedProjects=async removedProjects=>{
+      if(busy || !ready || stopped || ctx.disposed) throw Error('Continuity is not ready to save the current baseline');
+      busy=true;
+      try {
+        const saved=await ctx.backend.call('prepare',{home,windowId});
+        if(saved.busy) throw Error('Another window owns the continuity lease');
+        const current=await readCurrent();
+        await assertIdentity();
+        await ctx.backend.call('commit',{home,token:saved.token,revision:saved.snapshot.revision,current,removedProjects});
+      } finally {busy=false;}
+      await tick();
+      if(status.phase!=='ready') throw Error(status.error || 'Current project baseline was not saved');
+      return {projects:status.projects,assignments:status.assignments,removedProjects:status.removedProjects};
+    };
     void tick();
   });
 })();

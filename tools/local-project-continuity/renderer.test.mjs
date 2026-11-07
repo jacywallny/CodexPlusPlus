@@ -33,7 +33,18 @@ test('full renderer restores new identities and page boots, retains subsequent e
   const flush=()=>fs.writeFileSync(path.join(home,'.codex-global-state.json'),JSON.stringify(state));
   flush();
   const services={
-    projects:{getLocalProjects:async()=>structuredClone(state['local-projects'] || {}),setProjectOrder:async value=>{state['project-order']=value;flush();}},
+    projects:{getLocalProjects:async()=>structuredClone(state['local-projects'] || {}),setProjectOrder:async value=>{state['project-order']=value;flush();},
+      removeLocal:async id=>{
+        delete state['local-projects'][id];
+        state['project-order']=(state['project-order'] || []).filter(value=>value!==id);
+        for(const [threadId,value] of Object.entries(state['thread-project-assignments'] || {})) {
+          if(value.projectId===id) {
+            delete state['thread-project-assignments'][threadId];
+            state['projectless-thread-ids']=[...(state['projectless-thread-ids'] || []),threadId];
+          }
+        }
+        flush();
+      }},
     executionPaths:{readCodexHome:async()=>home},
     applicationState:{read:async key=>({value:state[key]??null}),write:async(key,value)=>{
       assert.ok(!['thread-project-assignments','project-order','projectless-thread-ids'].includes(key));
@@ -94,9 +105,25 @@ test('full renderer restores new identities and page boots, retains subsequent e
   delete state['local-projects'].p1;state['project-order']=['p2'];flush();
   await renderer.status.check();
   renderer.dispose();
-  state={'electron-account-renderer-state-v1':{owner:null,inactive:{}}};flush();
+  // The former subscription still has the removed project in its cached list.
+  state={'electron-account-renderer-state-v1':{owner:null,inactive:{}},
+    'local-projects':{p1:project('p1'),p2:project('p2')},'project-order':['p1','p2'],
+    'thread-project-assignments':{t1:assignment('p2'),t2:assignment('p2')}};flush();
   renderer=await startRenderer();
   assert.deepEqual(Object.keys(state['local-projects']),['p2']);
   assert.equal(renderer.status.assignments,2);
+  assert.equal(renderer.status.removedProjects,1);
+  // A newly added project is accepted; the former project is still suppressed.
+  state={'electron-account-renderer-state-v1':{owner:'ownerC',inactive:{}},
+    'local-projects':{p1:project('p1'),p3:project('p3')},'project-order':['p1','p3']};flush();
+  await renderer.status.check();
+  assert.deepEqual(Object.keys(state['local-projects']).sort(),['p2','p3']);
+  assert.equal(renderer.status.assignments,2);
+  // Re-adding an entry explicitly during normal operation remains supported.
+  state['local-projects'].p1=project('p1');flush();
+  await renderer.status.check();
+  state={'electron-account-renderer-state-v1':{owner:'ownerD',inactive:{}}};flush();
+  await renderer.status.check();
+  assert.deepEqual(Object.keys(state['local-projects']).sort(),['p1','p2','p3']);
   renderer.dispose();
 });

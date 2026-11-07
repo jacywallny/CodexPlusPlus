@@ -21,6 +21,29 @@
     && value.rootPaths.every(path => typeof path === 'string' && path.length > 0)
     && !value.chatGptBacking && !value.chatGptBackingRecoveryPending;
   const unique = values => [...new Set(values.filter(value => typeof value === 'string'))];
+  function pruneRemoved(globals, removedProjects) {
+    const result=clone(object(globals)), removed=object(removedProjects), ids=new Set(Object.keys(removed));
+    if(!ids.size) return result;
+    const presentationIds=new Set(ids);
+    for(const mapping of Object.values(object(result['app-server-project-id-by-legacy-project-id-by-host']))) {
+      for(const [id,serverId] of Object.entries(object(mapping))) if(ids.has(id)) presentationIds.add(serverId);
+    }
+    if(own(result,PROJECTS)) result[PROJECTS]=Object.fromEntries(Object.entries(object(result[PROJECTS])).filter(([id])=>!ids.has(id)));
+    if(own(result,ASSIGNMENTS)) result[ASSIGNMENTS]=Object.fromEntries(Object.entries(object(result[ASSIGNMENTS])).filter(([,value])=>!ids.has(value?.projectId)));
+    for(const key of ['project-order','pinned-project-ids']) if(Array.isArray(result[key])) result[key]=result[key].filter(id=>!ids.has(id));
+    for(const key of ['project-appearances','sidebar-project-thread-orders']) {
+      if(own(result,key)) result[key]=Object.fromEntries(Object.entries(object(result[key])).filter(([id])=>!presentationIds.has(id)));
+    }
+    const normalize=value=>String(value).replaceAll('\\','/').replace(/\/$/,'').toLowerCase();
+    const retainedRoots=new Set(Object.values(object(result[PROJECTS])).flatMap(project=>project.rootPaths || []).map(normalize));
+    const removedRoots=new Set(Object.values(removed).flatMap(project=>project.rootPaths || []).map(normalize).filter(root=>!retainedRoots.has(root)));
+    if(Array.isArray(result['electron-saved-workspace-roots'])) result['electron-saved-workspace-roots']=result['electron-saved-workspace-roots'].filter(root=>!removedRoots.has(normalize(root)));
+    if(own(result,'electron-workspace-root-labels')) result['electron-workspace-root-labels']=Object.fromEntries(Object.entries(object(result['electron-workspace-root-labels'])).filter(([root])=>!removedRoots.has(normalize(root))));
+    if(own(result,'app-server-project-id-by-legacy-project-id-by-host')) {
+      result['app-server-project-id-by-legacy-project-id-by-host']=Object.fromEntries(Object.entries(object(result['app-server-project-id-by-legacy-project-id-by-host'])).map(([host,mapping])=>[host,Object.fromEntries(Object.entries(object(mapping)).filter(([id])=>!ids.has(id)))]));
+    }
+    return result;
+  }
   function mergeHostMaps(older, newer) {
     const result={...object(older)};
     for(const [host,mapping] of Object.entries(object(newer))) result[host]={...object(result[host]),...object(mapping)};
@@ -47,8 +70,8 @@
     return result;
   }
 
-  function sanitize(globals, atoms, validThreadIds) {
-    globals = object(globals);
+  function sanitize(globals, atoms, validThreadIds, removedProjects={}) {
+    globals = pruneRemoved(globals,removedProjects);
     const valid = new Set(validThreadIds);
     const projects = Object.fromEntries(Object.entries(object(globals[PROJECTS])).filter(([id, project]) => plainProject(id, project)));
     const ids = new Set(Object.keys(projects));
@@ -101,6 +124,11 @@
 
   function plan(snapshot, current) {
     const updates = {};
+    const removed=object(snapshot.removedProjects);
+    const removedProjectIds=Object.entries(object(current.globals?.[PROJECTS])).filter(([id,project])=>own(removed,id) && plainProject(id,project)).map(([id])=>id);
+    const original=current;
+    snapshot={...snapshot,globals:pruneRemoved(snapshot.globals,removed)};
+    current={...current,globals:pruneRemoved(current.globals,removed)};
     const currentProjects = object(current.globals?.[PROJECTS]);
     const projects = {...object(snapshot.globals?.[PROJECTS]), ...currentProjects};
     for (const key of GLOBAL_KEYS) {
@@ -111,7 +139,7 @@
       else if (Array.isArray(old) || Array.isArray(live)) value = unique([...(live || []), ...(old || [])]);
       else if(key==='app-server-project-id-by-legacy-project-id-by-host') value=mergeHostMaps(old,live);
       else value = {...object(old), ...object(live)};
-      if (JSON.stringify(value) !== JSON.stringify(live ?? (Array.isArray(value) ? [] : {}))) updates[key] = value;
+      if (JSON.stringify(value) !== JSON.stringify(original.globals?.[key] ?? (Array.isArray(value) ? [] : {}))) updates[key] = value;
     }
     const projectless = new Set(current.globals?.['projectless-thread-ids'] || []);
     const assignments = Object.entries(object(snapshot.globals?.[ASSIGNMENTS])).filter(([id, assignment]) =>
@@ -133,8 +161,20 @@
       atoms['electron:onboarding-welcome-pending'] = false;
     }
     return {updates, assignments, order, atoms, atomsChanged: JSON.stringify(atoms) !== JSON.stringify(current.atoms || {}),
-      projectCount:Object.keys(projects).length};
+      projectCount:Object.keys(projects).length, removedProjectIds};
   }
 
-  return {GLOBAL_KEYS, ATOM_KEYS, seed, sanitize, plan, mergeSnapshots, plainProject};
+  function advance(previous, current, validThreadIds, options={}) {
+    const removedProjects=clone(object(previous.removedProjects));
+    const currentProjects=object(current.globals?.[PROJECTS]);
+    for(const [id,project] of Object.entries({...object(previous.globals?.[PROJECTS]),...object(options.removedProjects)})) {
+      if(!own(currentProjects,id) && plainProject(id,project)) removedProjects[id]=clone(project);
+    }
+    // Only a normal live observation may acknowledge a user's explicit re-add.
+    // A restore from another account's stale cache must keep removal markers.
+    if(options.mode!=='restore') for(const id of Object.keys(currentProjects)) delete removedProjects[id];
+    return {...sanitize(current.globals,current.atoms,validThreadIds,removedProjects),removedProjects};
+  }
+
+  return {GLOBAL_KEYS, ATOM_KEYS, seed, sanitize, plan, advance, mergeSnapshots, plainProject};
 });

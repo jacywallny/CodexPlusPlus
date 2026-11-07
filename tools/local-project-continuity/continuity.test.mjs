@@ -117,3 +117,34 @@ test('backend keeps only the three newest repair backups',()=>{
   assert.equal(new Set(remaining).size,3);
   assert.ok(created.slice(-1).every(file=>fs.existsSync(file)));
 });
+
+test('removed projects stay removed when returning to an old account cache',()=>{
+  const previous=snapshot();
+  previous.globals['local-projects'].p2=project('p2');
+  const current={globals:{'local-projects':{p2:project('p2')},'project-order':['p2']},atoms:{}};
+  const saved=core.advance(previous,current,['t1']);
+  assert.deepEqual(Object.keys(saved.removedProjects),['p1']);
+  const stale={globals:{'local-projects':{p1:project('p1'),p3:project('p3')},
+    'project-order':['p1','p3'],'pinned-project-ids':['p1'],
+    'electron-saved-workspace-roots':['D:/test/p1','D:/test/p3'],
+    'app-server-project-id-by-legacy-project-id-by-host':{'local:D:/home':{p1:'server1'}},
+    'sidebar-project-thread-orders':{server1:{local:['t1']}}},atoms:{}};
+  const plan=core.plan(saved,stale);
+  assert.deepEqual(plan.removedProjectIds,['p1']);
+  assert.deepEqual(Object.keys(plan.updates['local-projects']).sort(),['p2','p3']);
+  assert.ok(!plan.order.includes('p1'));
+  assert.ok(!plan.updates['electron-saved-workspace-roots'].includes('D:/test/p1'));
+  assert.deepEqual(plan.updates['sidebar-project-thread-orders'],{});
+  assert.deepEqual(plan.updates['app-server-project-id-by-legacy-project-id-by-host'],{'local:D:/home':{}});
+});
+
+test('explicit live re-add clears a marker while a restore cannot clear it',()=>{
+  const previous={...snapshot(),removedProjects:{p2:project('p2')}};
+  const current={globals:{'local-projects':{p1:project('p1'),p2:project('p2')}},atoms:{}};
+  const restored=core.advance(previous,current,['t1'],{mode:'restore'});
+  assert.deepEqual(Object.keys(restored.globals['local-projects']),['p1']);
+  assert.ok(restored.removedProjects.p2);
+  const readded=core.advance(previous,current,['t1']);
+  assert.deepEqual(readded.removedProjects,{});
+  assert.deepEqual(Object.keys(readded.globals['local-projects']),['p1','p2']);
+});
