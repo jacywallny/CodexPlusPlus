@@ -70,6 +70,31 @@
     return result;
   }
 
+  // Only persist workspace selections belonging to an existing local membership.
+  // Credentials, prompt history and unrelated permission atoms remain excluded.
+  function workspaceAtoms(globals, atoms, validThreadIds) {
+    const projects=object(globals[PROJECTS]), assignments=object(globals[ASSIGNMENTS]);
+    const valid=new Set(validThreadIds), projectless=new Set(globals['projectless-thread-ids'] || []);
+    const prefix='thread-workspace-state-v1:';
+    const normalize=value=>String(value).replaceAll('\\','/').replace(/\/+$/,'').toLowerCase();
+    const workspace=value=>value===null || value && typeof value.cwd==='string'
+      && ['projectSources','runtimeWorkspaceRoots'].every(key=>Array.isArray(value[key]) && value[key].length>0
+        && value[key].every(path=>typeof path==='string' && path.length>0))
+      && Object.keys(value).every(key=>['cwd','projectSources','runtimeWorkspaceRoots'].includes(key));
+    return Object.fromEntries(Object.entries(object(atoms)).filter(([key,state])=>{
+      if(!key.startsWith(prefix)) return false;
+      const id=key.slice(prefix.length), member=assignments[id], project=projects[member?.projectId];
+      if(!valid.has(id) || projectless.has(id) || member?.projectKind!=='local' || !project) return false;
+      if(state?.project?.projectKind!=='local' || state.project.projectId!==member.projectId
+        || Object.keys(state.project).some(key=>!['projectKind','projectId'].includes(key))
+        || typeof state.revision!=='string' || !workspace(state.applied) || !workspace(state.pending)
+        || Object.keys(state).some(key=>!['revision','project','applied','pending'].includes(key))) return false;
+      const effective=state.pending ?? state.applied;
+      return effective && project.rootPaths.some(root=>normalize(effective.cwd)===normalize(root)
+        || normalize(effective.cwd).startsWith(normalize(root)+'/'));
+    }).map(([key,value])=>[key,clone(value)]));
+  }
+
   function sanitize(globals, atoms, validThreadIds, removedProjects={}) {
     globals = pruneRemoved(globals,removedProjects);
     const valid = new Set(validThreadIds);
@@ -99,7 +124,7 @@
     for (const key of ['app-server-project-id-by-legacy-project-id-by-host', 'app-server-projects-migration-by-host']) {
       result[key] = Object.fromEntries(Object.entries(object(globals[key])).filter(([host]) => host.startsWith('local:')));
     }
-    return { globals: result, atoms: onboarding(atoms) };
+    return { globals: result, atoms: {...onboarding(atoms), ...workspaceAtoms(result,atoms,validThreadIds)} };
   }
 
   function mergeSnapshots(older, newer) {
@@ -147,6 +172,9 @@
       .map(([threadId, assignment]) => ({threadId, hostId: snapshot.globals?.['thread-project-membership-host-ids']?.[threadId] || 'local', projectless:false, assignment}));
     const order = unique([...(current.globals?.['project-order'] || []), ...(snapshot.globals?.['project-order'] || []), ...Object.keys(projects)]);
     const atoms = {...object(current.atoms), ...onboarding(snapshot.atoms)};
+    const effectiveGlobals={...current.globals,[PROJECTS]:projects,
+      [ASSIGNMENTS]:{...object(snapshot.globals?.[ASSIGNMENTS]),...object(current.globals?.[ASSIGNMENTS])}};
+    Object.assign(atoms,workspaceAtoms(effectiveGlobals,snapshot.atoms,Object.keys(effectiveGlobals[ASSIGNMENTS])));
     if (Object.keys(onboarding(snapshot.atoms)).length) {
       const liveRole = object(current.atoms?.['electron:onboarding-welcome-v2-role-state']);
       if (Object.keys(liveRole).length || own(atoms,'electron:onboarding-welcome-v2-role-state')) {

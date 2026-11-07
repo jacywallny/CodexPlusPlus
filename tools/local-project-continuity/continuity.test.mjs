@@ -12,6 +12,43 @@ const assignment = projectId => ({projectKind:'local',projectId});
 const snapshot = () => ({globals:{'local-projects':{p1:project('p1')},'project-order':['p1'],
   'thread-project-assignments':{t1:assignment('p1')}},atoms:{last_completed_onboarding:1}});
 
+const workspaceState=(cwd='D:/test/p1/module')=>({revision:'new-revision',project:assignment('p1'),applied:null,
+  pending:{cwd,projectSources:['D:/test/p1'],runtimeWorkspaceRoots:['D:/test/p1']}});
+const workspaceKey='thread-workspace-state-v1:t1';
+
+test('local workspace cwd survives cleared and stale account atoms',()=>{
+  const saved=snapshot();saved.atoms[workspaceKey]=workspaceState();
+  const sanitized=core.sanitize(saved.globals,saved.atoms,['t1']);
+  assert.deepEqual(sanitized.atoms[workspaceKey],workspaceState());
+  for(const current of [{globals:{},atoms:{}},{globals:structuredClone(saved.globals),atoms:{[workspaceKey]:workspaceState('D:/test/p1')}}]) {
+    const plan=core.plan(sanitized,current);
+    assert.equal(plan.atoms[workspaceKey].pending.cwd,'D:/test/p1/module');
+    const roundTrip=core.sanitize({...saved.globals,...plan.updates},plan.atoms,['t1']);
+    assert.deepEqual(roundTrip.atoms[workspaceKey],workspaceState());
+  }
+});
+
+test('workspace restore respects reassignment, projectless choices and removed projects',()=>{
+  const saved=snapshot();saved.atoms[workspaceKey]=workspaceState();
+  for(const globals of [
+    {'thread-project-assignments':{t1:assignment('p2')},'local-projects':{p2:project('p2')}},
+    {'projectless-thread-ids':['t1']},
+  ]) assert.equal(core.plan(saved,{globals,atoms:{}}).atoms[workspaceKey],undefined);
+  const removed=core.advance(saved,{globals:{},atoms:{}},['t1']);
+  assert.equal(core.plan(removed,{globals:saved.globals,atoms:{}}).atoms[workspaceKey],undefined);
+});
+
+test('workspace snapshots reject stale IDs, outside paths, remote memberships and extra data',()=>{
+  for(const value of [workspaceState('D:/outside'),{...workspaceState(),project:{projectKind:'remote',projectId:'p1'}},
+    {...workspaceState(),project:{...assignment('p1'),token:'private'}},
+    {...workspaceState(),auth:'private'}, {...workspaceState(),pending:{...workspaceState().pending,token:'private'}}]) {
+    const saved=snapshot();saved.atoms[workspaceKey]=value;
+    assert.equal(core.sanitize(saved.globals,saved.atoms,['t1']).atoms[workspaceKey],undefined);
+  }
+  const saved=snapshot();saved.atoms[workspaceKey]=workspaceState();
+  assert.equal(core.sanitize(saved.globals,saved.atoms,[]).atoms[workspaceKey],undefined);
+});
+
 test('recovers inactive local metadata, filters stale thread IDs and cloud-backed projects',()=>{
   const state={'electron-account-renderer-state-v1':{owner:null,inactive:{ownerA:{globals:{
     'local-projects':{p1:project('p1'),cloud:{...project('cloud'),chatGptBacking:{accountId:'other'}}},

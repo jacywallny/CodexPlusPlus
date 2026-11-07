@@ -3,7 +3,7 @@
   const core = window.__CodexLocalProjectContinuityCore;
   if (!core || !window.codexPlus?.extension) throw Error('Codex++ extension API is unavailable');
   window.codexPlus.extension(ctx => {
-    const status = {version:'0.2.0', phase:'starting', projects:0, assignments:0, removedProjects:0, error:null};
+    const status = {version:'0.2.1', phase:'starting', projects:0, assignments:0, removedProjects:0, error:null};
     window.__codexLocalProjectContinuity = status;
     let services, home, token, revision, prepared, busy=false, generation=null, ready=false;
     let stopped = false;

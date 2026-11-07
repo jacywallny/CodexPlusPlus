@@ -28,7 +28,9 @@ test('full renderer restores new identities and page boots, retains subsequent e
   db.close();
   let state={'electron-account-renderer-state-v1':{owner:null,inactive:{ownerA:{
     globals:{'local-projects':{p1:project('p1')},'project-order':['p1'],'thread-project-assignments':{t1:assignment('p1')}},
-    atoms:{last_completed_onboarding:42},
+    atoms:{last_completed_onboarding:42,'thread-workspace-state-v1:t1':{
+      revision:'research-path',project:assignment('p1'),applied:null,
+      pending:{cwd:'D:/test/p1/module',projectSources:['D:/test/p1'],runtimeWorkspaceRoots:['D:/test/p1']}}},
   }}}};
   const flush=()=>fs.writeFileSync(path.join(home,'.codex-global-state.json'),JSON.stringify(state));
   flush();
@@ -91,6 +93,7 @@ test('full renderer restores new identities and page boots, retains subsequent e
   assert.equal(renderer.status.projects,1);
   assert.equal(state['thread-project-assignments'].t1.projectId,'p1');
   // User edits and reclassification must become the next shared baseline.
+  assert.equal(state['electron-persisted-atom-state']['thread-workspace-state-v1:t1'].pending.cwd,'D:/test/p1/module');
   state['local-projects'].p2=project('p2');
   state['project-order']=['p2','p1'];
   state['thread-project-assignments'].t1=assignment('p2');

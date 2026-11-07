@@ -1,7 +1,7 @@
 {
   "id": "local-project-continuity",
   "name": "本地项目连续性修复",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "在本机共享的 Codex 工作区内，于启动和身份切换后恢复本地项目及有效会话归属；通过原生服务写入，变更前自动备份。",
   "engines": { "codexpp": 1 },
   "renderer": ["core.js", "renderer.js"],
