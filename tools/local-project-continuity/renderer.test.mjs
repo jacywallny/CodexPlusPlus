@@ -52,7 +52,14 @@ test('full renderer restores new identities and page boots, retains subsequent e
       assert.ok(!['thread-project-assignments','project-order','projectless-thread-ids'].includes(key));
       state[key]=value;flush();return {success:true};
     }},
-    threadProjectAssignments:{assignIfUnassigned:async entries=>{
+    threadProjectAssignments:{setMembership:async entry=>{
+      state['thread-project-assignments'] ||= {};
+      if(entry.assignment) state['thread-project-assignments'][entry.threadId]=entry.assignment;
+      else delete state['thread-project-assignments'][entry.threadId];
+      const projectless=new Set(state['projectless-thread-ids'] || []);
+      if(entry.projectless) projectless.add(entry.threadId);else projectless.delete(entry.threadId);
+      state['projectless-thread-ids']=[...projectless];flush();
+    },assignIfUnassigned:async entries=>{
       state['thread-project-assignments'] ||= {};
       for(const entry of entries) state['thread-project-assignments'][entry.threadId] ||= entry.assignment;
       flush();
@@ -104,6 +111,34 @@ test('full renderer restores new identities and page boots, retains subsequent e
   assert.equal(renderer.status.projects,2);
   assert.equal(state['thread-project-assignments'].t1.projectId,'p2');
   assert.deepEqual([...state['project-order']],['p2','p1']);
+  // Returning to an old identity must correct conflicting cached data, not
+  // merely restore missing fields. Also remove a stale workspace override.
+  state={'electron-account-renderer-state-v1':{owner:'stale-owner',inactive:{}},
+    'local-projects':{p1:{...project('p1'),name:'outdated',rootPaths:['D:/old/p1']},p2:project('p2')},
+    'project-order':['p1','p2'],'pinned-project-ids':['p1'],
+    'thread-project-assignments':{t1:assignment('p1')},'projectless-thread-ids':['t2'],
+    'electron-persisted-atom-state':{'thread-workspace-state-v1:t1':{
+      revision:'stale',project:assignment('p1'),applied:null,
+      pending:{cwd:'D:/old/p1',projectSources:['D:/old/p1'],runtimeWorkspaceRoots:['D:/old/p1']}}}};
+  flush();await renderer.status.check();
+  assert.equal(state['local-projects'].p1.name,'p1');
+  assert.deepEqual([...state['local-projects'].p1.rootPaths],['D:/test/p1']);
+  assert.equal(state['thread-project-assignments'].t1.projectId,'p2');
+  assert.equal(state['thread-project-assignments'].t2.projectId,'p2');
+  assert.deepEqual([...state['project-order']],['p2','p1']);
+  assert.deepEqual([...state['pinned-project-ids']],[]);
+  assert.equal(state['electron-persisted-atom-state']['thread-workspace-state-v1:t1'],undefined);
+  // A normal explicit unassignment becomes authoritative for the next switch.
+  delete state['thread-project-assignments'].t2;
+  state['projectless-thread-ids']=['t2'];flush();await renderer.status.check();
+  state={'electron-account-renderer-state-v1':{owner:'older-owner',inactive:{}},
+    'local-projects':{p1:project('p1'),p2:project('p2')},
+    'thread-project-assignments':{t1:assignment('p2'),t2:assignment('p2')}};
+  flush();await renderer.status.check();
+  assert.equal(state['thread-project-assignments'].t2,undefined);
+  assert.ok(state['projectless-thread-ids'].includes('t2'));
+  state['thread-project-assignments'].t2=assignment('p2');
+  state['projectless-thread-ids']=[];flush();await renderer.status.check();
   // Deliberate removal is retained after another complete renderer boot.
   delete state['local-projects'].p1;state['project-order']=['p2'];flush();
   await renderer.status.check();

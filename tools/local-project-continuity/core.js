@@ -155,26 +155,64 @@
     snapshot={...snapshot,globals:pruneRemoved(snapshot.globals,removed)};
     current={...current,globals:pruneRemoved(current.globals,removed)};
     const currentProjects = object(current.globals?.[PROJECTS]);
-    const projects = {...object(snapshot.globals?.[PROJECTS]), ...currentProjects};
+    // Restore runs only at boot/identity change. The last normally observed
+    // snapshot is authoritative; the incoming identity may contain an old cache.
+    const savedProjects=object(snapshot.globals?.[PROJECTS]);
+    const projects = {...currentProjects, ...savedProjects};
+    const knownProjects=new Set(Object.keys(savedProjects));
+    const presentationIds=new Set(knownProjects);
+    for(const globals of [current.globals,snapshot.globals]) {
+      for(const mapping of Object.values(object(globals?.['app-server-project-id-by-legacy-project-id-by-host']))) {
+        for(const [id,serverId] of Object.entries(object(mapping))) if(knownProjects.has(id)) presentationIds.add(serverId);
+      }
+    }
+    const savedRoots=new Set(Object.values(savedProjects).flatMap(project=>project.rootPaths));
+    const obsoleteRoots=new Set(Object.entries(currentProjects).filter(([id])=>knownProjects.has(id))
+      .flatMap(([,project])=>project.rootPaths || []).filter(root=>!savedRoots.has(root)));
     for (const key of GLOBAL_KEYS) {
       if ([ASSIGNMENTS, 'projectless-thread-ids', 'project-order'].includes(key)) continue;
       const old = snapshot.globals?.[key], live = current.globals?.[key];
       let value;
       if (key === PROJECTS) value = projects;
-      else if (Array.isArray(old) || Array.isArray(live)) value = unique([...(live || []), ...(old || [])]);
-      else if(key==='app-server-project-id-by-legacy-project-id-by-host') value=mergeHostMaps(old,live);
-      else value = {...object(old), ...object(live)};
+      else if(key==='pinned-project-ids') value=unique([...(old || []),...(live || []).filter(id=>!knownProjects.has(id))]);
+      else if(key==='project-appearances' || key==='sidebar-project-thread-orders') {
+        value={...Object.fromEntries(Object.entries(object(live)).filter(([id])=>!presentationIds.has(id))),...object(old)};
+      }
+      else if(key==='electron-saved-workspace-roots') value=unique([...(old || []),...(live || []).filter(root=>!obsoleteRoots.has(root))]);
+      else if(key==='electron-workspace-root-labels') value={...Object.fromEntries(Object.entries(object(live)).filter(([root])=>!obsoleteRoots.has(root))),...object(old)};
+      else if (Array.isArray(old) || Array.isArray(live)) value = unique([...(old || []), ...(live || [])]);
+      else if(key==='app-server-project-id-by-legacy-project-id-by-host') value=mergeHostMaps(live,old);
+      else value = {...object(live), ...object(old)};
       if (JSON.stringify(value) !== JSON.stringify(original.globals?.[key] ?? (Array.isArray(value) ? [] : {}))) updates[key] = value;
     }
     const projectless = new Set(current.globals?.['projectless-thread-ids'] || []);
-    const assignments = Object.entries(object(snapshot.globals?.[ASSIGNMENTS])).filter(([id, assignment]) =>
-      !own(current.globals?.[ASSIGNMENTS], id) && !projectless.has(id) && own(projects, assignment.projectId))
-      .map(([threadId, assignment]) => ({threadId, hostId: snapshot.globals?.['thread-project-membership-host-ids']?.[threadId] || 'local', projectless:false, assignment}));
-    const order = unique([...(current.globals?.['project-order'] || []), ...(snapshot.globals?.['project-order'] || []), ...Object.keys(projects)]);
+    const savedAssignments=object(snapshot.globals?.[ASSIGNMENTS]);
+    const savedProjectless=new Set(snapshot.globals?.['projectless-thread-ids'] || []);
+    const liveAssignments=object(current.globals?.[ASSIGNMENTS]);
+    const isRemote=id=>liveAssignments[id]!=null && liveAssignments[id].projectKind!=='local';
+    const assignments=[],membershipCorrections=[];
+    const entry=(threadId,assignment,projectless)=>({threadId,hostId:snapshot.globals?.['thread-project-membership-host-ids']?.[threadId] || 'local',assignment,projectless});
+    for(const [id,assignment] of Object.entries(savedAssignments)) {
+      if(!own(projects,assignment.projectId) || isRemote(id)) continue;
+      if(!own(liveAssignments,id) && !projectless.has(id)) assignments.push(entry(id,assignment,false));
+      else if(projectless.has(id) || JSON.stringify(liveAssignments[id])!==JSON.stringify(assignment)) membershipCorrections.push(entry(id,assignment,false));
+    }
+    for(const id of savedProjectless) {
+      if(!isRemote(id) && (own(liveAssignments,id) || !projectless.has(id))) membershipCorrections.push(entry(id,null,true));
+    }
+    const order = unique([...(snapshot.globals?.['project-order'] || []), ...(current.globals?.['project-order'] || []).filter(id=>!knownProjects.has(id)), ...Object.keys(projects)]);
     const atoms = {...object(current.atoms), ...onboarding(snapshot.atoms)};
-    const effectiveGlobals={...current.globals,[PROJECTS]:projects,
-      [ASSIGNMENTS]:{...object(snapshot.globals?.[ASSIGNMENTS]),...object(current.globals?.[ASSIGNMENTS])}};
-    Object.assign(atoms,workspaceAtoms(effectiveGlobals,snapshot.atoms,Object.keys(effectiveGlobals[ASSIGNMENTS])));
+    const effectiveAssignments={...liveAssignments};
+    for(const [id,assignment] of Object.entries(savedAssignments)) if(!isRemote(id)) effectiveAssignments[id]=assignment;
+    for(const id of savedProjectless) if(!isRemote(id)) delete effectiveAssignments[id];
+    const effectiveGlobals={...current.globals,[PROJECTS]:projects,[ASSIGNMENTS]:effectiveAssignments,
+      'projectless-thread-ids':unique([...(current.globals?.['projectless-thread-ids'] || []).filter(id=>!own(savedAssignments,id)),...savedProjectless])};
+    const savedWorkspaces=workspaceAtoms(effectiveGlobals,snapshot.atoms,Object.keys(effectiveAssignments));
+    for(const id of new Set([...Object.keys(savedAssignments),...savedProjectless])) {
+      const key='thread-workspace-state-v1:'+id;
+      if(!isRemote(id) && !own(savedWorkspaces,key)) delete atoms[key];
+    }
+    Object.assign(atoms,savedWorkspaces);
     if (Object.keys(onboarding(snapshot.atoms)).length) {
       const liveRole = object(current.atoms?.['electron:onboarding-welcome-v2-role-state']);
       if (Object.keys(liveRole).length || own(atoms,'electron:onboarding-welcome-v2-role-state')) {
@@ -188,7 +226,7 @@
       if(Number(current.atoms?.last_completed_onboarding)>Number(atoms.last_completed_onboarding || 0)) atoms.last_completed_onboarding=current.atoms.last_completed_onboarding;
       atoms['electron:onboarding-welcome-pending'] = false;
     }
-    return {updates, assignments, order, atoms, atomsChanged: JSON.stringify(atoms) !== JSON.stringify(current.atoms || {}),
+    return {updates, assignments, membershipCorrections, order, atoms, atomsChanged: JSON.stringify(atoms) !== JSON.stringify(current.atoms || {}),
       projectCount:Object.keys(projects).length, removedProjectIds};
   }
 

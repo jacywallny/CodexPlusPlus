@@ -3,7 +3,7 @@
   const core = window.__CodexLocalProjectContinuityCore;
   if (!core || !window.codexPlus?.extension) throw Error('Codex++ extension API is unavailable');
   window.codexPlus.extension(ctx => {
-    const status = {version:'0.2.1', phase:'starting', projects:0, assignments:0, removedProjects:0, error:null};
+    const status = {version:'0.2.2', phase:'starting', projects:0, assignments:0, removedProjects:0, error:null};
     window.__codexLocalProjectContinuity = status;
     let services, home, token, revision, prepared, busy=false, generation=null, ready=false;
     let stopped = false;
@@ -60,7 +60,7 @@
       let current=await readCurrent();
       let plan=core.plan(prepared.snapshot,current);
       const orderChanged=JSON.stringify(plan.order)!==JSON.stringify(current.globals['project-order'] || []);
-      const changed=Object.keys(plan.updates).length || plan.assignments.length || orderChanged || plan.atomsChanged || plan.removedProjectIds.length;
+      const changed=Object.keys(plan.updates).length || plan.assignments.length || plan.membershipCorrections.length || orderChanged || plan.atomsChanged || plan.removedProjectIds.length;
       if(changed) {
         const backup=await ctx.backend.call('backup',{home,token,before:current,
           counts:{projects:plan.projectCount,assignments:plan.assignments.length,keys:Object.keys(plan.updates)}});
@@ -81,6 +81,10 @@
           await assertIdentity();
           await within(services.threadProjectAssignments.assignIfUnassigned(plan.assignments.slice(index,index+100)));
         }
+        for(const entry of plan.membershipCorrections) {
+          await assertIdentity();
+          await within(services.threadProjectAssignments.setMembership(entry));
+        }
         if(plan.atomsChanged) await write('electron-persisted-atom-state',plan.atoms);
       }
       await assertIdentity();
@@ -90,8 +94,9 @@
         if(!Object.hasOwn(projects,id)) throw Error('Native project readback did not confirm restoration');
       }
       const actualAssignments=actual.globals['thread-project-assignments'] || {};
-      for(const entry of plan.assignments) {
-        if(!Object.hasOwn(actualAssignments,entry.threadId)) throw Error('Native assignment readback did not confirm restoration');
+      for(const entry of [...plan.assignments,...plan.membershipCorrections]) {
+        if(JSON.stringify(actualAssignments[entry.threadId]??null)!==JSON.stringify(entry.assignment)
+          || (actual.globals['projectless-thread-ids'] || []).includes(entry.threadId)!==entry.projectless) throw Error('Native assignment readback did not confirm restoration');
       }
       status.projects=Object.keys(projects).length;
       status.assignments=Object.keys(actualAssignments).length;

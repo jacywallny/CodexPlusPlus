@@ -2,7 +2,9 @@
 
 Codex++ 用户拓展，用于在同一 Windows 用户、同一 Codex home 内共享本地项目及有效会话归属，并在启动或身份变化后自动恢复。用户已明确选择跨订阅共享本机项目。
 
-0.2.1 补充保存已归属本地项目的 `thread-workspace-state-v1:<id>`：保留当前/待应用工作目录和工作区根目录。仅纳入现存线程、匹配本地项目的规定字段；旧身份缓存的同项目旧路径由最新共享选择覆盖，显式无项目或改归其他项目时跳过。15 项回归通过；2026-11-07 PMUT 76 条新目录已写入并核验，未主动进行真实订阅切换。
+0.2.2 修复旧订阅缓存优先的覆盖风险：启动/身份变化时，已知本地项目的名称、根目录、排序、置顶、展示和会话归属采用最近正常保存的共享快照；冲突归属通过原生 `setMembership` 纠正，已保存的显式无项目选择也会恢复。正常运行继续采纳用户的新修改，未知本地项目及远程归属保留。19 项回归覆盖旧缓存冲突、移除源项目后临时成为无项目、再次修改后往返恢复。恢复仅处理元数据，不回滚科研工程文件。
+
+0.2.1 补充保存已归属本地项目的 `thread-workspace-state-v1:<id>`：保留当前/待应用工作目录和工作区根目录。仅纳入现存线程、匹配本地项目的规定字段；0.2.2进一步规定以最新正常保存的归属/无项目选择决定恢复，远程归属不改动。2026-11-07 PMUT 76 条新目录已写入并核验，未主动进行真实订阅切换。
 
 ## 实测环境与证据
 
@@ -15,6 +17,7 @@ Codex++ 用户拓展，用于在同一 Windows 用户、同一 Codex home 内共
 - 2026-11-07：Codex App 26.1103.4239.0、拓展 0.2.0 已热加载；用户主动整理后为 12 个项目、297 条归属、18 个持久移除标记。原生服务与共享快照一致，1311 个会话 ID 和归档标志未变。
 - 0.2.0 新增跨身份的 `removedProjects`：正常观察会记录项目移除；启动/身份变化恢复时先排除这些项目，旧身份仍含对应入口时通过原生 `projects.removeLocal` 移除入口。过滤对应排序、工作区根路径及服务器映射，不删除项目目录或会话。后续新增项目仍可保存。
 - 12 项 Node 回归通过，补充旧身份仍保留项目时的重启/往返、移除元数据过滤及主动重新添加。对本机 6 份订阅配置与 8 份当前/历史缓存进行了 48 次恢复计划回放；这属于配置检查和模拟验证，未实际逐个切换订阅。
+- 2026-11-07 23:41：0.2.2 已在原安装目录运行并读回 ready/error=null；最新 4 项目、327 条归属、27 个移除标记保持，76 条研究会话的新目录与共享快照匹配。19 项回归、空缓存/三份历史缓存/人工冲突缓存五组本机回放通过，原生元数据和工作区状态与操作前一致，安装四文件与源码 SHA-256 相同。本轮完成后台恢复后的验收，未真实切换订阅；计数仅代表采样时点。
 
 ## 安装与启动
 
@@ -42,7 +45,7 @@ pwsh -File scripts/install-local-project-continuity.ps1
 ## 核验
 
 ```powershell
-node --experimental-vm-modules --test tools/local-project-continuity/continuity.test.mjs tools/local-project-continuity/renderer.test.mjs
+node --experimental-vm-modules --test tools/local-project-continuity/authority.test.mjs tools/local-project-continuity/continuity.test.mjs tools/local-project-continuity/renderer.test.mjs
 node scripts/audit-local-project-continuity.mjs 'C:\Users\18127\.codex'
 node scripts/local-project-state-cdp.mjs tools/local-project-continuity/check-runtime.js 9229
 ```

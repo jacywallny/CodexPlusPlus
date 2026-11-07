@@ -28,12 +28,14 @@ test('local workspace cwd survives cleared and stale account atoms',()=>{
   }
 });
 
-test('workspace restore respects reassignment, projectless choices and removed projects',()=>{
+test('latest saved reassignment, projectless choices and removed projects govern workspace restoration',()=>{
   const saved=snapshot();saved.atoms[workspaceKey]=workspaceState();
   for(const globals of [
     {'thread-project-assignments':{t1:assignment('p2')},'local-projects':{p2:project('p2')}},
     {'projectless-thread-ids':['t1']},
-  ]) assert.equal(core.plan(saved,{globals,atoms:{}}).atoms[workspaceKey],undefined);
+  ]) assert.equal(core.plan(saved,{globals,atoms:{}}).atoms[workspaceKey].pending.cwd,'D:/test/p1/module');
+  const unassigned=core.advance(saved,{globals:{'local-projects':saved.globals['local-projects'],'projectless-thread-ids':['t1']},atoms:{}},['t1']);
+  assert.equal(core.plan(unassigned,saved).atoms[workspaceKey],undefined);
   const removed=core.advance(saved,{globals:{},atoms:{}},['t1']);
   assert.equal(core.plan(removed,{globals:saved.globals,atoms:{}}).atoms[workspaceKey],undefined);
 });
@@ -66,7 +68,7 @@ test('does not invent onboarding completion for a user who has never completed i
   assert.deepEqual(result.atoms,{});
 });
 
-test('restore retains target projects, edits, assignments and explicit projectless choices',()=>{
+test('restore retains unknown projects and corrects known stale memberships from latest snapshot',()=>{
   const saved=snapshot();
   saved.globals['thread-project-assignments'].t2=assignment('p1');
   saved.globals['thread-project-assignments'].t3=assignment('p1');
@@ -75,7 +77,8 @@ test('restore retains target projects, edits, assignments and explicit projectle
   const plan=core.plan(saved,current);
   assert.equal(plan.projectCount,2);
   assert.deepEqual(plan.assignments.map(entry=>entry.threadId),['t1']);
-  assert.deepEqual(plan.order,['p2','p1']);
+  assert.deepEqual(plan.order,['p1','p2']);
+  assert.deepEqual(plan.membershipCorrections.map(entry=>entry.threadId),['t2','t3']);
   assert.equal(plan.atoms['unrelated-preference'],true);
   assert.ok(!Object.hasOwn(plan.updates,'thread-project-assignments'));
 });
@@ -94,6 +97,7 @@ test('native restore planning is idempotent after the restored snapshot is read 
   const plan=core.plan(saved,{globals:structuredClone(saved.globals),atoms:structuredClone(saved.atoms)});
   assert.deepEqual(plan.updates,{});
   assert.equal(plan.assignments.length,0);
+  assert.equal(plan.membershipCorrections.length,0);
   assert.equal(plan.atomsChanged,false);
 });
 
