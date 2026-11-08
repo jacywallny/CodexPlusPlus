@@ -81,7 +81,7 @@ jobs:
               throw new Error('只允许复用本仓库可信分支上成功的 PR build');
             }
             const tag = process.env.RELEASE_TAG;
-            if (!/^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/.test(tag)) throw new Error('需要语义版本标签');
+            if (!/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(tag)) throw new Error('需要正式语义版本标签');
             try {
               const { data: ref } = await github.rest.git.getRef({ ...context.repo, ref: `tags/${tag}` });
               if (ref.object.type !== 'commit' || ref.object.sha !== run.head_sha) {
@@ -140,9 +140,7 @@ jobs:
           state=$(gh release view "$RELEASE_TAG" --json isDraft -q .isDraft 2>/dev/null || echo missing)
           case "$state" in
             missing)
-              release_flags=()
-              if [[ "$RELEASE_TAG" == *-* ]]; then release_flags+=(--prerelease); fi
-              gh release create "$RELEASE_TAG" --draft --verify-tag --title "Codex++ $RELEASE_TAG$RELEASE_TITLE_SUFFIX" --notes-file notes.md "${release_flags[@]}"
+              gh release create "$RELEASE_TAG" --draft --verify-tag --title "Codex++ $RELEASE_TAG$RELEASE_TITLE_SUFFIX" --notes-file notes.md
               echo "is_draft=true" >> "$GITHUB_OUTPUT"
               ;;
             true)
@@ -554,10 +552,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$TAG" == *-* ]]; then
-            gh release edit "$TAG" --draft=false --prerelease --latest=false --verify-tag --repo "$REPO"
-            exit 0
-          fi
           # 只有版本最新时才标 Latest：补发的旧版本不能抢走 Latest，
           # 否则「检查更新」读 releases/latest/download/latest.json 会回退到旧版。
           published=$(gh release list --repo "$REPO" --exclude-drafts --exclude-pre-releases --limit 100 --json tagName -q '.[].tagName')
