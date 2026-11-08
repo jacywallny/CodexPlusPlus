@@ -548,7 +548,7 @@ fn parsed_arguments(arguments: &[String], image: &str) -> Result<ParsedArguments
         .first()
         .ok_or_else(|| anyhow::anyhow!("Codex 命令行缺少 argv[0]"))?;
     anyhow::ensure!(
-        normalized_path_text(first)? == image,
+        same_executable_path(&normalized_path_text(first)?, image),
         "Codex argv[0] 与实际映像不一致"
     );
     parsed_launch_arguments(&arguments[1..])
@@ -647,7 +647,7 @@ fn normalized_path_text(path: &str) -> Result<String> {
 }
 
 fn image_matches(expected: &str, actual: &str) -> bool {
-    if expected == actual {
+    if same_executable_path(expected, actual) {
         return true;
     }
     let Some((expected_family, expected_entry)) = packaged_entry(expected) else {
@@ -657,6 +657,27 @@ fn image_matches(expected: &str, actual: &str) -> bool {
         return false;
     };
     expected_family == actual_family && expected_entry == actual_entry
+}
+
+/// 仅为可执行文件解析目录联接；用户数据目录仍沿用原有的精确路径约定。
+/// argv[0] 必须指向同一个入口，不能使用允许包版本更新的 image_matches 放宽它。
+fn same_executable_path(expected: &str, actual: &str) -> bool {
+    if expected == actual {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // 两端都必须成功解析，不能凭盘符替换、包名或文件名猜测别名关系。
+        let resolved = |path: &str| {
+            std::fs::canonicalize(path)
+                .ok()
+                .and_then(|path| normalized_path(&path).ok())
+        };
+        if let (Some(expected), Some(actual)) = (resolved(expected), resolved(actual)) {
+            return expected == actual;
+        }
+    }
+    false
 }
 
 fn packaged_entry(path: &str) -> Option<((String, String, String), &str)> {
@@ -1161,6 +1182,106 @@ mod tests {
     }
 
     #[test]
+    fn argv_image_does_not_accept_only_a_matching_package_family() {
+        let image = normalized_path_text(IMAGE).unwrap();
+        let old = IMAGE.replace("1.2.3.4", "1.2.2.0");
+        assert!(image_matches(&image, &normalized_path_text(&old).unwrap()));
+        assert!(parsed_arguments(&[old], &image).is_err());
+        let other_volume = IMAGE.replace(r"C:\Program Files", "D:");
+        assert!(!image_matches(
+            &image,
+            &normalized_path_text(&other_volume).unwrap()
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_aliases_match_both_image_and_argv_without_relaxing_context() {
+        use std::os::windows::process::CommandExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let real_dir = fixture.path().join("real app");
+        let alias_dir = fixture.path().join("registered app");
+        std::fs::create_dir(&real_dir).unwrap();
+        let real = real_dir.join("ChatGPT.exe");
+        let alias = alias_dir.join("ChatGPT.exe");
+        std::fs::write(&real, b"test image").unwrap();
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&alias_dir)
+            .arg(&real_dir)
+            .creation_flags(crate::windows_integration::CREATE_NO_WINDOW)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let real_text = normalized_path(&real).unwrap();
+        let alias_text = normalized_path(&alias).unwrap();
+        assert_ne!(real_text, alias_text);
+        assert!(same_executable_path(&alias_text, &real_text));
+        assert!(same_executable_path(&real_text, &alias_text));
+
+        for (expected_path, image, argv) in [
+            (&alias, &real, &alias),
+            (&real, &alias, &real),
+            (&alias, &alias, &real),
+        ] {
+            let mut expected = context(None);
+            expected.executable = normalized_path(expected_path).unwrap();
+            let mut candidate = facts(&[]);
+            candidate.image = image.clone();
+            candidate.arguments = vec![argv.to_str().unwrap().to_owned()];
+            assert!(ensure_listener_matches(&candidate, &expected).is_ok());
+
+            let mut isolated = candidate.clone();
+            isolated.environment.user_data = Some(r"C:\isolated".to_owned());
+            assert!(!target_matches(&isolated, &expected).unwrap());
+            isolated = candidate.clone();
+            isolated
+                .arguments
+                .push(r"--user-data-dir=C:\isolated".to_owned());
+            assert!(!target_matches(&isolated, &expected).unwrap());
+            isolated = candidate.clone();
+            isolated.environment.agent_run_id = Some("isolated-agent".to_owned());
+            assert!(!target_matches(&isolated, &expected).unwrap());
+            isolated = candidate.clone();
+            isolated.environment.app_data = Some(r"C:\other\AppData".to_owned());
+            assert!(!target_matches(&isolated, &expected).unwrap());
+            isolated = candidate.clone();
+            isolated.owner.session_id += 1;
+            assert!(!target_matches(&isolated, &expected).unwrap());
+            isolated = candidate.clone();
+            isolated.owner.user_sid.push(4);
+            assert!(!target_matches(&isolated, &expected).unwrap());
+            isolated = candidate.clone();
+            isolated.owner.authentication_id.0 += 1;
+            assert!(!target_matches(&isolated, &expected).unwrap());
+            isolated = candidate.clone();
+            isolated.arguments.push("--type=renderer".to_owned());
+            assert!(!target_matches(&isolated, &expected).unwrap());
+
+            // 经过真实候选选择、重复核验与停止流程，别名不会只在辅助比较中生效。
+            let events = Rc::new(RefCell::new(Vec::new()));
+            assert_eq!(
+                stop(vec![fake(1, vec![candidate], &events)], &expected).unwrap(),
+                1
+            );
+            assert_eq!(*events.borrow(), [1]);
+        }
+
+        let other = fixture.path().join("ChatGPT.exe");
+        std::fs::write(&other, b"test image").unwrap();
+        assert!(!image_matches(
+            &alias_text,
+            &normalized_path(&other).unwrap()
+        ));
+        assert!(parsed_arguments(&[other.to_str().unwrap().to_owned()], &real_text).is_err());
+        assert!(!same_executable_path(
+            &normalized_path(&alias_dir.join("missing.exe")).unwrap(),
+            &normalized_path(&real_dir.join("missing.exe")).unwrap()
+        ));
+    }
+
+    #[test]
     fn owner_and_appdata_mismatch_are_preserved_but_missing_appdata_is_an_error() {
         let expected = context(None);
         let mut candidate = facts(&[]);
@@ -1411,7 +1532,7 @@ mod tests {
         use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
 
-        for mode in ["default", "environment"] {
+        for mode in ["default", "environment", "junction"] {
             let fixture = tempfile::tempdir().unwrap();
             let app_data = fixture.path().join("appdata");
             std::fs::create_dir(&app_data).unwrap();
@@ -1449,7 +1570,7 @@ mod tests {
         use std::process::{Command, Stdio};
 
         let mode = std::env::var("CODEX_PLUS_MAIN_STOP_API_TEST_DRIVER").unwrap_or_default();
-        if !matches!(mode.as_str(), "default" | "environment") {
+        if !matches!(mode.as_str(), "default" | "environment" | "junction") {
             return;
         }
         let original = std::env::current_exe().unwrap();
@@ -1459,8 +1580,24 @@ mod tests {
         let app_data = PathBuf::from(std::env::var_os("APPDATA").unwrap());
         assert!(app_data.is_absolute());
         let fixture = tempfile::tempdir_in(&app_data).unwrap();
-        let executable = fixture.path().join("ChatGPT.exe");
-        std::fs::copy(&original, &executable).unwrap();
+        let real_dir = fixture.path().join("real app");
+        std::fs::create_dir(&real_dir).unwrap();
+        let real_executable = real_dir.join("ChatGPT.exe");
+        std::fs::copy(&original, &real_executable).unwrap();
+        let executable = if mode == "junction" {
+            let alias_dir = fixture.path().join("registered app");
+            let output = Command::new("cmd.exe")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(&alias_dir)
+                .arg(&real_dir)
+                .creation_flags(crate::windows_integration::CREATE_NO_WINDOW)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            alias_dir.join("ChatGPT.exe")
+        } else {
+            real_executable
+        };
         let selected = app_data.join("selected");
         let spawn = |user_data: Option<&Path>| {
             let mut command = Command::new(&executable);
@@ -1492,7 +1629,7 @@ mod tests {
             stop_windows_main_codex_processes_and_wait(&executable, None).unwrap(),
             1
         );
-        assert_eq!(main.0.try_wait().unwrap().is_some(), mode == "default");
+        assert_eq!(main.0.try_wait().unwrap().is_some(), mode != "environment");
         assert_eq!(
             isolated.0.try_wait().unwrap().is_some(),
             mode == "environment"
@@ -1502,7 +1639,7 @@ mod tests {
             stop_windows_main_codex_processes_and_wait(&executable, None).is_err(),
             "{mode}: a live Codex main process exists under another context"
         );
-        if mode == "default" {
+        if mode != "environment" {
             let arguments = vec![format!("--user-data-dir={}", selected.display())];
             assert_eq!(
                 stop_windows_main_codex_processes_with_args_and_wait(
