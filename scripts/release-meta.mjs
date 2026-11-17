@@ -32,11 +32,11 @@ export const VERSION_FILES = [
     },
     bump: (text, from, to) =>
       text
-        .split("\n[[package]]\n")
+        .split(/(\r?\n\[\[package\]\]\r?\n)/)
         .map((block) =>
           isWorkspaceLockBlock(block) ? block.replace(`\nversion = "${from}"`, `\nversion = "${to}"`) : block,
         )
-        .join("\n[[package]]\n"),
+        .join(""),
   },
   {
     file: "apps/codex-plus-manager/package.json",
@@ -73,7 +73,7 @@ function isWorkspaceLockBlock(block) {
 }
 
 function workspaceLockBlocks(text) {
-  return text.split("\n[[package]]\n").filter(isWorkspaceLockBlock);
+  return text.split(/\r?\n\[\[package\]\]\r?\n/).filter(isWorkspaceLockBlock);
 }
 
 export function readText(file) {

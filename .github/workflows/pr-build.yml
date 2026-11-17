@@ -161,11 +161,11 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v", "V")
-          $version = $version -replace '[\\/]', '-'
-          if (-not $version -or $version -eq "main") {
-            $version = "0.0.0-${{ github.run_number }}"
-          }
+          $version = (Get-Content -LiteralPath apps/codex-plus-manager/package.json -Raw | ConvertFrom-Json).version
+          node --test scripts/tests/release-meta.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw "版本元数据测试失败。" }
+          node scripts/release-meta.mjs check $version
+          if ($LASTEXITCODE -ne 0) { throw "版本号不一致，停止安装包构建。" }
           # NSIS 的 64 位安装目录与 Chocolatey PATH 更新均需要兼容。
           $candidates = @(
             "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
