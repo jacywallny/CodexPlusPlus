@@ -15,7 +15,7 @@
 - 新增的五项 Rust 回归全部通过；版本脚本 LF/CRLF 两项 Node 测试通过；六处版本元数据一致为 `2.7.2`。
 - Rust workspace 编译与测试 11 分 20 秒，data 串行编译与测试 5 分 25 秒；Release 编译 10 分 03 秒，NSIS 打包与版本检查 45 秒。云端工具链为 `rustc 1.100.0 (0ef1bc386 2026-11-09)`。
 - 成品：`codex-plus-plus-windows-binaries`（Artifact 14326257724）、`codex-plus-plus-windows-installer`（14325873594）、`codex-plus-plus-windows-build-info`（14325074983），均已上传且未过期。安装包文件名为 `CodexPlusPlus-2.7.2-windows-x64-setup.exe`。
-- 本记录提交只更新文档，程序和工作流与上述已验证提交保持一致；未下载、安装或执行本次成品，未发布 Release。
+- 构建验证后的记录提交只更新文档；发布阶段仅调整 Release 说明的通用前缀，程序代码及测试、打包逻辑保持一致。未在本机下载、安装或执行本次成品。
 
 官方账号网关的 WebSocket 请求保留响应、输入项和工具调用标识；纯工具增量沿用首轮缓存键，未知续接 ID 明确拒绝。第三方 Responses 供应商默认回退 HTTP；确实支持原生 Responses WebSocket 时，在供应商配置快照的活动 provider 下显式声明：
 
@@ -29,6 +29,25 @@ supports_websockets = true
 该声明不替代原有 provider 的 URL、认证和其他配置，需与真实上游能力一致。显式 `false` 禁用；路由池中存在不支持的成员时，现有保守检查让整个入口在升级前返回 426。没有增加 WS 到 HTTP 的桥接或生成后自动重放。
 
 新增测试使用本地模拟上游覆盖官方账号网关连续两轮工具调用、缓存键及连接复用、未知续接拒绝和握手前回退。云端通过只能证明这些测试及构建通过，真实账号和客户端仍需实机验证。
+
+### 2.7.2 正式发布
+
+2026-11-17 21:39:51（Asia/Shanghai）已在个人仓库公开发布，非草稿、非预发布，`releases/latest` 已确认为 `v2.7.2`。
+
+- Release：`https://github.com/jacywallny/CodexPlusPlus/releases/tag/v2.7.2`。
+- 发布运行：`https://github.com/jacywallny/CodexPlusPlus/actions/runs/44094615472`，最终成功，21:37:38 至 21:39:54，耗时 2 分 16 秒。
+- 版本标签精确指向完整测试通过的 `971bf162b1d45a2a6d1153ec26c5fd62c921311d`；发布工作流提交为 `52575d8ceed95b221dd7f23ccae64c82a92e602e`。
+- Windows EXE 复用构建运行 `44075197454`，来源、版本、完整测试标记和 SHA-256 均由发布流程校验；NSIS 安装包和便携 ZIP 重新打包。
+- 五个非空附件均已上传：`CodexPlusPlus-2.7.2-windows-x64-setup.exe`、`CodexPlusPlus-2.7.2-windows-x64.zip`、`SHA256SUMS.txt`、`build-info.json`、`latest.json`。本次只发布 Windows x64。
+- 已从 Release 读取三份元数据并核对：构建版本 `2.7.2`、源码提交、构建及发布运行编号、`testFilter=""`，更新元数据版本 `v2.7.2` 和正式 tag 地址均一致。安装包和 ZIP 的 GitHub asset digest 与 `SHA256SUMS.txt` 一致。
+
+```text
+92b94368dccef099ca4533cdd964ec5855ad45a15b701127a01ee85bde17ba0f  codex-plus-plus.exe
+219a93e2f0011eadbeac0793863c2ad7df69936df85d3450a4cc22fe483993d1  CodexPlusPlus-2.7.2-windows-x64-setup.exe
+347ad9cd33ecd1dc6bcd6f3049791e64086a995092036defe3371686d1536964  CodexPlusPlus-2.7.2-windows-x64.zip
+```
+
+EXE 摘要来自已核验的 `build-info.json`，安装包和 ZIP 摘要来自 Release 清单与 GitHub asset digest；本机没有下载和重新计算成品摘要。实际账号行为仍需安装后实测。
 
 ## 2.3.1 历史基线（2026-11-06）
 
