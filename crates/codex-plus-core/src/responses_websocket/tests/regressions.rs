@@ -18,11 +18,12 @@ async fn official_gateway_preserves_two_incremental_tool_rounds() {
     relay["apiKey"] = json!("");
     relay["apiKeys"] = json!([]);
     relay["activeApiKeyId"] = json!("");
-    relay["authContents"] = json!({
+    let auth = json!({
         "auth_mode":"chatgpt","codex_plus_gateway":true,
         "tokens":{"account_id":"test-account","access_token":"test-access",
             "refresh_token":"test-refresh"}
-    }.to_string());
+    });
+    relay["authContents"] = Value::String(auth.to_string());
     let fixture = Fixture::new(relay.clone());
     fixture.gateway(relay);
     let upstream = tokio::spawn(async move {
