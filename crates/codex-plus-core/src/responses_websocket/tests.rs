@@ -124,7 +124,7 @@ fn profile(address: std::net::SocketAddr) -> Value {
         "apiKeys":[{"id":"ws-test-key","name":"test","apiKey":"sk-test"}],"activeApiKeyId":"ws-test-key","protocol":"responses",
         "relayMode":"pureApi","model":"ws-model","modelList":"ws-model\nreview-model",
         "upstreamBaseUrl":format!("http://{address}/v1"),"useCommonConfig":false,
-        "configContents":"model = \"ws-model\"","autoReviewModel":"review-model"})
+        "configContents":"model = \"ws-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nsupports_websockets = true\n","autoReviewModel":"review-model"})
 }
 async fn helper(count: usize) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -997,3 +997,4 @@ fn websocket_error_without_http_status_preserves_failure_classification() {
 
 mod lifecycle;
 mod origin;
+mod regressions;

@@ -676,7 +676,11 @@ async fn attempt_pipeline(
             &candidate.upstream_model,
         );
         body["model"] = Value::String(candidate.upstream_model.clone());
-        crate::gateway::chatgpt_backend::adapt_request(&mut body, prompt.as_deref());
+        if crate::responses_websocket::active() {
+            crate::gateway::chatgpt_backend::adapt_websocket_request(&mut body, prompt.as_deref());
+        } else {
+            crate::gateway::chatgpt_backend::adapt_request(&mut body, prompt.as_deref());
+        }
         let version = crate::gateway::chatgpt_backend::codex_version(&home);
         relay.user_agent = crate::gateway::chatgpt_backend::codex_user_agent(&version);
         for (key, value) in [
@@ -709,7 +713,11 @@ async fn attempt_pipeline(
     if chatgpt_api {
         body["model"] = Value::String(candidate.upstream_model.clone());
         if shaping {
-            crate::gateway::chatgpt_backend::adapt_api_request(&mut body);
+            if crate::responses_websocket::active() {
+                crate::gateway::chatgpt_backend::adapt_api_websocket_request(&mut body);
+            } else {
+                crate::gateway::chatgpt_backend::adapt_api_request(&mut body);
+            }
         }
         cache_key = body
             .get("prompt_cache_key")

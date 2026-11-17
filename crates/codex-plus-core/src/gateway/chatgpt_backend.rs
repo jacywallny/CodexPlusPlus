@@ -27,10 +27,22 @@ const MAX_CALL_ID: usize = 64;
 
 /// 整理请求体。`codex_prompt` 是该模型的官方指令（读不到时为 None，保留客户端自己的指令）。
 pub fn adapt_request(body: &mut Value, codex_prompt: Option<&str>) {
+    adapt_request_for_transport(body, codex_prompt, false);
+}
+
+/// WS 的连接本地续接必须保留响应、输入项和工具调用的原始标识。
+pub fn adapt_websocket_request(body: &mut Value, codex_prompt: Option<&str>) {
+    adapt_request_for_transport(body, codex_prompt, true);
+}
+
+fn adapt_request_for_transport(body: &mut Value, codex_prompt: Option<&str>, websocket: bool) {
     let Some(object) = body.as_object_mut() else {
         return;
     };
     for key in REJECTED_FIELDS {
+        if websocket && *key == "previous_response_id" {
+            continue;
+        }
         object.remove(*key);
     }
     // 只保留 Codex 快速档会发的服务等级。
@@ -48,7 +60,7 @@ pub fn adapt_request(body: &mut Value, codex_prompt: Option<&str>) {
         Some(Value::Array(items)) => items,
         _ => Vec::new(),
     };
-    input = adapt_input(input);
+    input = adapt_input(input, websocket);
 
     let own = object
         .get("instructions")
@@ -142,7 +154,19 @@ pub fn bound_call_id(id: &str) -> String {
 
 /// 整理输入项：不引用已存的项、不带 id（以及跟着 id 的 status）、调用 id 不超长、
 /// 找不到调用的工具输出改成一条说明、`system` 角色改成 `developer`。
-fn adapt_input(input: Vec<Value>) -> Vec<Value> {
+fn adapt_input(input: Vec<Value>, websocket: bool) -> Vec<Value> {
+    if websocket {
+        // 调用可能在上一响应中；这里不能根据本次增量判断它是否孤立。
+        return input
+            .into_iter()
+            .map(|mut item| {
+                if item.get("role").and_then(Value::as_str) == Some("system") {
+                    item["role"] = json!("developer");
+                }
+                item
+            })
+            .collect();
+    }
     const CALL_TYPES: &[&str] = &[
         "function_call",
         "function_call_output",
@@ -436,10 +460,21 @@ const API_HOSTED_TOOLS: &[&str] = &[
 /// 发往 api.openai.com 的 ChatGPT API 订阅请求：不存储、只流式，去掉不接受的字段和托管工具，
 /// `system` 消息改成 `developer`。与 Codex 订阅不同，指令保留 Agent 自己的。
 pub fn adapt_api_request(body: &mut Value) {
+    adapt_api_request_for_transport(body, false);
+}
+
+pub fn adapt_api_websocket_request(body: &mut Value) {
+    adapt_api_request_for_transport(body, true);
+}
+
+fn adapt_api_request_for_transport(body: &mut Value, websocket: bool) {
     let Some(object) = body.as_object_mut() else {
         return;
     };
     for key in API_REJECTED_FIELDS {
+        if websocket && *key == "previous_response_id" {
+            continue;
+        }
         object.remove(*key);
     }
     object.insert("store".to_string(), Value::Bool(false));
@@ -763,5 +798,30 @@ mod tests {
         let sse = b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[1]}}\n\n";
         assert_eq!(responses_json_from_sse(sse).unwrap()["output"], json!([1]));
         assert!(responses_json_from_sse(b"{\"id\":\"x\"}").is_none());
+    }
+
+    #[test]
+    fn websocket_shaping_preserves_incremental_tool_and_item_identity() {
+        let input = json!([
+            {"type":"function_call_output","call_id":"c".repeat(80),"output":"ok"},
+            {"type":"custom_tool_call_output","call_id":"custom","output":"ok"},
+            {"type":"local_shell_call_output","call_id":"shell","output":"ok"},
+            {"type":"tool_search_output","call_id":"search","tools":[]},
+            {"type":"item_reference","id":"rs_previous"}
+        ]);
+        let mut body = json!({
+            "previous_response_id":"resp_previous", "input":input,
+            "temperature":0.2, "store":true
+        });
+        adapt_websocket_request(&mut body, None);
+        assert_eq!(body["previous_response_id"], "resp_previous");
+        assert_eq!(body["input"], input);
+        assert_eq!(body["store"], false);
+        assert!(body.get("temperature").is_none());
+
+        let mut api = json!({"previous_response_id":"resp_previous","input":input});
+        adapt_api_websocket_request(&mut api);
+        assert_eq!(api["previous_response_id"], "resp_previous");
+        assert_eq!(api["input"], input);
     }
 }

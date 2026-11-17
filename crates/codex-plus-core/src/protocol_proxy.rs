@@ -188,15 +188,34 @@ pub(crate) fn managed_protocol_proxy_base_urls() -> Vec<String> {
     ports.into_iter().map(local_responses_proxy_base_url).collect()
 }
 
-/// 本地 WS 入口只能把 `response.create` 转给原生 Responses 上游；Chat Completions /
-/// Anthropic 兼容路由只能走 HTTP/SSE。混合协议池一律在握手阶段回 426，让客户端继续
-/// 用 HTTP，而不是升级成功后在路由阶段把整轮请求打成失败（#2963 的能力边界）。
+/// 第三方必须显式声明 WS 能力，避免把仅支持 HTTP 的 Responses 路由误判为支持升级。
+pub(crate) fn relay_supports_responses_websocket(
+    relay: &crate::settings::RelayProfile,
+) -> bool {
+    if relay.protocol != crate::settings::RelayProtocol::Responses {
+        return false;
+    }
+    // 第三方 Responses 不一定支持 WS。复用供应商现有 TOML 的能力声明，
+    // 不声明时在握手前回落 HTTP；官方账号默认支持，显式 false 仍优先。
+    let declared = relay
+        .config_contents
+        .parse::<toml_edit::DocumentMut>()
+        .ok()
+        .and_then(|doc| {
+            let provider = doc.get("model_provider")?.as_str()?;
+            doc.get("model_providers")?
+                .get(provider)?
+                .get("supports_websockets")?
+                .as_bool()
+        });
+    declared.unwrap_or_else(|| crate::official_login::member_uses_official_login_transport(relay))
+}
+
+/// 握手尚未收到模型名，保守检查整个路由池；不支持的成员使客户端直接回落 HTTP。
 pub(crate) fn websocket_upgrade_serves_all_routes(
     settings: &crate::settings::BackendSettings,
 ) -> bool {
-    let native_responses = |relay: &crate::settings::RelayProfile| {
-        relay.protocol == crate::settings::RelayProtocol::Responses
-    };
+    let native_responses = relay_supports_responses_websocket;
     if settings.relay_profiles_enabled
         && !settings.relay_profiles.iter().all(native_responses)
     {
@@ -3877,6 +3896,11 @@ async fn open_responses_proxy_request_once(
         if crate::responses_websocket::active() && relay.protocol != crate::settings::RelayProtocol::Responses {
             return Err(crate::responses_websocket::Unsupported("此 WS 路径只支持原生 Responses 上游；HTTP/SSE 兼容路由请继续使用 HTTP").into());
         }
+        if crate::responses_websocket::active() && !relay_supports_responses_websocket(&relay) {
+            return Err(crate::responses_websocket::Unsupported(
+                "此供应商未声明支持 Responses WebSocket；请使用 HTTP 或显式启用 supports_websockets",
+            ).into());
+        }
         // 官方登录成员：用该账号 OAuth 凭据发往 chatgpt.com，而不是 API Key。
         let official_member =
             crate::official_login::member_uses_official_login_transport(&relay);
@@ -6341,7 +6365,9 @@ async fn upstream_request_parts(
             );
         }
         dedupe_responses_tool_search_outputs(&mut body);
-        normalize_responses_item_ids(&mut body);
+        if !crate::responses_websocket::active() {
+            normalize_responses_item_ids(&mut body);
+        }
     }
 
     // base64 图片一旦落进文本字段会把 token 估算撑到不可用，必须在 VLM 预处理前清掉。

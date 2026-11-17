@@ -211,6 +211,7 @@ async fn continuation_after_auth_change(
             relay: "auth-test".into(),
             model: "test".into(),
             key: None,
+            prompt_cache_key: None,
         }),
     };
     let result = REQUEST

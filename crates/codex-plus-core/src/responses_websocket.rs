@@ -29,6 +29,7 @@ struct Affinity {
     relay: String,
     model: String,
     key: Option<KeyRef>,
+    prompt_cache_key: Option<String>,
 }
 
 #[derive(Default)]
@@ -542,7 +543,7 @@ fn parse_create(text: &str) -> anyhow::Result<(String, Value)> {
 
 async fn open_request(
     lane: String,
-    body: Value,
+    mut body: Value,
     headers: ClientHeaders,
     path: String,
     opener: crate::launcher::ProxyOpener,
@@ -561,17 +562,28 @@ async fn open_request(
             "本地 WS 响应亲和记录已达上限，请重新连接并发送完整上下文".into(),
         ));
     }
-    let previous = body
-        .get("previous_response_id")
-        .and_then(Value::as_str)
-        .and_then(|id| {
-            registry
+    let previous = match body.get("previous_response_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if !id.trim().is_empty() => {
+            let previous = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .responses
                 .get(id)
-                .cloned()
-        });
+                .cloned();
+            let Some(previous) = previous else {
+                return Err((lane, 400, "未知的 WS 续接响应；请使用完整上下文开始新响应".into()));
+            };
+            // 首轮适配器可能生成缓存键；增量没有用户消息，不能重新推导或丢掉会话头。
+            if !body.get("prompt_cache_key").and_then(Value::as_str).is_some_and(|key| !key.is_empty()) {
+                if let Some(key) = &previous.prompt_cache_key {
+                    body["prompt_cache_key"] = json!(key);
+                }
+            }
+            Some(previous)
+        }
+        _ => return Err((lane, 400, "previous_response_id 必须是非空字符串".into())),
+    };
     let context = RequestContext { registry, previous };
     REQUEST.scope(context, crate::extension_gateway::with_codex_response_plan(async {
         let mut log = crate::launcher::ProxyRequestLog::begin("GET", &path, Some(&body), headers.thread.clone().or(headers.session.clone()));
@@ -736,7 +748,7 @@ pub(crate) async fn handle(
             stream,
             "426 Upgrade Required",
             "application/json; charset=utf-8",
-            br#"{"status":"upgrade_required","message":"WebSocket transport requires native Responses upstreams; retry with HTTP."}"#,
+            br#"{"status":"upgrade_required","message":"WebSocket transport requires explicitly supported Responses upstreams; retry with HTTP."}"#,
         )
         .await?;
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -745,7 +757,7 @@ pub(crate) async fn handle(
                 "method": "GET",
                 "path": path,
                 "status": "426 Upgrade Required",
-                "reason": "mixed_protocol_relays",
+                "reason": "unsupported_websocket_routes",
             }),
         );
         return Ok(());
@@ -914,6 +926,7 @@ pub(crate) async fn handle(
                             connection: id.clone(), relay: response.ready.relay.clone(),
                             model: response.ready.body["model"].as_str().unwrap_or("").into(),
                             key: response.ready.gateway.as_ref().map(|gateway| gateway.candidate.key.clone()),
+                            prompt_cache_key: response.ready.body.get("prompt_cache_key").and_then(Value::as_str).map(str::to_string),
                         });
                     }
                     if kind.ends_with(".delta") { response.log.mark_first_token_at(crate::launcher::current_time_ms()); }
