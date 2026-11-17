@@ -2,16 +2,44 @@
 
 本文记录如何在 `jacywallny/CodexPlusPlus` 使用 GitHub Actions 构建 Windows 成品，适用于只验证云端编译、不改动本机安装的场景。
 
-## 源码与分支
+## 2.7.2 修复构建（2026-11-17）
+
+个人 fork 基于上游 `v2.7.1`（`d5dcad3b3b9d1ef1dc83ba76a3b8f4c4098d2abe`）修复 #3151、#3154、#3155，版本升为 `2.7.2`。保留个人仓库原有历史与云端构建能力，不改写历史。
+
+- 修复分支：`fix/ws-context-and-http-fallback`。
+- 修复实现：`51096e7f335ad81e7a207d619e48163b214b9e2b`。
+- 本轮测试和打包提交：`971bf162b1d45a2a6d1153ec26c5fd62c921311d`。
+- Windows 全量运行：`https://github.com/jacywallny/CodexPlusPlus/actions/runs/44075197454`，未设置 Rust 测试筛选。
+- 验证结果：2026-11-17 19:34:12 至 20:04:00（Asia/Shanghai）运行成功，总耗时 29 分 48 秒。前端测试、注入回归、TypeScript 检查、Vite 构建和全部 Windows 打包步骤通过。
+- Rust 汇总：5420 通过、0 失败、47 忽略。统计 21 组 `0 filtered out` 的测试结果，不重复计入独立子进程的定向摘要；忽略项没有执行。
+- 新增的五项 Rust 回归全部通过；版本脚本 LF/CRLF 两项 Node 测试通过；六处版本元数据一致为 `2.7.2`。
+- Rust workspace 编译与测试 11 分 20 秒，data 串行编译与测试 5 分 25 秒；Release 编译 10 分 03 秒，NSIS 打包与版本检查 45 秒。云端工具链为 `rustc 1.100.0 (0ef1bc386 2026-11-09)`。
+- 成品：`codex-plus-plus-windows-binaries`（Artifact 14326257724）、`codex-plus-plus-windows-installer`（14325873594）、`codex-plus-plus-windows-build-info`（14325074983），均已上传且未过期。安装包文件名为 `CodexPlusPlus-2.7.2-windows-x64-setup.exe`。
+- 本记录提交只更新文档，程序和工作流与上述已验证提交保持一致；未下载、安装或执行本次成品，未发布 Release。
+
+官方账号网关的 WebSocket 请求保留响应、输入项和工具调用标识；纯工具增量沿用首轮缓存键，未知续接 ID 明确拒绝。第三方 Responses 供应商默认回退 HTTP；确实支持原生 Responses WebSocket 时，在供应商配置快照的活动 provider 下显式声明：
+
+```toml
+model_provider = "custom"
+
+[model_providers.custom]
+supports_websockets = true
+```
+
+该声明不替代原有 provider 的 URL、认证和其他配置，需与真实上游能力一致。显式 `false` 禁用；路由池中存在不支持的成员时，现有保守检查让整个入口在升级前返回 426。没有增加 WS 到 HTTP 的桥接或生成后自动重放。
+
+新增测试使用本地模拟上游覆盖官方账号网关连续两轮工具调用、缓存键及连接复用、未知续接拒绝和握手前回退。云端通过只能证明这些测试及构建通过，真实账号和客户端仍需实机验证。
+
+## 2.3.1 历史基线（2026-11-06）
 
 - 上游版本：`BigPizzaV3/CodexPlusPlus` 的 `v2.3.1`。
 - 上游源码提交：`7d7832edfb93afbcc9759c8d970b07cbcb27ae44`。
-- 当前维护分支：`main`，源码基线为已验证的 `2.3.1`。
+- 当时维护分支：`main`，源码基线为已验证的 `2.3.1`。
 - 首次云端验证分支：`ci/windows-v2.3.1-20261106`，已在分支收敛时归档。
 - 首次 CI 提交：`432beedc2fbaee18fb085596e46624184b2c5d84`。
-- 本地检出：`D:\github\CodexPlusPlus-2.3.1-project-state-repair`。
+- 当时本地检出：`D:\github\CodexPlusPlus-2.3.1-project-state-repair`。
 
-首次同步时 fork 的旧 `main` 与上游已经分叉：上游领先 1527 个提交，fork 有 8 个独立提交，当时使用独立验证分支。发布成功后，按用户确认，将已验证的 `2.3.1` 和 CI 优化整理为唯一维护分支 `main`；通过保留旧 `main` 为合并父提交的方式正常推进，没有强推改写历史。当前 Rust、前端及注入脚本与已验证构建相同；旧分支上的定制功能保存在归档中，尚未逐项移植到这个源码基线。
+首次同步时 fork 的旧 `main` 与上游已经分叉：上游领先 1527 个提交，fork 有 8 个独立提交，当时使用独立验证分支。发布成功后，按用户确认，将已验证的 `2.3.1` 和 CI 优化整理为唯一维护分支 `main`；通过保留旧 `main` 为合并父提交的方式正常推进，没有强推改写历史。当时 Rust、前端及注入脚本与已验证构建相同；旧分支上的定制功能保存在归档中，尚未逐项移植到这个源码基线。
 
 ## 触发 Windows 构建
 
@@ -23,7 +51,7 @@ gh workflow run pr-build.yml --repo jacywallny/CodexPlusPlus --ref main -f platf
 
 `platform` 支持 `windows`、`macos`、`linux`、`all`，默认 `all`。配置已经并入 `main`。日常手动 Windows 验证使用 `--ref main -f platform=windows`，避免同时启动其他平台的构建。
 
-`main` 的普通推送会按现有配置自动触发各平台构建；需要仅验证 Windows 时使用上述手动命令。本次分支收敛仅涉及历史整理和文档，应用源码未变，提交带 `[skip ci]`，没有重复触发完整构建。
+`main` 的普通推送会按现有配置自动触发各平台检查；需要仅验证 Windows 时使用上述手动命令。2.7.2 使用已经通过的精确提交完成云端验证后推进 `main`，后续记录提交只更新文档，带 `[skip ci]`，不重复触发完整构建。
 
 ## 跟踪结果
 
@@ -37,7 +65,7 @@ gh run watch <RUN_ID> --repo jacywallny/CodexPlusPlus --exit-status --interval 3
 
 刚触发后的列表可能暂时为空；优先使用触发命令返回链接中的运行编号。只有运行最终 `conclusion=success` 且三个 Windows 产物都上传完成，才算本次交付成功。
 
-构建顺序为前端依赖安装、前端测试、注入脚本回归检查、TypeScript 检查、Vite 构建、`cargo test --workspace --locked`、`cargo build --release --locked -p codex-plus-manager`、NSIS 打包与产物上传。
+构建顺序为前端依赖安装、前端测试、注入脚本回归检查、TypeScript 检查、Vite 构建、`cargo test --workspace --locked --exclude codex-plus-data`、单独串行运行 `cargo test --locked -p codex-plus-data -- --test-threads=1`、`cargo build --release --locked -p codex-plus-manager`、NSIS 打包与产物上传。完整测试覆盖 workspace；data 单独串行执行以遵守共享内存预算。
 
 不要为了得到绿色状态而跳过失败测试。可用下面的命令查看失败证据；修正 CI 问题后，提交、推送并针对新提交重新触发：
 
@@ -66,7 +94,7 @@ gh run download <RUN_ID> --repo jacywallny/CodexPlusPlus -n codex-plus-plus-wind
 Get-FileHash -LiteralPath '<选定目录>\app\codex-plus-plus.exe' -Algorithm SHA256
 ```
 
-对照 `SHA256SUMS.txt`，并确认 `build-info.json` 的仓库、版本、提交、运行编号和测试筛选条件均符合预期。SHA-256 用于核对下载文件，不代表 Windows 代码签名或实机功能验证。分支构建的安装包文件名包含分支名，程序版本以构建信息中的 `version` 为准。
+对照 `SHA256SUMS.txt`，并确认 `build-info.json` 的仓库、版本、提交、运行编号和测试筛选条件均符合预期。SHA-256 用于核对下载文件，不代表 Windows 代码签名或实机功能验证。从 2.7.2 起，安装包文件名和安装登记版本使用程序版本，不再使用分支名；来源分支和提交记录在 `build-info.json`。
 
 本流程只产出云端安装包和 EXE，不会自动发布 Release，也不会替换 `D:\Codex++`、重启 Codex、改变供应商或修复项目归属。
 
@@ -74,7 +102,7 @@ Get-FileHash -LiteralPath '<选定目录>\app\codex-plus-plus.exe' -Algorithm SH
 
 - `actions/setup-node` 缓存 npm 下载内容，键关联 `package-lock.json`；仍执行 `npm ci`。
 - `Swatinem/rust-cache` 缓存 Cargo 依赖和编译依赖产物，结合 Rust 工具链、依赖清单及构建环境区分缓存。
-- 同一分支、同一平台的新运行取消尚未结束的旧运行。
+- 同一分支的自动推送构建会取消旧的自动运行；手动构建按运行编号独立，不自动互相取消。
 - Windows 发布构建只编译管理器包，Rust 测试仍覆盖整个 workspace。
 
 首次运行没有该分支的缓存，仍可能花费几十分钟。只有实际比较后续缓存命中运行，才能判断加速幅度；更换工具链、依赖或分支可能导致缓存未命中。GitHub 排队与缓存上传也计入等待时间。
