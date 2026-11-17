@@ -128,12 +128,12 @@ jobs:
         run: |
           set -euo pipefail
           {
-            printf '%s\n\n' '此版本是本 fork 基于上游同版本源码发布的 Windows x64 构建，仅提供 Windows 安装包和便携包。'
-            printf '%s\n\n' '旧定制分支的功能尚未逐项合入；本次不包含针对项目消失问题新增的修复，供应商切换后的项目恢复行为尚未实机验证。'
+            printf '%s\n\n' '此版本为本 fork 的 Windows x64 发布，仅提供 Windows 安装包和便携包；源码基线与本次修复见下方更新说明。'
+            printf '%s\n\n' '云端测试与打包通过不代表真实账号上的全部行为已经实机验证。'
             if [ -n "$SOURCE_RUN_ID" ]; then
               printf '复用已通过完整云端测试的 EXE：[构建运行 %s](https://github.com/%s/actions/runs/%s)。正式安装包由本次发布流程重新打包，附 SHA256SUMS.txt 和 build-info.json 供核对。\n\n' "$SOURCE_RUN_ID" "$GH_REPO" "$SOURCE_RUN_ID"
             fi
-            printf '%s\n\n' '### 上游更新说明'
+            printf '%s\n\n' '### 本次更新说明'
             cat notes.md
           } > scoped-notes.md
           mv scoped-notes.md notes.md
