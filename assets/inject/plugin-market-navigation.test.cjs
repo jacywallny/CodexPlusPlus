@@ -92,6 +92,7 @@ function fixture(layout = "sidebar") {
     codexPluginMarketplacePatchEnabled: () => false, nodeOrAncestorLooksLikeCodexUserBubble: () => false, nodeLooksLikeCodexUserBubble: () => false,
   });
   const functions = [
+    navigation.match(/^  const codexPlusPromotionsEnabled = (?:true|false);$/m)?.[0],
     extract(adapter, "codexPlusNativePluginNavigationEntry"), extract(adapter, "openCodexPlusNativePluginMarket"),
     ...["codexPlusRailTemplateButton", "codexPlusRailPrimaryAnchor", "createCodexPlusRailButton", "installCodexPlusRailNavigation", "installCodexPlusSidebarNavigation", "detachCodexPlusSidebarNavigation", "removeCodexPlusRailNavigation", "codexPlusNavEntryReusable"].map(name => extract(navigation, name)),
     extract(entryNavigation, "installCodexPlusNavigationEntries"),
@@ -197,4 +198,15 @@ test("native rail mutations schedule reconciliation while owned fallback writes 
   assert.equal(f.context.shouldScheduleScan([{ target: f.nav, addedNodes: [native], removedNodes: [] }]), true);
   native.remove();
   assert.equal(f.context.shouldScheduleScan([{ target: f.nav, addedNodes: [], removedNodes: [native] }]), true);
+});
+
+test("rail reconciliation removes retired promotions and preserves native navigation", () => {
+  const f = fixture("rail");
+  const sponsored = f.nav.appendChild(new Element("div", { id: "codex-plus-rail-sponsor" }));
+  const native = f.native();
+  f.install();
+  f.install();
+  assert.equal(sponsored.isConnected, false);
+  assert.equal(f.document.getElementById("codex-plus-rail-sponsor"), null);
+  assert.equal(native.isConnected, true);
 });
