@@ -23,6 +23,46 @@ type UpstreamSocket = WebSocketStream<reqwest::Upgraded>;
 #[error("{0}")]
 pub(crate) struct Unsupported(pub(crate) &'static str);
 
+/// WS 续接（带 `previous_response_id`）接不上：原连接已关（上游闲置断开等）、模型变了、
+/// 原供应商或 Key 已不在路由里，或本连接根本没有这个响应。回给客户端 OpenAI 的标准错误码
+/// `previous_response_not_found`：Codex 收到后自己重连并发送完整上下文（0.169 实测），
+/// 用户看不到报错；以前回自定义错误码，Codex 把它当失败显示出来（#3169 / #3176 / #3183）。
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct ContinuationLost(pub(crate) &'static str);
+
+/// 客户端据此重发完整上下文的错误码（OpenAI Responses WebSocket 的约定）。
+const CONTINUATION_LOST_CODE: &str = "previous_response_not_found";
+const LOCAL_ERROR_CODE: &str = "local_responses_websocket_error";
+
+/// 这次请求只能走 HTTP（HTTP 专用的压缩 / exec 转换）。与 [`Unsupported`] 不同，
+/// 它说明的是传输选择而不是请求本身有误：下游连接会被关掉，让客户端重连时拿到 426 改走 HTTP。
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct RequiresHttp(pub(crate) &'static str);
+
+/// 101 之后才知道上游不接受 WS：此时已不能回 426，客户端只会按 WS 错误重试，
+/// 重试预算耗尽（实测 5 次）才切 HTTP（#3154 / #3149 / #3145）。所以一旦遇到，
+/// 本进程在这段时间内对新的升级直接回 426；误判的代价只是退回 2.6 的 HTTP 行为。
+const HTTP_FALLBACK_WINDOW: Duration = Duration::from_secs(30 * 60);
+static HTTP_FALLBACK_UNTIL: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+fn require_http_for_a_while(reason: &str) {
+    *HTTP_FALLBACK_UNTIL.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some(std::time::Instant::now() + HTTP_FALLBACK_WINDOW);
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "helper.responses_websocket_http_fallback",
+        json!({ "reason": reason, "windowSecs": HTTP_FALLBACK_WINDOW.as_secs() }),
+    );
+}
+
+fn http_fallback_active() -> bool {
+    HTTP_FALLBACK_UNTIL
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some_and(|until| std::time::Instant::now() < until)
+}
+
 #[derive(Clone)]
 struct Affinity {
     connection: String,
@@ -70,7 +110,7 @@ pub(crate) fn pinned_relay() -> Option<String> {
 /// 原 Key 必须在路由收集阶段筛选，保留它的冷却候选，再由既有队列等名额。
 pub(crate) fn restrict_plan(plan: &mut RoutePlan) -> anyhow::Result<()> {
     if pinned_key().is_some() && plan.candidates.is_empty() && plan.waiting.is_empty() {
-        return Err(Unsupported(
+        return Err(ContinuationLost(
             "WS 续接的原供应商或 Key 已不在当前模型路由中；请使用完整上下文开始新响应",
         )
         .into());
@@ -185,7 +225,7 @@ pub(crate) async fn prepare(
                 if current.as_deref() != Some(&previous.connection)
                     || body.get("model").and_then(Value::as_str) != Some(&previous.model)
                 {
-                    return Err(Unsupported(
+                    return Err(ContinuationLost(
                         "WS 续接的原连接已关闭或模型已变更；请使用完整上下文开始新响应",
                     )
                     .into());
@@ -365,6 +405,16 @@ struct Opened {
     response: ActiveResponse,
 }
 
+/// 准备失败。`http` 为 true 表示上游 / 请求只能走 HTTP：调用方要让客户端尽快改走 HTTP。
+struct OpenFailure {
+    lane: String,
+    status: u16,
+    message: String,
+    http: bool,
+    /// 错误事件里的 `error.code`：续接接不上时是 [`CONTINUATION_LOST_CODE`]。
+    code: &'static str,
+}
+
 struct Reservation {
     slot: Option<crate::gateway::key_pool::KeySlot>,
     submitted: bool,
@@ -505,7 +555,14 @@ fn start_connection(
 }
 
 fn error_event(lane: &str, status: u16, message: &str) -> Message {
-    let mut value = json!({"type":"error","status":status,"error":{"type":"invalid_request_error","code":"local_responses_websocket_error","message":message}});
+    error_event_with_code(lane, status, LOCAL_ERROR_CODE, message)
+}
+
+fn error_event_with_code(lane: &str, status: u16, code: &str, message: &str) -> Message {
+    let mut value = json!({"type":"error","status":status,"error":{"type":"invalid_request_error","code":code,"message":message}});
+    if code == CONTINUATION_LOST_CODE {
+        value["error"]["param"] = json!("previous_response_id");
+    }
     if !lane.is_empty() {
         value["stream_id"] = json!(lane);
     }
@@ -548,7 +605,7 @@ async fn open_request(
     path: String,
     opener: crate::launcher::ProxyOpener,
     registry: Arc<Mutex<Registry>>,
-) -> Result<Opened, (String, u16, String)> {
+) -> Result<Opened, OpenFailure> {
     if registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -556,34 +613,42 @@ async fn open_request(
         .len()
         >= 4096
     {
-        return Err((
+        return Err(OpenFailure {
             lane,
-            429,
-            "本地 WS 响应亲和记录已达上限，请重新连接并发送完整上下文".into(),
-        ));
+            status: 429,
+            message: "本地 WS 响应亲和记录已达上限，请重新连接并发送完整上下文".into(),
+            http: false,
+            code: LOCAL_ERROR_CODE,
+        });
     }
-    let previous = match body.get("previous_response_id") {
+    let previous_id = match body.get("previous_response_id") {
         None | Some(Value::Null) => None,
-        Some(Value::String(id)) if !id.trim().is_empty() => {
-            let previous = registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .responses
-                .get(id)
-                .cloned();
-            let Some(previous) = previous else {
-                return Err((lane, 400, "未知的 WS 续接响应；请使用完整上下文开始新响应".into()));
-            };
-            // 首轮适配器可能生成缓存键；增量没有用户消息，不能重新推导或丢掉会话头。
-            if !body.get("prompt_cache_key").and_then(Value::as_str).is_some_and(|key| !key.is_empty()) {
-                if let Some(key) = &previous.prompt_cache_key {
-                    body["prompt_cache_key"] = json!(key);
-                }
-            }
-            Some(previous)
-        }
-        _ => return Err((lane, 400, "previous_response_id 必须是非空字符串".into())),
+        Some(Value::String(id)) if !id.trim().is_empty() => Some(id.as_str()),
+        _ => return Err(OpenFailure {
+            lane, status: 400, message: "previous_response_id 必须是非空字符串".into(),
+            http: false, code: LOCAL_ERROR_CODE,
+        }),
     };
+    let previous = previous_id.and_then(|id| {
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .responses
+            .get(id)
+            .cloned()
+    });
+    // 本连接没见过这个响应：不能把它当新请求发给某个上游（那边没有前文，增量输入会丢上下文），
+    // 让客户端重发完整上下文。
+    if previous_id.is_some() && previous.is_none() {
+        let message = ContinuationLost("WS 续接引用的响应不在本连接上；请使用完整上下文开始新响应").to_string();
+        return Err(OpenFailure { lane, status: 400, message, http: false, code: CONTINUATION_LOST_CODE });
+    }
+    // 首轮适配器可能生成缓存键；纯工具增量无法重新推导它。
+    if !body.get("prompt_cache_key").and_then(Value::as_str).is_some_and(|key| !key.is_empty())
+        && let Some(key) = previous.as_ref().and_then(|affinity| affinity.prompt_cache_key.as_ref())
+    {
+        body["prompt_cache_key"] = json!(key);
+    }
     let context = RequestContext { registry, previous };
     REQUEST.scope(context, crate::extension_gateway::with_codex_response_plan(async {
         let mut log = crate::launcher::ProxyRequestLog::begin("GET", &path, Some(&body), headers.thread.clone().or(headers.session.clone()));
@@ -602,12 +667,23 @@ async fn open_request(
         let (mut upstream, slot) = match result {
             Ok(result) => result,
             Err(error) => {
+                if let Some(error) = error.downcast_ref::<RequiresHttp>() {
+                    let message = error.to_string();
+                    require_http_for_a_while(&message);
+                    log.record_error("400", message.clone());
+                    return Err(OpenFailure { lane, status: 400, message, http: true, code: LOCAL_ERROR_CODE });
+                }
+                if let Some(error) = error.downcast_ref::<ContinuationLost>() {
+                    let message = error.to_string();
+                    log.record_error("400", message.clone());
+                    return Err(OpenFailure { lane, status: 400, message, http: false, code: CONTINUATION_LOST_CODE });
+                }
                 let (status, message) = match error.downcast_ref::<Unsupported>() {
                     Some(error) => (400, error.to_string()),
                     None => (502, "WS 上游连接或请求准备失败".to_string()),
                 };
                 log.record_error(&status.to_string(), message.clone());
-                return Err((lane, status, message));
+                return Err(OpenFailure { lane, status, message, http: false, code: LOCAL_ERROR_CODE });
             }
         };
         let reservation = Reservation { slot, submitted: false };
@@ -617,7 +693,8 @@ async fn open_request(
             let status = if upstream.status_code == 200 { 502 } else { upstream.status_code };
             let message = "选中的上游未接受标准 Responses WebSocket，请为此配置使用 HTTP".to_string();
             log.record_error(&status.to_string(), message.clone());
-            return Err((lane, status, message));
+            require_http_for_a_while(&format!("upstream rejected WebSocket upgrade with HTTP {}", upstream.status_code));
+            return Err(OpenFailure { lane, status, message, http: true, code: LOCAL_ERROR_CODE });
         };
         let phase = crate::settings::SettingsStore::default().load().unwrap_or_default().codex_app_third_party_reasoning_collapse;
         let transformer = crate::protocol_proxy::ResponsesSseTransformer::for_request(Some(&body))
@@ -627,6 +704,19 @@ async fn open_request(
         response.filter = crate::extension_gateway::ResponseFilter::start(&path, Some(&body)).await;
         Ok(Opened { lane, response })
     })).await
+}
+
+const HTTP_FALLBACK_MESSAGE: &str = "上游需要使用 HTTP，本连接即将关闭；请重连并改用 HTTP";
+
+async fn close_for_http_fallback<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
+) {
+    use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+    let frame = CloseFrame {
+        code: CloseCode::Again,
+        reason: "retry with HTTP".into(),
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), ws.close(Some(frame))).await;
 }
 
 async fn send_message<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
@@ -743,7 +833,12 @@ pub(crate) async fn handle(
     let settings = crate::settings::SettingsStore::default()
         .load()
         .unwrap_or_default();
-    if !crate::protocol_proxy::websocket_upgrade_serves_all_routes(&settings) {
+    let blocked = if http_fallback_active() {
+        Some("upstream_requires_http")
+    } else {
+        crate::protocol_proxy::websocket_upgrade_block_reason(&settings)
+    };
+    if let Some(reason) = blocked {
         crate::launcher::write_http_response(
             stream,
             "426 Upgrade Required",
@@ -757,7 +852,7 @@ pub(crate) async fn handle(
                 "method": "GET",
                 "path": path,
                 "status": "426 Upgrade Required",
-                "reason": "unsupported_websocket_routes",
+                "reason": reason,
             }),
         );
         return Ok(());
@@ -797,7 +892,14 @@ pub(crate) async fn handle(
         }
     }
     let mut preparing = PreparationTasks(HashMap::new());
+    // 有请求发现只能走 HTTP 后，不再接新的 response.create；手上的响应收尾后关掉连接，
+    // 客户端重连时在握手阶段拿到 426，立即改走 HTTP。
+    let mut draining = false;
     loop {
+        if draining && active.is_empty() && preparing.0.is_empty() {
+            close_for_http_fallback(&mut ws).await;
+            return Ok(());
+        }
         while active.len() + preparing.0.len() < 16 {
             let Some(index) = queue.iter().position(|(lane, _, _)| {
                 !active.contains_key(lane) && !preparing.0.contains_key(lane)
@@ -826,6 +928,9 @@ pub(crate) async fn handle(
         tokio::select! {
             message = ws.next() => match message {
                 Some(Ok(Message::Text(text))) => match parse_create(&text) {
+                    Ok((lane, _)) if draining => {
+                        send_message(&mut ws, error_event(&lane, 503, HTTP_FALLBACK_MESSAGE)).await?;
+                    }
                     Ok((lane, body)) => {
                         if (!lane.is_empty() && !lanes.contains(&lane) && lanes.len() >= 32)
                             || queue.len() >= 64 || queued_bytes.saturating_add(text.len()) > 32 * 1024 * 1024
@@ -846,9 +951,20 @@ pub(crate) async fn handle(
             },
             result = opened_rx.recv(), if !preparing.0.is_empty() => {
                 match result.context("WS 请求准备任务退出")? {
-                    Err((lane, status, message)) => {
+                    Err(OpenFailure { lane, status, message, http, code }) => {
                         preparing.0.remove(&lane);
-                        send_message(&mut ws, error_event(&lane, status, &message)).await?;
+                        if http {
+                            draining = true;
+                            queue.clear();
+                            queued_bytes = 0;
+                            // 没有其它进行中的响应时不发错误事件，直接关连接：客户端把断线当作可重试，
+                            // 重连拿到 426 就改走 HTTP。还有别的响应时先回错误，等它们收尾再关。
+                            if !active.is_empty() || !preparing.0.is_empty() {
+                                send_message(&mut ws, error_event(&lane, status, &message)).await?;
+                            }
+                        } else {
+                            send_message(&mut ws, error_event_with_code(&lane, status, code, &message)).await?;
+                        }
                     }
                     Ok(opened) => {
                         let Opened { lane, mut response } = opened;

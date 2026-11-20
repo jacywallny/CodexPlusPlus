@@ -58,7 +58,7 @@ impl GatewayUpstream {
         }
     }
 
-    fn is_success(&self) -> bool {
+    pub(crate) fn is_success(&self) -> bool {
         self.status_code()
             .is_some_and(|status| (200..300).contains(&status))
     }
@@ -170,6 +170,10 @@ async fn open_candidates(
     if crate::extension_gateway::builtin_replaced("builtin:gateway-failover") {
         pending.truncate(1);
     }
+    let same_model_group = plan.group_id.is_some()
+        && pending.first().is_some_and(|first| {
+            pending.iter().all(|candidate| candidate.upstream_model == first.upstream_model)
+        });
     if plan.candidates.is_empty() {
         let Some(wait) = plan.cooling else {
             anyhow::bail!("网关没有可用的上游：请检查绑定的供应商或模型组是否配置了地址和 Key");
@@ -290,7 +294,7 @@ async fn open_candidates(
                     trace.wire_api = "AnthropicMessages".to_string();
                     attempt_native(candidate, passthrough, &request).await
                 }
-                None => attempt_pipeline(settings, candidate, &request).await,
+                None => Box::pin(attempt_pipeline(settings, candidate, &request, same_model_group && has_more)).await,
             };
             let failure = match attempt {
                 Ok(Attempt::Success(mut upstream)) => {
@@ -603,6 +607,11 @@ fn estimate_tokens(request: &GatewayRequest<'_>) -> u64 {
         .anthropic
         .as_ref()
         .map_or(&request.responses_body, |passthrough| passthrough.body);
+    estimate_body_tokens(body)
+}
+
+/// 同 [`estimate_tokens`]，直接按一个请求体估。
+pub(crate) fn estimate_body_tokens(body: &Value) -> u64 {
     text_bytes(body) / 4
 }
 
@@ -639,6 +648,7 @@ async fn attempt_pipeline(
     settings: &BackendSettings,
     candidate: &GatewayCandidate,
     request: &GatewayRequest<'_>,
+    allow_stream_failover: bool,
 ) -> Result<Attempt, AttemptError> {
     let mut body = request.responses_body.clone();
     if candidate.relay.protocol == RelayProtocol::Responses {
@@ -676,11 +686,12 @@ async fn attempt_pipeline(
             &candidate.upstream_model,
         );
         body["model"] = Value::String(candidate.upstream_model.clone());
-        if crate::responses_websocket::active() {
-            crate::gateway::chatgpt_backend::adapt_websocket_request(&mut body, prompt.as_deref());
-        } else {
-            crate::gateway::chatgpt_backend::adapt_request(&mut body, prompt.as_deref());
-        }
+        // WS 增量续接要保留续接 ID 与跨响应的工具配对（#3151）。
+        crate::gateway::chatgpt_backend::adapt_request_for_transport(
+            &mut body,
+            prompt.as_deref(),
+            crate::responses_websocket::active(),
+        );
         let version = crate::gateway::chatgpt_backend::codex_version(&home);
         relay.user_agent = crate::gateway::chatgpt_backend::codex_user_agent(&version);
         for (key, value) in [
@@ -713,11 +724,10 @@ async fn attempt_pipeline(
     if chatgpt_api {
         body["model"] = Value::String(candidate.upstream_model.clone());
         if shaping {
-            if crate::responses_websocket::active() {
-                crate::gateway::chatgpt_backend::adapt_api_websocket_request(&mut body);
-            } else {
-                crate::gateway::chatgpt_backend::adapt_api_request(&mut body);
-            }
+            crate::gateway::chatgpt_backend::adapt_api_request_for_transport(
+                &mut body,
+                crate::responses_websocket::active(),
+            );
         }
         cache_key = body
             .get("prompt_cache_key")
@@ -737,11 +747,21 @@ async fn attempt_pipeline(
     } else {
         request.session_headers
     };
+    let pre_output_failover = allow_stream_failover
+        && chatgpt
+        && !crate::responses_websocket::active()
+        && request.responses_body.get("previous_response_id").is_none_or(Value::is_null)
+        && request.responses_body.get("input").is_some_and(|input| {
+            input.as_array().is_some_and(|items| !items.is_empty() && !items.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("item_reference")
+            })) || input.as_str().is_some_and(|text| !text.is_empty())
+        });
     let body = serde_json::to_string(&body).map_err(|error| AttemptError::Fatal(error.into()))?;
     let forced = ForcedRelay {
         relay,
         upstream_model: Some(candidate.upstream_model.clone()),
         auto_retry: request.auto_retry,
+        pre_output_failover,
     };
     let mut response = match crate::protocol_proxy::open_responses_proxy_request_for_relay(
         &body,
@@ -801,7 +821,7 @@ pub(crate) async fn attempt_once(
             .context("读取网关额度策略失败")?;
         crate::gateway::quota::dispatch_decision(&gateway, &candidate.relay)?;
     }
-    let upstream = match attempt_pipeline(settings, candidate, request).await {
+    let upstream = match attempt_pipeline(settings, candidate, request, false).await {
         Ok(Attempt::Success(upstream)) => (upstream, None),
         Ok(Attempt::Failed { upstream, class }) => (upstream, Some(class)),
         Err(AttemptError::Fatal(error) | AttemptError::Transport(error)) => return Err(error),
@@ -882,6 +902,8 @@ fn conversation_seed(request: &GatewayRequest<'_>) -> Option<String> {
 /// 这些错误是请求内容本身不被支持（附件、加密内容、原生搜索、缺视觉配置），换上游也一样。
 fn is_request_rejection(error: &anyhow::Error) -> bool {
     error.is::<crate::responses_websocket::Unsupported>()
+        || error.is::<crate::responses_websocket::RequiresHttp>()
+        || error.is::<crate::responses_websocket::ContinuationLost>()
         || error
         .downcast_ref::<crate::protocol_proxy::UnsupportedEncryptedAgentContent>()
         .is_some()

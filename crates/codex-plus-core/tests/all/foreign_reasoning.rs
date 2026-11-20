@@ -119,6 +119,7 @@ async fn send_forced_with(
         &body.to_string(),
         settings,
         ForcedRelay {
+            pre_output_failover: false,
             relay: relay.clone(),
             upstream_model: None,
             auto_retry,
@@ -601,6 +602,7 @@ async fn send_forced_traced(
         &body.to_string(),
         BackendSettings::default(),
         ForcedRelay {
+            pre_output_failover: false,
             relay: relay.clone(),
             upstream_model: None,
             auto_retry: false,

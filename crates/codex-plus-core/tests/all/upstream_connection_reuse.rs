@@ -141,6 +141,7 @@ async fn try_send_once(relay: &RelayProfile, user_agent: Option<&str>) -> anyhow
         &body,
         BackendSettings::default(),
         ForcedRelay {
+            pre_output_failover: false,
             relay: relay.clone(),
             upstream_model: None,
             auto_retry: false,

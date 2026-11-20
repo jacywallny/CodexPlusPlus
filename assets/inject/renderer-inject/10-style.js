@@ -1420,6 +1420,37 @@
         color: var(--codex-plus-text) !important;
       }
       .${codexPlusPageClass} .codex-plus-modal-content { border-color: transparent; }
+      /*
+       * 梦皮（Dream Skin）壁纸模式（#3152）：原生设置页在梦皮下是一层半透明遮罩叠在壁纸上，
+       * 我们的页面却是实色底，整块盖住壁纸。页面是盖在内容区上的独立 fixed 层，底下不是同一页，
+       * 不能直接透明；这里照梦皮给原生设置页的画法，在页面根节点自己画「遮罩 + 壁纸」，
+       * 内层的页面底、左栏、内容区改透明。变量都由梦皮定义（--dream-skin-art / --ds-*），
+       * 每个都带兜底：缺了就退回原来的实色底，不会变成全透明。
+       * full 模式对应梦皮的 --ds-immersive-*，ambient / banner 对应更重的 --ds-task-immersive-*；
+       * off 模式梦皮自己也不画壁纸，这里不管。
+       */
+      html[data-dream-skin="active"][data-dream-art-ready="true"]:is([data-dream-task-mode="full"], [data-dream-art-task-mode="full"]) .${codexPlusPageClass} {
+        --codex-plus-dream-veil: linear-gradient(90deg, var(--ds-immersive-edge, transparent), var(--ds-immersive-mid, transparent) 64%, var(--ds-immersive-far, transparent));
+      }
+      html[data-dream-skin="active"][data-dream-art-ready="true"]:is([data-dream-task-mode="ambient"], [data-dream-art-task-mode="ambient"], [data-dream-task-mode="banner"], [data-dream-art-task-mode="banner"]) .${codexPlusPageClass} {
+        --codex-plus-dream-veil: linear-gradient(90deg, var(--ds-task-immersive-edge, transparent), var(--ds-task-immersive-mid, transparent) 64%, var(--ds-task-immersive-far, transparent));
+      }
+      html[data-dream-skin="active"][data-dream-art-ready="true"]:is([data-dream-task-mode="full"], [data-dream-art-task-mode="full"], [data-dream-task-mode="ambient"], [data-dream-art-task-mode="ambient"], [data-dream-task-mode="banner"], [data-dream-art-task-mode="banner"]) .${codexPlusPageClass} {
+        --codex-plus-settings-page-bg: transparent !important;
+        --codex-plus-nav-bg: transparent !important;
+        background:
+          var(--codex-plus-dream-veil, linear-gradient(transparent, transparent)),
+          var(--dream-skin-art, none) var(--ds-art-position, center) / cover no-repeat fixed,
+          var(--ds-bg, var(--codex-plus-bg-primary)) !important;
+      }
+      html[data-dream-skin="active"][data-dream-art-ready="true"]:is([data-dream-task-mode="full"], [data-dream-art-task-mode="full"], [data-dream-task-mode="ambient"], [data-dream-art-task-mode="ambient"], [data-dream-task-mode="banner"], [data-dream-art-task-mode="banner"]) .${codexPlusPageClass} .codex-plus-modal-content {
+        background: transparent !important;
+      }
+      /* 吸顶标题底下会滚过正文：透明后改成梦皮面板色的半透明磨砂，正文不会从标题后面透出来。 */
+      html[data-dream-skin="active"][data-dream-art-ready="true"]:is([data-dream-task-mode="full"], [data-dream-art-task-mode="full"], [data-dream-task-mode="ambient"], [data-dream-art-task-mode="ambient"], [data-dream-task-mode="banner"], [data-dream-art-task-mode="banner"]) .${codexPlusPageClass} :is(.codex-plus-provider-detail > .codex-plus-provider-detail-header, .codex-plus-task-group-head) {
+        background: color-mix(in srgb, var(--ds-panel, var(--codex-plus-bg-primary)) 72%, transparent);
+        backdrop-filter: blur(18px) saturate(1.1);
+      }
       .codex-plus-modal-body { scrollbar-color: var(--codex-plus-text-tertiary) transparent; }
       .codex-plus-modal-body::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--codex-plus-text-tertiary) 45%, transparent); background-clip: padding-box; }
       .codex-plus-modal-body::-webkit-scrollbar-thumb:hover { background: var(--codex-plus-text-tertiary); background-clip: padding-box; }
@@ -1776,6 +1807,40 @@
       .codex-plus-remote-qrs figure { margin: 0; display: grid; gap: 6px; justify-items: center; color: var(--codex-plus-text-secondary); font-size: 12px; }
       .codex-plus-remote-qr { width: 180px; padding: 8px; border-radius: 8px; background: #fff; }
       .codex-plus-remote-qr svg { display: block; width: 100%; height: auto; }
+      /* 「微信连接」页（45-weixin-connect-page.js）：版式同远程控制页；账号、联系人 ID、登录链接这类长文本省略号截断，不撑破布局。 */
+      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="weixin-connect"] {
+        background: var(--codex-plus-settings-page-bg, var(--codex-plus-bg-primary)) !important;
+        container: codex-plus-weixin-page / inline-size;
+      }
+      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="weixin-connect"] .codex-plus-modal-body {
+        box-sizing: border-box;
+        padding: 72px 32px 64px;
+      }
+      @container codex-plus-weixin-page (max-width: 800px) {
+        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="weixin-connect"] .codex-plus-modal-body { padding: 48px 24px; }
+      }
+      .codex-plus-weixin-page .codex-plus-row > :not(:first-child) { max-width: 60%; min-width: 0; }
+      .codex-plus-weixin-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; }
+      .codex-plus-weixin-controls .codex-plus-action-button { padding: 0 12px; white-space: nowrap; }
+      .codex-plus-weixin-page .codex-plus-action-button[data-primary="true"]:not(:disabled) { background: var(--codex-plus-text); color: var(--codex-plus-bg-primary); }
+      .codex-plus-weixin-page .codex-plus-action-button:disabled { cursor: default; opacity: .55; }
+      .codex-plus-weixin-ellipsis { display: block; min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .codex-plus-weixin-meta-line { display: flex; flex-wrap: wrap; gap: 2px 12px; min-width: 0; margin-top: 2px; }
+      .codex-plus-weixin-meta { display: inline-flex; align-items: baseline; gap: 4px; min-width: 0; max-width: 100%; white-space: nowrap; }
+      .codex-plus-weixin-meta code, .codex-plus-weixin-qr-link { font-family: var(--codex-plus-font-mono, ui-monospace, Menlo, monospace); font-size: 12px; }
+      .codex-plus-weixin-meta code { flex: 0 1 auto; max-width: 220px; }
+      .codex-plus-weixin-input { width: 280px; max-width: 100%; min-width: 0; text-overflow: ellipsis; }
+      .codex-plus-weixin-menu { position: relative; display: inline-flex; min-width: 0; max-width: 100%; }
+      .codex-plus-weixin-menu .codex-plus-menu-trigger { max-width: 100%; }
+      .codex-plus-weixin-menu .codex-plus-menu-trigger:disabled { cursor: default; opacity: .55; }
+      .codex-plus-weixin-menu-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+      .codex-plus-weixin-menu-popover { top: calc(100% + 4px); right: 0; max-width: min(360px, 80vw); max-height: 320px; overflow-y: auto; }
+      .codex-plus-weixin-title-badge { margin-left: 8px; font-weight: 400; }
+      .codex-plus-weixin-qr-card { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 16px; padding: 16px; }
+      .codex-plus-weixin-qr { flex: none; }
+      .codex-plus-weixin-qr-side { display: grid; flex: 1 1 220px; gap: 10px; min-width: 0; }
+      .codex-plus-weixin-qr-side .codex-plus-weixin-controls { justify-content: flex-start; }
+      .codex-plus-weixin-qr-link { display: block; min-width: 0; overflow: hidden; color: var(--codex-plus-text-secondary); text-overflow: ellipsis; white-space: nowrap; }
       @container codex-plus-settings (max-width: 560px) {
         .codex-plus-settings .codex-plus-row { gap: 16px; }
       }
