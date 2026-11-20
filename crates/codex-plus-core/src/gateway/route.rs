@@ -45,6 +45,8 @@ pub struct GatewayCandidate {
     pub window: Option<u64>,
     /// 这家每个 Key 的主动限速上限（没填就是不限）；候选循环发请求前按它占名额。
     pub limits: KeyLimits,
+    /// 自动组 Fast 请求：Some(false) 表示这个候选只按普通档发。
+    pub(super) auto_priority: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +209,41 @@ pub fn active_auto_group(gateway: &GatewaySettings, model: &str) -> Option<Gatew
         return None;
     }
     build_auto_group(gateway, &enabled_relay_models(gateway), model)
+}
+
+pub(super) fn auto_fast_model(model: &str) -> bool {
+    ["gpt-6.2-sol", "gpt-6.2-astra"]
+        .iter()
+        .any(|slug| slug.eq_ignore_ascii_case(model))
+}
+
+pub(super) fn priority_tiers(entry: &serde_json::Value) -> bool {
+    [("service_tiers", "priority"), ("additional_speed_tiers", "fast")]
+        .iter()
+        .any(|(field, id)| {
+            entry.get(*field).and_then(serde_json::Value::as_array).is_some_and(|tiers| {
+                tiers.iter().any(|tier| crate::model_suffix::model_speed_tier_is(tier, id))
+            })
+        })
+}
+
+pub(super) fn priority_member_configured(relay: &RelayProfile) -> bool {
+    relay.protocol == crate::settings::RelayProtocol::Responses
+        && (crate::official_login::member_uses_official_login_transport(relay)
+            || (!relay.base_url.trim().is_empty()
+                && (relay.uses_no_auth()
+                    || !relay.api_key.trim().is_empty()
+                    || relay.api_keys.iter().any(|key| !key.api_key.trim().is_empty()))))
+}
+
+fn member_accepts_priority(relay: &RelayProfile, model: &str) -> bool {
+    priority_member_configured(relay)
+        && crate::aggregate_catalog::build_member_catalog(relay).is_ok_and(|catalog| {
+            catalog["models"].as_array().is_some_and(|entries| entries.iter().any(|entry| {
+                entry["slug"].as_str().is_some_and(|slug| slug.eq_ignore_ascii_case(model))
+                    && priority_tiers(entry)
+            }))
+        })
 }
 
 /// 隐藏了成员的组（自建的、生效中的自动组）里，不再单独出现在 Agent 模型列表里的那些成员。
@@ -1671,7 +1708,7 @@ pub fn resolve_plan(
     requested_model: &str,
     conversation: Option<&str>,
 ) -> anyhow::Result<RoutePlan> {
-    resolve_plan_with(gateway, agent, requested_model, conversation, true, false)
+    resolve_plan_with(gateway, agent, requested_model, conversation, true, false, false)
 }
 
 /// 同 [`resolve_plan`]，再看请求体里有没有图片：模型组设了图像输入模型、请求上下文又带图片时，
@@ -1684,7 +1721,7 @@ pub fn resolve_plan_for_request(
     request: &serde_json::Value,
 ) -> anyhow::Result<RoutePlan> {
     let images = request_has_images(request);
-    resolve_plan_with(gateway, agent, requested_model, conversation, true, images)
+    resolve_plan_with(gateway, agent, requested_model, conversation, true, images, wants_priority(request))
 }
 
 /// 只预览：和 [`resolve_plan`] 选出同样的第一个候选，但不推进模型组轮换 / 权重和 Key 轮询的进度。
@@ -1695,7 +1732,7 @@ pub fn preview_plan(
     requested_model: &str,
     conversation: Option<&str>,
 ) -> anyhow::Result<RoutePlan> {
-    resolve_plan_with(gateway, agent, requested_model, conversation, false, false)
+    resolve_plan_with(gateway, agent, requested_model, conversation, false, false, false)
 }
 
 /// 同 [`preview_plan`]，带图片的请求按图像输入模型预览（与 [`resolve_plan_for_request`] 一致）。
@@ -1707,7 +1744,11 @@ pub fn preview_plan_for_request(
     request: &serde_json::Value,
 ) -> anyhow::Result<RoutePlan> {
     let images = request_has_images(request);
-    resolve_plan_with(gateway, agent, requested_model, conversation, false, images)
+    resolve_plan_with(gateway, agent, requested_model, conversation, false, images, wants_priority(request))
+}
+
+fn wants_priority(request: &serde_json::Value) -> bool {
+    request["service_tier"].as_str() == Some("priority")
 }
 
 fn resolve_plan_with(
@@ -1717,6 +1758,7 @@ fn resolve_plan_with(
     conversation: Option<&str>,
     advance: bool,
     images: bool,
+    priority: bool,
 ) -> anyhow::Result<RoutePlan> {
     let binding = gateway
         .active_binding(agent)
@@ -1738,6 +1780,11 @@ fn resolve_plan_with(
 
     let group = selected.is_none().then(|| group_for(gateway, &model)).flatten();
     let group_id = group.as_ref().map(|group| group.id.clone());
+    let auto_priority = priority
+        && *agent == ToolId::Codex
+        && auto_fast_model(requested_model.trim())
+        && requested_model.trim().eq_ignore_ascii_case(&model)
+        && group_id.as_deref().is_some_and(|id| id.starts_with(AUTO_GROUP_PREFIX));
     // 图像输入模型（#3150）：组设了图像输入模型、请求上下文里又有图片时，这次只发给图像输入模型。
     // 看的是整段上下文而不只是本轮新消息：历史里的图片每轮都会随上下文重发，交给不收图的成员
     // 照样会被拒（或被上游悄悄丢掉），所以只要上下文里还带着图，就一直走图像输入模型，
@@ -1748,7 +1795,7 @@ fn resolve_plan_with(
     // 改发图像输入模型的请求不参与会话固定：不记、不读，免得没图片的请求被拉去固定在图像输入模型上。
     let sticky_ttl = group
         .as_ref()
-        .filter(|_| image_group.is_none())
+        .filter(|_| image_group.is_none() && !auto_priority)
         .and_then(|group| sticky_ttl(group.sticky));
     let mut relays = match (selected, image_group) {
         (Some((relay, upstream)), _) => vec![(relay.clone(), upstream)],
@@ -1820,12 +1867,23 @@ fn resolve_plan_with(
     if relays.is_empty() {
         bail!("网关的供应商池里没有供应商提供模型 {model}");
     }
+    let mut relays: Vec<_> = relays
+        .into_iter()
+        .map(|(relay, upstream)| {
+            let priority = auto_priority.then(|| member_accepts_priority(&relay, &upstream));
+            (relay, upstream, priority)
+        })
+        .collect();
+    if auto_priority && crate::responses_websocket::pinned_key().is_none() {
+        // 保留同一档内原有顺序；不把被排除的供应商补回候选。
+        relays.sort_by_key(|(_, _, priority)| *priority != Some(true));
+    }
     let mut gate = crate::gateway::quota::DispatchGate::default();
     let mut permitted = Vec::new();
     let mut blocked = None;
-    for (relay, model) in relays {
+    for (relay, model, priority) in relays {
         match gate.check(gateway, &relay) {
-            Ok(()) => permitted.push((relay, model)),
+            Ok(()) => permitted.push((relay, model, priority)),
             Err(error) => {
                 let stop = matches!(
                     &error.action,
@@ -1846,7 +1904,7 @@ fn resolve_plan_with(
     let preferred = preferred.filter(|(relay_id, preferred_model)| {
         permitted
             .iter()
-            .any(|(relay, model)| &relay.id == relay_id && model == preferred_model)
+            .any(|(relay, model, _)| &relay.id == relay_id && model == preferred_model)
     });
     if mapped_to_default && advance && should_log_model_rewrite(agent.as_str(), requested_model.trim()) {
         // 请求的模型池里没人提供，按「未知模型」策略整个改发到默认模型的供应商（#2874）。
@@ -1856,8 +1914,8 @@ fn resolve_plan_with(
                 "agent": agent.as_str(),
                 "requestedModel": requested_model.trim(),
                 "model": model,
-                "provider": permitted.first().map(|(relay, _)| relay.name.as_str()).unwrap_or_default(),
-                "providerId": permitted.first().map(|(relay, _)| relay.id.as_str()).unwrap_or_default(),
+                "provider": permitted.first().map(|(relay, _, _)| relay.name.as_str()).unwrap_or_default(),
+                "providerId": permitted.first().map(|(relay, _, _)| relay.id.as_str()).unwrap_or_default(),
                 "hint": "请求的模型不在网关供应商池里（或所在供应商已关闭），已按「未知模型」策略改发到默认模型；可在网关的 Agent 接入设置里改成原样转发",
             }),
         );
@@ -1874,7 +1932,7 @@ fn resolve_plan_with(
     let breaker_off = crate::extension_gateway::builtin_replaced("builtin:key-breaker");
     let rate_limit_off = crate::extension_gateway::builtin_replaced("builtin:local-rate-limit");
     let pinned_key = crate::responses_websocket::pinned_key();
-    for (relay, upstream_model) in permitted {
+    for (relay, upstream_model, auto_priority) in permitted {
         let provider = gateway.provider(&relay.id);
         let window = provider.and_then(|provider| provider.window_for(&upstream_model));
         // 限速满了的 Key 照样进候选：是否跳过、排队由候选循环在发请求时按实时名额决定。
@@ -1898,6 +1956,7 @@ fn resolve_plan_with(
             upstream_model: upstream_model.clone(),
             window,
             limits,
+            auto_priority,
         };
         for key in order.available {
             if pinned_key.as_ref().is_some_and(|pinned| pinned != &key.key) {
@@ -2122,6 +2181,51 @@ mod tests {
 
     fn pair(relay: &str, model: &str) -> (String, String) {
         (relay.to_string(), model.to_string())
+    }
+
+    #[test]
+    fn gpt62_auto_priority_respects_pool_exclusions_and_ordinary_order() {
+        let models = "gpt-6.2-sol\ngpt-6.2-astra";
+        let mut settings = gateway("gpt-6.2-sol");
+        let mut official = provider("official-fast", models);
+        official.relay.relay_mode = RelayMode::Official;
+        official.relay.base_url.clear();
+        official.relay.api_key.clear();
+        official.relay.auth_contents =
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fixture","account_id":"fixture"}}"#.into();
+        settings.providers = vec![
+            provider("molifang", models),
+            provider("nanlab", models),
+            official,
+        ];
+        let mut binding = settings.bindings["claude"].clone();
+        binding.pool_exclude.clear();
+        settings.bindings.insert("codex".into(), binding);
+
+        let route = |settings: &GatewaySettings, model, body: serde_json::Value| {
+            resolve_plan_for_request(settings, &ToolId::Codex, model, None, &body)
+                .unwrap()
+                .candidates.into_iter().map(|candidate| {
+                    assert_eq!(candidate.upstream_model, model);
+                    (candidate.relay.id, candidate.auto_priority)
+                }).collect::<Vec<_>>()
+        };
+        for model in models.lines() {
+            settings.auto_groups.insert(model.into(), AutoGroupSettings {
+                mode: GroupMode::InOrder,
+                ..Default::default()
+            });
+            assert_eq!(route(&settings, model, serde_json::json!({})), [
+                ("molifang".to_string(), None), ("nanlab".to_string(), None), ("official-fast".to_string(), None)
+            ]);
+            assert_eq!(route(&settings, model, serde_json::json!({"service_tier":"priority"})), [
+                ("official-fast".to_string(), Some(true)), ("molifang".to_string(), Some(false)), ("nanlab".to_string(), Some(false))
+            ]);
+        }
+        settings.bindings.get_mut("codex").unwrap().pool_exclude.push("official-fast".into());
+        assert_eq!(route(&settings, "gpt-6.2-sol", serde_json::json!({"service_tier":"priority"})), [
+            ("molifang".to_string(), Some(false)), ("nanlab".to_string(), Some(false))
+        ]);
     }
 
     #[test]

@@ -651,6 +651,9 @@ async fn attempt_pipeline(
     allow_stream_failover: bool,
 ) -> Result<Attempt, AttemptError> {
     let mut body = request.responses_body.clone();
+    if candidate.auto_priority == Some(false) && let Some(object) = body.as_object_mut() {
+        object.remove("service_tier");
+    }
     if candidate.relay.protocol == RelayProtocol::Responses {
         anthropic_inbound::strip_unreplayable_reasoning(&mut body);
     }
@@ -756,6 +759,18 @@ async fn attempt_pipeline(
                 item.get("type").and_then(Value::as_str) == Some("item_reference")
             })) || input.as_str().is_some_and(|text| !text.is_empty())
         });
+    if let Some(priority) = candidate.auto_priority {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "gateway.auto_service_tier",
+            serde_json::json!({
+                "relayId": candidate.relay.id,
+                "upstreamModel": candidate.upstream_model,
+                "requestedServiceTier": "priority",
+                "dispatchedServiceTier": if priority { "priority" } else { "standard" },
+                "transport": if crate::responses_websocket::active() { "websocket" } else { "http" },
+            }),
+        );
+    }
     let body = serde_json::to_string(&body).map_err(|error| AttemptError::Fatal(error.into()))?;
     let forced = ForcedRelay {
         relay,
@@ -1024,6 +1039,7 @@ fn log_attempt_failure(
             "relayName": crate::gateway::accounts::mask_account_name(&candidate.relay.name),
             "keyId": candidate.key.key_id,
             "upstreamModel": candidate.upstream_model,
+            "autoServiceTier": candidate.auto_priority.map(|priority| if priority { "priority" } else { "standard" }),
             "class": class.map(FailureClass::label),
             "error": error.map(crate::protocol_proxy::error_chain),
             "willFailover": will_failover,
@@ -1051,6 +1067,7 @@ mod window_tests {
             upstream_model: "m".to_string(),
             window,
             limits: Default::default(),
+            auto_priority: None,
         }
     }
 
@@ -1132,6 +1149,7 @@ mod limit_tests {
                 rpm: Some(5),
                 concurrency: Some(1),
             },
+            auto_priority: None,
         };
         let second = GatewayCandidate {
             key: KeyRef {

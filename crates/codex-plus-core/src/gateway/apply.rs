@@ -679,19 +679,7 @@ fn codex_model_metadata(
                         .and_then(|index| {
                             member_catalog_entry(&mut member_catalogs, &relays, index, &model)
                         })
-                        .is_some_and(|entry| {
-                            entry["service_tiers"].as_array().is_some_and(|tiers| {
-                                tiers.iter().any(|tier| {
-                                    crate::model_suffix::model_speed_tier_is(tier, "priority")
-                                })
-                            }) || entry["additional_speed_tiers"]
-                                .as_array()
-                                .is_some_and(|tiers| {
-                                    tiers.iter().any(|tier| {
-                                        crate::model_suffix::model_speed_tier_is(tier, "fast")
-                                    })
-                                })
-                        })
+                        .is_some_and(|entry| route::priority_tiers(&entry))
                 });
             if !all_support_fast {
                 fields.insert("service_tiers".into(), json!([]));
@@ -738,21 +726,47 @@ fn codex_model_metadata(
                 fields.insert("codex_plus_group".into(), json!("自动组"));
                 fields.insert("codex_plus_group_id".into(), json!(CODEX_AUTO_GROUP_ID));
                 // 按顺序切到的每一家都可能接这次请求：图片能力取各家的交集。
+                let mut fast_entry = None;
                 let member_fields: Vec<Map<String, Value>> =
                     route::codex_model_members(gateway, binding, &model)
                         .iter()
                         .filter_map(|(member, member_upstream)| {
                             let index = relays.iter().position(|relay| relay.id == member.id)?;
-                            member_catalog_entry(
+                            let entry = member_catalog_entry(
                                 &mut member_catalogs,
                                 &relays,
                                 index,
                                 member_upstream,
-                            )
+                            )?;
+                            if fast_entry.is_none()
+                                && route::auto_fast_model(&model)
+                                && route::priority_member_configured(member)
+                                && route::priority_tiers(&entry)
+                                && super::quota::dispatch_decision(gateway, member).is_ok()
+                            {
+                                fast_entry = Some(entry.clone());
+                            }
+                            Some(entry)
                         })
                         .map(|entry| catalog_ui_fields(&entry))
                         .collect();
                 narrow_image_capability(&mut fields, &member_fields);
+                if route::auto_fast_model(&model) && binding.selection_for(&model).is_none() {
+                    // 显式 Fast 请求只向声明支持 priority 的成员发该档位。
+                    // 目录可从这个成员借用 Fast 档位，其它字段仍按原来的规则生成。
+                    let has_fast = fast_entry.is_some();
+                    let mut tiers = fast_entry.unwrap_or_default();
+                    if has_fast {
+                        crate::model_suffix::apply_model_fast_support(&mut tiers, Some(&json!("supported")));
+                    }
+                    for (field, id) in [("service_tiers", "priority"), ("additional_speed_tiers", "fast")] {
+                        let values: Vec<_> = tiers[field].as_array().into_iter().flatten()
+                            .filter(|tier| crate::model_suffix::model_speed_tier_is(tier, id))
+                            .cloned()
+                            .collect();
+                        fields.insert(field.into(), json!(values));
+                    }
+                }
             } else {
                 fields.insert("display_name".into(), json!(display));
                 fields.insert("codex_plus_group_id".into(), Value::Null);
@@ -4709,6 +4723,67 @@ mod tests {
         relay.relay_mode = RelayMode::PureApi;
         relay.model_metadata.clear();
         assert_eq!(catalog(&gateway)["gpt-6.2-astra"]["service_tiers"], json!([]));
+    }
+
+    #[test]
+    fn gpt62_auto_catalog_advertises_only_eligible_priority() {
+        let models = "gpt-6.2-sol\ngpt-6.2-astra";
+        let provider = |id, mode, base, key, auth| {
+            serde_json::from_value(json!({"relay": RelayProfile {
+                id: String::from(id),
+                relay_mode: mode,
+                protocol: RelayProtocol::Responses,
+                model_list: models.into(),
+                base_url: String::from(base),
+                api_key: String::from(key),
+                auth_contents: String::from(auth),
+                ..RelayProfile::default()
+            }})).unwrap()
+        };
+        let mut gateway = GatewaySettings::default();
+        gateway.providers = vec![
+            provider("molifang", RelayMode::PureApi, "https://molifang.test/v1", "test", ""),
+            provider("nanlab", RelayMode::PureApi, "https://nanlab.test/v1", "test", ""),
+            provider("official", RelayMode::Official, "", "",
+                r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fixture","account_id":"fixture"}}"#),
+        ];
+        let mut binding = AgentBinding {
+            model: "gpt-6.2-sol".into(),
+            token: crate::gateway::store::new_client_token(&ToolId::Codex),
+            ..AgentBinding::default()
+        };
+        let read = |gateway: &GatewaySettings, binding: &AgentBinding| {
+            serde_json::from_str::<Value>(&codex_gateway_model_catalog(gateway, binding).model_metadata).unwrap()
+        };
+        let assert_fast = |entry: &Value, expected| {
+            assert_eq!(route::priority_tiers(entry), expected, "{entry}");
+            if expected {
+                assert_eq!(entry["service_tiers"][0]["id"], "priority");
+                assert_eq!(entry["additional_speed_tiers"], json!(["fast"]));
+            } else {
+                assert_eq!(entry["service_tiers"], json!([]));
+                assert_eq!(entry["additional_speed_tiers"], json!([]));
+            }
+        };
+        let metadata = read(&gateway, &binding);
+        for model in models.lines() {
+            assert_eq!(metadata[model]["codex_plus_group_id"], CODEX_AUTO_GROUP_ID);
+            assert_fast(&metadata[model], true);
+            assert_fast(&metadata[format!("official/{model}")], true);
+            assert_fast(&metadata[format!("molifang/{model}")], false);
+            assert_fast(&metadata[format!("nanlab/{model}")], false);
+        }
+        binding.pool_exclude.push("official".into());
+        let metadata = read(&gateway, &binding);
+        for model in models.lines() {
+            assert_fast(&metadata[model], false);
+        }
+        binding.pool_exclude.clear();
+        gateway.providers[2].relay.model_metadata =
+            r#"{"gpt-6.2-sol":{"codex_plus_fast_support":"unsupported"}}"#.into();
+        let metadata = read(&gateway, &binding);
+        assert_fast(&metadata["gpt-6.2-sol"], false);
+        assert_fast(&metadata["gpt-6.2-astra"], true);
     }
 
     /// #2746：没登录时的托管供应商要被原生 Fast 认成本机 API 配置；登录后是 openai 身份，

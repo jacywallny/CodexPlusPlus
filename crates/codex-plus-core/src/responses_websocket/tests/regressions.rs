@@ -7,11 +7,12 @@ async fn gateway_http_official_pre_output_failover() {
         return;
     }
     // The long fixture exceeds 270k estimated tokens; neither request reaches a real provider.
-    for (case, length, first_event, expected_backup) in [
-        (0, 24, None, true),
-        (1, 1_100_000, Some(r#"{"type":"response.created"}"#), true),
-        (2, 1_100_000, Some(r#"{"type":"response.output_text.delta","delta":"official-output"}"#), false),
-        (3, 24, Some(r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","name":"test","call_id":"call_1","arguments":""}}"#), false),
+    for (case, model, length, first_event, expected_backup) in [
+        (0, "gpt-6.2-sol", 24, None, true),
+        (1, "gpt-6.2-astra", 1_100_000, Some(r#"{"type":"response.created"}"#), true),
+        (2, "gpt-6.2-sol", 1_100_000, Some(r#"{"type":"response.output_text.delta","delta":"official-output"}"#), false),
+        (3, "gpt-6.2-astra", 24, Some(r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","name":"test","call_id":"call_1","arguments":""}}"#), false),
+        (4, "gpt-6.2-sol", 24, Some(r#"{"type":"response.reasoning_summary_text.delta","delta":"official-reasoning","item_id":"rs_1","summary_index":0,"output_index":0}"#), false),
     ] {
         let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backup = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -27,7 +28,7 @@ async fn gateway_http_official_pre_output_failover() {
         official["apiKey"] = json!("");
         official["apiKeys"] = json!([]);
         official["activeApiKeyId"] = json!("");
-        official["modelList"] = json!("gpt-6.2-sol");
+        official["modelList"] = json!(model);
         let auth = json!({
             "auth_mode":"chatgpt","codex_plus_gateway":true,
             "tokens":{"account_id":"test-account","access_token":"test-access",
@@ -39,9 +40,12 @@ async fn gateway_http_official_pre_output_failover() {
         relay["name"] = json!("molifang");
         relay["apiKeys"][0]["id"] = json!(format!("backup-{case}"));
         relay["activeApiKeyId"] = json!(format!("backup-{case}"));
-        relay["modelList"] = json!("gpt-6.2-sol");
+        relay["modelList"] = json!(model);
+        let mut second_relay = relay.clone();
+        second_relay["id"] = json!(format!("nanlab-{case}"));
+        second_relay["name"] = json!("NaNLab");
         let fixture = Fixture::new(official.clone());
-        fixture.gateway_profiles(vec![official, relay]);
+        fixture.gateway_profiles(vec![relay, second_relay, official]);
         let store = GatewayStore::default();
         let mut settings = store.load().unwrap();
         settings.auto_models = true;
@@ -49,7 +53,8 @@ async fn gateway_http_official_pre_output_failover() {
         let primary_task = tokio::spawn(async move {
             let (mut socket, _) = primary.accept().await.unwrap();
             let body = http_fixture_body(&mut socket).await;
-            assert_eq!(body["model"], "gpt-6.2-sol");
+            assert_eq!(body["model"], model);
+            assert_eq!(body["service_tier"], "priority");
             if let Some(event) = first_event {
                 let bytes = format!("data: {event}\n\n");
                 let headers = format!(
@@ -68,8 +73,11 @@ async fn gateway_http_official_pre_output_failover() {
             }
             let (mut socket, _) = backup.accept().await.unwrap();
             let body = http_fixture_body(&mut socket).await;
-            assert_eq!(body["model"], "gpt-6.2-sol");
-            assert!(body["input"].to_string().contains(&"a".repeat(length)));
+            assert_eq!(body["model"], model);
+            assert!(body.get("service_tier").is_none());
+            assert_eq!(body["input"], "a".repeat(length));
+            assert_eq!(body["prompt_cache_key"], format!("fast-{case}"));
+            assert_eq!(body["reasoning"]["effort"], "high");
             let content = format!(
                 "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"backup-output\"}}\n\n\
                  data: {}\n\n",
@@ -86,7 +94,9 @@ async fn gateway_http_official_pre_output_failover() {
         let mut response = reqwest::Client::builder().no_proxy().build().unwrap()
             .post(format!("{}/gw/codex/v1/responses", url.replacen("ws://", "http://", 1)))
             .bearer_auth("local-test")
-            .json(&json!({"model":"gpt-6.2-sol","input":"a".repeat(length),"stream":true}))
+            .json(&json!({"model":model,"input":"a".repeat(length),"stream":true,
+                "service_tier":"priority","prompt_cache_key":format!("fast-{case}"),
+                "reasoning":{"effort":"high"}}))
             .send().await.unwrap();
         assert_eq!(response.status(), 200, "case {case}");
         if expected_backup {
@@ -99,7 +109,11 @@ async fn gateway_http_official_pre_output_failover() {
                 body.extend_from_slice(&chunk);
             }
             let body = String::from_utf8(body).unwrap();
-            let marker = if case == 2 { "official-output" } else { "function_call" };
+            let marker = match case {
+                2 => "official-output",
+                3 => "function_call",
+                _ => "official-reasoning",
+            };
             assert!(body.contains(marker), "case {case}: {body}");
             assert!(!body.contains("backup-output"));
         }
@@ -136,6 +150,7 @@ async fn official_gateway_preserves_two_incremental_tool_rounds() {
         return;
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backup = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     unsafe {
         std::env::set_var(
             "CODEX_PLUS_OFFICIAL_BASE_URL",
@@ -143,6 +158,7 @@ async fn official_gateway_preserves_two_incremental_tool_rounds() {
         );
     }
     let mut relay = profile(listener.local_addr().unwrap());
+    relay["modelList"] = json!("gpt-6.2-sol");
     relay["relayMode"] = json!("official");
     relay["upstreamBaseUrl"] = json!("");
     relay["apiKey"] = json!("");
@@ -154,12 +170,21 @@ async fn official_gateway_preserves_two_incremental_tool_rounds() {
             "refresh_token":"test-refresh"}
     });
     relay["authContents"] = Value::String(auth.to_string());
+    let mut api = profile(backup.local_addr().unwrap());
+    api["id"] = json!("ws-api-first");
+    api["modelList"] = json!("gpt-6.2-sol");
     let fixture = Fixture::new(relay.clone());
-    fixture.gateway(relay);
+    fixture.gateway_profiles(vec![api, relay]);
+    let store = GatewayStore::default();
+    let mut settings = store.load().unwrap();
+    settings.auto_models = true;
+    store.save(&settings).unwrap();
     let upstream = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
         let initial = next(&mut ws).await;
+        assert_eq!(initial["model"], "gpt-6.2-sol");
+        assert_eq!(initial["service_tier"], "priority");
         assert_eq!(
             initial["input"][0]["content"],
             "Inspect the project and continue"
@@ -177,6 +202,14 @@ async fn official_gateway_preserves_two_incremental_tool_rounds() {
             }]);
             send(&mut ws, event).await;
             let continuation = next(&mut ws).await;
+            assert_eq!(continuation["model"], "gpt-6.2-sol");
+            // Toggle back to ordinary on the first continuation; it must still use the same
+            // upstream connection, even though ordinary routing would otherwise prefer the API.
+            if round == 0 {
+                assert!(continuation.get("service_tier").is_none());
+            } else {
+                assert_eq!(continuation["service_tier"], "priority");
+            }
             assert_eq!(continuation["previous_response_id"], response_id);
             assert_eq!(continuation["prompt_cache_key"], cache_key);
             assert_eq!(continuation["input"].as_array().unwrap().len(), 1);
@@ -198,6 +231,8 @@ async fn official_gateway_preserves_two_incremental_tool_rounds() {
     )
     .await;
     let mut initial = create("");
+    initial["model"] = json!("gpt-6.2-sol");
+    initial["service_tier"] = json!("priority");
     initial["instructions"] = json!("You are Codex.");
     initial["input"] = json!([{
         "type":"message","role":"user","content":"Inspect the project and continue"
@@ -208,6 +243,10 @@ async fn official_gateway_preserves_two_incremental_tool_rounds() {
         let response = next(&mut ws).await;
         assert_eq!(response["type"], "response.completed", "{response}");
         let mut continuation = create("");
+        continuation["model"] = json!("gpt-6.2-sol");
+        if round == 1 {
+            continuation["service_tier"] = json!("priority");
+        }
         continuation["instructions"] = json!("You are Codex.");
         continuation["previous_response_id"] = response["response"]["id"].clone();
         continuation["input"] = json!([{
@@ -226,6 +265,7 @@ async fn official_gateway_preserves_two_incremental_tool_rounds() {
     drop(ws);
     finish(task).await;
     finish(upstream).await;
+    assert!(tokio::time::timeout(Duration::from_millis(50), backup.accept()).await.is_err());
     unsafe { std::env::remove_var("CODEX_PLUS_OFFICIAL_BASE_URL") };
 }
 

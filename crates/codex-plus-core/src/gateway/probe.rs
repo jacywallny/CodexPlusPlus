@@ -211,6 +211,7 @@ async fn run(
         upstream_model: model.to_string(),
         window: None,
         limits: KeyLimits::default(),
+        auto_priority: None,
     };
     let request = GatewayRequest {
         responses_body: probe_body(model),
