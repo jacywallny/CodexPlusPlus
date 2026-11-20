@@ -682,7 +682,8 @@ test("赞助商单独一组放在「添加供应商」最前面，不再混在�
   const relays = presets.filter((preset) => preset.section === "relay").map((preset) => preset.key);
   assert.ok(relays.includes("openrouter") && relays.includes("siliconflow") && relays.includes("opencode-go"));
   const catalog = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
-  assert.ok(catalog.indexOf('key: "sponsor"') < catalog.indexOf('key: "subscription"'));
+  assert.doesNotMatch(catalog, /key: "sponsor"|presetItems\("sponsor"\)/);
+  assert.match(catalog, /key: "subscription"/);
 });
 
 test("起名模型随绑定草稿往返，空值和旧版后端缺字段都当成不指定", () => {

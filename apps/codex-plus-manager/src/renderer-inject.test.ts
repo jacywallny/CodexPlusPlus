@@ -1046,6 +1046,7 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /const codexPlusSponsorTab = "sponsor"/);
     assert.match(renderer, /function openCodexPlusSponsor\(\)/);
     assert.match(renderer, /id: codexPlusRailSponsorId, label: "推荐内容"/);
+    assert.match(renderer, /\.filter\(\(spec\) => codexPlusPromotionsEnabled \|\| spec\.id !== codexPlusRailSponsorId\)/);
     // 三个入口都要参与选中态映射，否则「推荐内容」亮不起来。
     assert.match(renderer, /\[codexPlusRailSponsorId, "sponsor"\],/);
     assert.match(renderer, /if \(tab === codexPlusSponsorTab\) return "sponsor";/);
@@ -1478,6 +1479,25 @@ function mutation(addedNodes: unknown[] = [], removedNodes: unknown[] = []) {
 }
 
 describe("native-style extension and sponsor discovery", () => {
+  it("does not request promotions in the personal build, even if the loader is called", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const requests: string[] = [];
+    const load = new Function("postJson", "directFetchCodexPlusAds", "sendCodexPlusDiagnostic", "document", `
+${segment(renderer, "  const codexPlusAdsUrl =", "  function isCodexPlusAdWebUrl(")}
+${segment(renderer, "  async function fetchCodexPlusAds()", "  function selectCodexPlusTab(")}
+return fetchCodexPlusAds;
+`)(
+      (path: string) => { requests.push(path); },
+      () => { requests.push("direct"); },
+      () => {},
+      { querySelector: () => null },
+    );
+    await load();
+    assert.deepEqual(requests, []);
+    assert.match(renderer, /const codexPlusPromotionsEnabled = false;/);
+    assert.match(renderer, /async function fetchCodexPlusAds\(\) \{\s*if \(!codexPlusPromotionsEnabled\) return;/);
+    assert.match(renderer, /if \(codexPlusPromotionsEnabled && !codexPlusAdsLoaded\) fetchCodexPlusAds\(\);/);
+  });
   const rendererPath = new URL("../../../assets/inject/renderer-inject.js", import.meta.url);
   function segment(source: string, from: string, to: string) {
     const start = source.indexOf(from);

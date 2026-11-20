@@ -1372,6 +1372,8 @@ type UpdateResult = CommandResult<{
 /** 后台下载更新的状态：只下载、不安装。 */
 type UpdateDownloadState = { version: string; state: "downloading" | "ready" | "failed"; percent: number | null; message?: string };
 
+const PERSONAL_PROMOTIONS_ENABLED = false;
+
 type AdItem = {
   id?: string;
   type: "sponsor" | "normal" | string;
@@ -3111,7 +3113,7 @@ export function App() {
       await refreshScriptMarket(true);
       await refreshUserScriptInventory();
     }
-    if (next === "home") await refreshAds(true);
+    if (PERSONAL_PROMOTIONS_ENABLED && next === "home") await refreshAds(true);
     if (next === "settings") {
       await refreshOverview(true);
       await refreshLogs(true);
@@ -3821,6 +3823,7 @@ export function App() {
   };
 
   const refreshAds = async (silent = false) => {
+    if (!PERSONAL_PROMOTIONS_ENABLED) return;
     const result = await run(() => call<AdsResult>("load_ads"));
     if (result) {
       setAds(result);
@@ -4412,8 +4415,7 @@ export function App() {
         void checkUpdate(true);
       }
       await refreshOverview(true);
-      // 启动落在首页，首页就是赞助商推荐，所以启动就拉一次。
-      await refreshAds(true);
+      if (PERSONAL_PROMOTIONS_ENABLED) await refreshAds(true);
       if (!handledNavigation) await refreshSettings(true);
       await refreshRelay(true);
       await refreshEnvConflicts(true);
@@ -5170,7 +5172,7 @@ export function App() {
     return { id: `${group}:${routeId}`, group, label: item.label, keywords: `${routeId} ${keywords}`, icon: <Icon className="h-4 w-4" />, run };
   };
   const pushCommand = (command: PaletteCommand | null) => { if (command) paletteCommands.push(command); };
-  pushCommand(routeCommand("home", t("全局管理"), () => void navigate("home"), "home ads 推荐 赞助"));
+  pushCommand(routeCommand("home", t("全局管理"), () => void navigate("home"), "home"));
   gatewayNavigationRoutes.forEach((routeId) => pushCommand(routeCommand(routeId, t("网关"), () => void navigate(routeId), "gateway")));
   managementNavigationRoutes.forEach((routeId) => pushCommand(routeCommand(routeId, t("全局管理"), () => void navigate(routeId))));
   pushCommand(routeCommand("requestLog", t("全局管理"), () => void navigate("requestLog"), "usage requests"));
@@ -5559,7 +5561,7 @@ export function App() {
             />
           ) : null}
           {/* 供应商池右下角的悬浮提示：在找供应商时顺手带去首页的赞助商推荐；首页没有赞助商时不显示。 */}
-          {route === "gatewayProviders" && !sponsorHintClosed && (ads?.ads?.length ?? 0) + (ads?.topAds?.length ?? 0) > 0 ? (
+          {PERSONAL_PROMOTIONS_ENABLED && route === "gatewayProviders" && !sponsorHintClosed && (ads?.ads?.length ?? 0) + (ads?.topAds?.length ?? 0) > 0 ? (
             <div className="cx-float-hint">
               <button className="cx-float-hint-main" onClick={() => void navigate("home")} type="button">
                 <Sparkles aria-hidden="true" />
@@ -10919,12 +10921,12 @@ function HomeScreen({
 
   return (
     <div className="tp-page home-page">
-      <TopbarActions>
+      {PERSONAL_PROMOTIONS_ENABLED ? <TopbarActions>
         <button className="cx-secondary" onClick={() => void actions.refreshAds()} type="button">
           <RefreshCw />
           {t("刷新推荐")}
         </button>
-      </TopbarActions>
+      </TopbarActions> : null}
 
       <CxSection title={t("状态")}>
         <CxCard>
@@ -10942,7 +10944,7 @@ function HomeScreen({
         </CxCard>
       </CxSection>
 
-      {heroes.length ? (
+      {PERSONAL_PROMOTIONS_ENABLED && heroes.length ? (
         <CxSection aside={<span>{t("赞助商推荐：支持 Codex++ 的服务")}</span>} title={t("精选推荐")}>
           <div className="home-heroes" data-dense={heroes.length >= 3 || undefined} style={{ gridTemplateColumns: `repeat(${heroes.length}, minmax(0, 1fr))` }}>
             {heroes.map((ad) => (
@@ -10977,7 +10979,7 @@ function HomeScreen({
         </CxSection>
       ) : null}
 
-      {rest.length ? (
+      {PERSONAL_PROMOTIONS_ENABLED && rest.length ? (
         <CxSection count={rest.length} title={t("更多赞助商")}>
           <div className="home-sponsors">
             {rest.map((ad) => (

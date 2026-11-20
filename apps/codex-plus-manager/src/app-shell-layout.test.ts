@@ -364,7 +364,7 @@ test("代理设置按归属拆开：本地服务与请求避震移到网关设�
   assert.match(functionSource("App"), /<SharedServiceSettings[\s\S]*?form=\{settingsForm\}/);
 });
 
-test("首页：状态、精选推荐、其他赞助商、常用入口；广告只在首页，首页是侧栏第一项和启动落脚页", () => {
+test("个人版首页保留状态和常用入口，默认不加载或渲染推广", () => {
   const app = functionSource("App");
   assert.match(app, /\{route === "home" \? \(\n\s*<HomeScreen\n\s*ads=\{ads\}/);
   assert.equal((text.match(/<HomeScreen\b/g) ?? []).length, 1);
@@ -373,9 +373,15 @@ test("首页：状态、精选推荐、其他赞助商、常用入口；广告�
   // 侧栏主模式第一项；旧「推荐内容」路由跳到首页，设置模式里不再有这一项。
   assert.match(functionSource("AppSidebar"), /const general: SideEntry\[\] = \[\n\s*\{ key: "home", route: "home", label: t\("首页"\), icon: House, match: \["home", "recommendations"\] \},/);
   assert.match(app, /target === "recommendations" \? "home" : target/);
-  assert.match(app, /if \(next === "home"\) await refreshAds\(true\);/);
+  assert.match(text, /const PERSONAL_PROMOTIONS_ENABLED = false;/);
+  assert.match(app, /if \(PERSONAL_PROMOTIONS_ENABLED && next === "home"\) await refreshAds\(true\);/);
+  assert.match(app, /const refreshAds = async \(silent = false\) => \{\s*if \(!PERSONAL_PROMOTIONS_ENABLED\) return;/);
+  assert.match(app, /PERSONAL_PROMOTIONS_ENABLED && route === "gatewayProviders"/);
   assert.doesNotMatch(text.slice(text.indexOf("const settingsModeRoutes"), text.indexOf("const customizeRoutes")), /"recommendations"/);
   const home = functionSource("HomeScreen");
+  assert.match(home, /PERSONAL_PROMOTIONS_ENABLED \? <TopbarActions>/);
+  assert.match(home, /PERSONAL_PROMOTIONS_ENABLED && heroes\.length/);
+  assert.match(home, /PERSONAL_PROMOTIONS_ENABLED && rest\.length/);
   // 首页不能全是广告：先是状态，再是精选推荐和其他赞助商，最后常用入口。
   const order = ['title={t("状态")}', 'title={t("精选推荐")}', 'title={t("更多赞助商")}', 'title={t("常用")}'].map((needle) => home.indexOf(needle));
   assert.ok(order.every((index, position) => index > 0 && (position === 0 || index > order[position - 1])), String(order));

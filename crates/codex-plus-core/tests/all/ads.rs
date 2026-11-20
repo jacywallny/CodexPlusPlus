@@ -3,9 +3,15 @@ use std::net::TcpListener;
 use std::thread;
 
 use codex_plus_core::ads::{
-    DEFAULT_AD_LIST_URLS, cache_busted_ad_url, fetch_ad_list_from_urls, normalize_ad_payload,
+    DEFAULT_AD_LIST_URLS, cache_busted_ad_url, fetch_ad_list, fetch_ad_list_from_urls,
+    normalize_ad_payload,
 };
 use serde_json::json;
+
+#[tokio::test]
+async fn personal_build_returns_no_advertisements() {
+    assert_eq!(fetch_ad_list().await.unwrap(), json!({ "version": 1, "ads": [] }));
+}
 
 #[test]
 fn default_ad_urls_prefer_cloudflare_and_keep_github_fallbacks() {

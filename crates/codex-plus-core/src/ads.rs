@@ -153,7 +153,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 pub async fn fetch_ad_list() -> anyhow::Result<Value> {
-    fetch_ad_list_from_urls(&DEFAULT_AD_LIST_URLS).await
+    Ok(json!({ "version": 1, "ads": [] }))
 }
 
 pub fn cache_busted_ad_url(url: &str, version: u128) -> String {

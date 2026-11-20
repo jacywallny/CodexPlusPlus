@@ -134,6 +134,12 @@
 
 ## 发版
 
+### 个人版上游同步
+
+- 合入上游更新时，默认保留个人版去推广改动。若基线尚未包含，从个人 fork 分支 `chore/personal-no-promotions` 移植去推广提交，处理冲突后再构建。
+- 核对管理器首页、供应商的赞助位和 Codex 侧栏推荐均不出现；前端不请求广告，运行时广告接口不访问外部广告源。不改已经配置的供应商、订阅登录、普通预设或自定义接入。
+- 若上游新增推广入口或广告源，一并纳入个人版过滤和回归。保留开源署名、许可证和上游贡献记录。
+
 - 先在 `CHANGELOG.md` 顶部写好 `## X.Y.Z - YYYY-MM-DD` 一节（这一节原样成为 Release 说明），
   再跑 `node scripts/release.mjs X.Y.Z`（可先加 `--dry-run` 预览）：改 6 处版本号 → 提交 `release: vX.Y.Z` → 打 tag → 原子推送。
 - 推 `v*` tag 触发 `release-assets.yml`：校验版本号 → 建草稿 Release → 构建 Windows / macOS / Linux(.deb) → 上传 `SHA256SUMS.txt`、`latest.json` → Windows、macOS 齐了自动发布，只有最新版本才标 Latest。
