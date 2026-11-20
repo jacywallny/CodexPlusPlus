@@ -2,6 +2,21 @@
 
 本文记录如何在 `jacywallny/CodexPlusPlus` 使用 GitHub Actions 构建 Windows 成品，适用于只验证云端编译、不改动本机安装的场景。
 
+## Windows CI 提速（2026-11-20）
+
+基线为个人 fork `main` 的 `8863002d`。v2.8.2 的 [冷缓存运行 #44701908799](https://github.com/jacywallny/CodexPlusPlus/actions/runs/44701908799) 用时 32 分 05 秒：Rust 测试 12 分 17 秒，data 串行测试 5 分 08 秒，Release 编译 11 分 17 秒，NSIS 打包 57 秒。随后 `main` 已预热测试和 Release 两份 Windows 缓存。这个基线用于比较，不能代表缓存命中后的耗时。
+
+优化放在个人 fork 分支 `ci/windows-build-speedup`。当前仅静态检查，不触发编译、测试、打包或发布。启用后，`platform=windows` 让两个 Windows runner 分别跑验证和构建；两者通过后，Ubuntu runner 才上传三个原名产物。`windows-preview` 只出独立的自测包，保留 7 天；正式发布会在创建标签前拒绝缺少正式产物的运行，并保留版本、提交、完整测试及摘要校验。
+
+等待需要构建时再手动触发；下面两条命令任选其一，目前都不执行：
+
+```powershell
+gh workflow run pr-build.yml --repo jacywallny/CodexPlusPlus --ref ci/windows-build-speedup -f platform=windows
+gh workflow run pr-build.yml --repo jacywallny/CodexPlusPlus --ref ci/windows-build-speedup -f platform=windows-preview
+```
+
+首次启用先跑 `windows`，核对两个 Windows job 并行、`windows-release` 缓存恢复结果、三份原名产物与 SHA-256；再用同一提交比较命中情况和总耗时。日常构建和验证都在 GitHub Actions 执行。正式复用路径仍是 `release-assets.yml` 的 `windows_build_run_id`。
+
 ## 2.7.2 修复构建（2026-11-17）
 
 个人 fork 基于上游 `v2.7.1`（`d5dcad3b3b9d1ef1dc83ba76a3b8f4c4098d2abe`）修复 #3151、#3154、#3155，版本升为 `2.7.2`。保留个人仓库原有历史与云端构建能力，不改写历史。
@@ -84,7 +99,7 @@ gh run watch <RUN_ID> --repo jacywallny/CodexPlusPlus --exit-status --interval 3
 
 刚触发后的列表可能暂时为空；优先使用触发命令返回链接中的运行编号。只有运行最终 `conclusion=success` 且三个 Windows 产物都上传完成，才算本次交付成功。
 
-构建顺序为前端依赖安装、前端测试、注入脚本回归检查、TypeScript 检查、Vite 构建、`cargo test --workspace --locked --exclude codex-plus-data`、单独串行运行 `cargo test --locked -p codex-plus-data -- --test-threads=1`、`cargo build --release --locked -p codex-plus-manager`、NSIS 打包与产物上传。完整测试覆盖 workspace；data 单独串行执行以遵守共享内存预算。
+在提速分支上，Windows 验证 job 运行前端测试、注入脚本回归、TypeScript 检查和 Vite，再运行 `cargo test --workspace --locked --exclude codex-plus-data`，最后单独串行运行 `cargo test --locked -p codex-plus-data -- --test-threads=1`，以遵守共享内存预算。手动打包 job 同时运行 Vite、`cargo build --release --locked -p codex-plus-manager` 和 NSIS；两路结束后才上传正式交付产物。尚未合入提速改动的分支继续使用原串行流程。
 
 不要为了得到绿色状态而跳过失败测试。可用下面的命令查看失败证据；修正 CI 问题后，提交、推送并针对新提交重新触发：
 
@@ -121,6 +136,7 @@ Get-FileHash -LiteralPath '<选定目录>\app\codex-plus-plus.exe' -Algorithm SH
 
 - `actions/setup-node` 缓存 npm 下载内容，键关联 `package-lock.json`；仍执行 `npm ci`。
 - `Swatinem/rust-cache` 缓存 Cargo 依赖和编译依赖产物，结合 Rust 工具链、依赖清单及构建环境区分缓存。
+- Windows 测试 job 保留 `windows` 缓存；打包 job 读取 `release-cache.yml` 在 `main` 预热的 `windows-release`，两个 profile 不混用。预热编译目标与手动打包一致，并复用 npm 缓存；复用现成 EXE 发版时跳过 Rust 缓存下载。
 - 同一分支的自动推送构建会取消旧的自动运行；手动构建按运行编号独立，不自动互相取消。
 - Windows 发布构建只编译管理器包，Rust 测试仍覆盖整个 workspace。
 

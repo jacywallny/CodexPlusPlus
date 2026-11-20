@@ -35,6 +35,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/codex-plus-manager/package-lock.json
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -55,7 +57,7 @@ jobs:
         run: npm run vite:build
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --locked -p codex-plus-manager
 
   macos:
     name: macOS release deps (${{ matrix.target }})
