@@ -168,6 +168,17 @@ pub fn bound_call_id(id: &str) -> String {
 /// 找不到调用的工具输出改成一条说明、`system` 角色改成 `developer`。
 /// `continuation`（WS 增量续接）时调用可能在上一响应里，工具输出保持原样交给上游配对。
 fn adapt_input(input: Vec<Value>, continuation: bool) -> Vec<Value> {
+    if continuation {
+        return input
+            .into_iter()
+            .map(|mut item| {
+                if item.get("role").and_then(Value::as_str) == Some("system") {
+                    item["role"] = json!("developer");
+                }
+                item
+            })
+            .collect();
+    }
     const CALL_TYPES: &[&str] = &[
         "function_call",
         "function_call_output",
@@ -253,7 +264,7 @@ fn adapt_input(input: Vec<Value>, continuation: bool) -> Vec<Value> {
             let want = calls.get(&call_id).copied();
             let paired = want == Some(kind)
                 || (kind == "function_call_output" && want == Some("local_shell_call_output"));
-            if !paired && !continuation {
+            if !paired {
                 object = orphan_output(&object, &call_id);
             }
         }
@@ -730,13 +741,14 @@ mod tests {
     #[test]
     fn websocket_continuations_keep_previous_response_and_tool_outputs() {
         // WS 增量续接：只带续接 ID 和上一响应里那次调用的结果（#3151 / #3155）。
+        let long_call_id = format!("call_read_{}", "x".repeat(80));
         let continuation = || {
             json!({
                 "model": "gpt-6.1-sol",
                 "instructions": "You are Grok.",
                 "previous_response_id": "resp_with_task",
                 "input": [
-                    { "type": "function_call_output", "call_id": "call_read", "output": "listing" },
+                    { "type": "function_call_output", "call_id": long_call_id, "output": "listing" },
                     { "type": "custom_tool_call_output", "call_id": "call_patch", "output": "done" }
                 ],
                 "temperature": 0.2
@@ -749,7 +761,7 @@ mod tests {
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 2, "前文已有 developer 指令，续接不再插入");
         assert_eq!(input[0]["type"], "function_call_output");
-        assert_eq!(input[0]["call_id"], "call_read");
+        assert_eq!(input[0]["call_id"], long_call_id);
         assert_eq!(input[1]["type"], "custom_tool_call_output");
         assert_eq!(input[1]["call_id"], "call_patch");
         assert_eq!(body["instructions"], "You are Codex.\nOfficial.");
