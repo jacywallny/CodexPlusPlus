@@ -309,10 +309,16 @@ pub fn update_running_retry(
     if let Ok(mut live) = live_requests().lock()
         && let Some(entry) = live.get_mut(id)
     {
-        entry.attempts = attempts;
+        entry.attempts = crate::gateway::http_wait::HTTP_ATTEMPT
+            .try_with(|scope| scope.routing_attempt(attempts))
+            .unwrap_or(attempts);
         entry.auto_retries = auto_retries;
         entry.retry_reasons = retry_reasons;
     }
+}
+
+pub(crate) fn running_request(id: &str) -> Option<RequestLogEntry> {
+    live_requests().lock().ok()?.get(id).cloned()
 }
 
 /// 运行中请求的输出 token 粗估（按已收到的流式 delta 字符数 / 4 计算）。

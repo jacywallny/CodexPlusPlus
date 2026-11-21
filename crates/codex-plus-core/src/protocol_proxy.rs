@@ -681,6 +681,11 @@ async fn wait_scheduled_proxy_auto_retry(
         );
         crate::request_log::update_running_phase(id, "retrying");
     }
+    let delay = crate::gateway::http_wait::HTTP_ATTEMPT
+        .try_with(|scope| {
+            delay.min(scope.deadline().saturating_duration_since(tokio::time::Instant::now()))
+        })
+        .unwrap_or(delay);
     tokio::time::sleep(delay).await;
     retry_reasons.push(reason.to_string());
 }
@@ -2338,6 +2343,10 @@ pub fn stream_header_timeout() -> Duration {
         .load()
         .ok()
         .and_then(|settings| settings.upstream_stream_header_timeout_secs);
+    configured_stream_header_timeout(configured)
+}
+
+pub(crate) fn configured_stream_header_timeout(configured: Option<u64>) -> Duration {
     let secs = configured.unwrap_or(UPSTREAM_STREAM_HEADER_TIMEOUT.as_secs());
     Duration::from_secs(secs.clamp(UPSTREAM_STREAM_HEADER_TIMEOUT.as_secs(), 3600))
 }
@@ -2391,6 +2400,9 @@ pub async fn send_upstream_request_with_header_timeout(
     let mut request = request;
     for (name, value) in crate::extension_gateway::extension_headers() {
         request = request.header(name, value);
+    }
+    if let Ok(deadline) = crate::gateway::http_wait::HTTP_ATTEMPT.try_with(|scope| scope.deadline()) {
+        return send_gateway_http_request(request, deadline).await;
     }
     // RequestBuilder 只有在 body 可克隆时才能重试；不可克隆时保持单次请求。
     let retry_source = request.try_clone();
@@ -2463,6 +2475,64 @@ pub async fn send_upstream_request_with_header_timeout(
                     "上游请求超过 {} 秒未返回响应头",
                     timeout.as_secs()
                 ));
+            }
+        }
+    }
+}
+
+async fn send_gateway_http_request(
+    mut builder: reqwest::RequestBuilder,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<reqwest::Response> {
+    use crate::gateway::http_wait::HTTP_ATTEMPT;
+
+    let mut delays = UPSTREAM_CONNECT_RETRY_DELAYS.into_iter();
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(HTTP_ATTEMPT.with(|scope| scope.budget_error()).into());
+        }
+        let retry_source = builder.try_clone();
+        let (client, request) = builder.build_split();
+        let mut request = request.context("构造上游请求失败")?;
+        crate::extension_gateway::refresh_response_passthrough(&mut request);
+        if tokio::time::Instant::now() >= deadline {
+            return Err(HTTP_ATTEMPT.with(|scope| scope.budget_error()).into());
+        }
+        let send = HTTP_ATTEMPT.with(|scope| scope.begin_send(&request));
+        match tokio::time::timeout_at(deadline, client.execute(request)).await {
+            Ok(Ok(response)) if response.status().is_redirection() => {
+                let status = response.status().as_u16();
+                return Err(HTTP_ATTEMPT.with(|scope| {
+                    scope.record(&send, "redirect_refused", Some(status), false);
+                    scope.redirect_error(status)
+                }).into());
+            }
+            Ok(Ok(response)) => {
+                HTTP_ATTEMPT.with(|scope| scope.record(&send, "headers_received", Some(response.status().as_u16()), false));
+                return Ok(response);
+            }
+            Ok(Err(error)) if error.is_connect() => {
+                let retry = retry_source.zip(delays.next()).filter(|(_, delay)| {
+                    tokio::time::Instant::now() + *delay < deadline
+                });
+                HTTP_ATTEMPT.with(|scope| scope.record(&send, "connect_error", None, retry.is_some()));
+                let Some((next, delay)) = retry else {
+                    return Err(anyhow::Error::new(error).context("上游连接失败"));
+                };
+                tokio::time::sleep(delay).await;
+                builder = next;
+            }
+            Ok(Err(_)) => {
+                return Err(HTTP_ATTEMPT.with(|scope| {
+                    scope.record(&send, "disconnected_before_headers", None, false);
+                    scope.disconnected_error()
+                }).into());
+            }
+            Err(_) => {
+                return Err(HTTP_ATTEMPT.with(|scope| {
+                    scope.record(&send, "header_timeout", None, false);
+                    scope.timeout_error(send.elapsed_ms())
+                }).into());
             }
         }
     }
@@ -3098,8 +3168,16 @@ pub(crate) async fn read_limited_upstream_body(
         anyhow::bail!("上游响应体超过 {limit} 字节限制");
     }
 
+    let deadline = (!response.status().is_success())
+        .then(|| crate::gateway::http_wait::HTTP_ATTEMPT.try_with(|scope| scope.deadline()).ok())
+        .flatten();
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+    loop {
+        let chunk = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, response.chunk()).await?,
+            None => response.chunk().await,
+        }?;
+        let Some(chunk) = chunk else { break };
         if body.len().saturating_add(chunk.len()) > limit {
             anyhow::bail!("上游响应体超过 {limit} 字节限制");
         }
@@ -4445,6 +4523,9 @@ async fn open_responses_proxy_request_once(
             return Ok(extension_rejected_response(&reason)?);
         }
         request_trace.bind_upstream_model(&upstream_body);
+        if let Some(model) = upstream_body.get("model").and_then(Value::as_str) {
+            let _ = crate::gateway::http_wait::HTTP_ATTEMPT.try_with(|scope| scope.bind_model(model));
+        }
         if let Some(id) = live_request_id {
             crate::request_log::update_running_route(id, &request_trace, is_stream);
         }
@@ -6756,8 +6837,9 @@ fn build_responses_upstream_request(
     } else {
         effective_user_agent(&relay.user_agent, original_user_agent)
     };
+    let follow_redirects = crate::gateway::http_wait::HTTP_ATTEMPT.try_with(|_| ()).is_err();
     let mut builder = upstream_request_builder(
-        crate::http_client::proxied_client_for_relay(&user_agent, &relay)?,
+        crate::http_client::relay_client_for_request(&user_agent, relay, follow_redirects)?,
         endpoint,
         relay,
         is_stream,

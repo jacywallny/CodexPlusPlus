@@ -810,6 +810,7 @@ async fn isolated(name: &str) -> bool {
             "--test-threads=1",
         ])
         .env("CODEX_PLUS_WS_TEST_CHILD", "1")
+        .env("RUST_MIN_STACK", "16777216")
         .env(crate::paths::STATE_DIR_ENV, temp.path().join("state"))
         .env("CODEX_HOME", temp.path().join("home"))
         .kill_on_drop(true);

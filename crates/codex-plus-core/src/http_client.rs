@@ -130,6 +130,7 @@ const RELAY_CLIENT_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration:
 struct RelayClientKey {
     user_agent: String,
     proxy: ProxyChoice,
+    follow_redirects: bool,
     /// 影响 reqwest 代理行为的环境变量：显式代理时的 NO_PROXY，`Auto` 时 reqwest 自己读的 HTTP_PROXY。
     proxy_env: [Option<String>; 4],
     /// CODEX_CA_CERTIFICATE 的值；是文件路径时再带上文件大小和修改时间，证书换了能感知。
@@ -141,7 +142,7 @@ struct RelayClientKey {
 }
 
 impl RelayClientKey {
-    fn current(user_agent: &str, proxy: ProxyChoice) -> Self {
+    fn current(user_agent: &str, proxy: ProxyChoice, follow_redirects: bool) -> Self {
         let proxy_env = ["NO_PROXY", "no_proxy", "HTTP_PROXY", "http_proxy"]
             .map(|name| std::env::var(name).ok());
         let ca_certificate = std::env::var_os("CODEX_CA_CERTIFICATE")
@@ -157,6 +158,7 @@ impl RelayClientKey {
         Self {
             user_agent: user_agent.to_string(),
             proxy,
+            follow_redirects,
             proxy_env,
             ca_certificate,
             runtime: tokio::runtime::Handle::try_current()
@@ -181,8 +183,12 @@ fn relay_client_cache() -> &'static std::sync::Mutex<RelayClientCache> {
 /// 取（或建）可复用的 client。reqwest::Client 自带连接池：每个请求都新建 client，
 /// 连接池随之丢弃，每次都要重新 DNS + TCP + TLS 握手（经代理还要多一次 CONNECT），
 /// 还要重新加载系统根证书；复用后连续请求同一上游只握手一次（#2761）。
-fn cached_relay_client(user_agent: &str, proxy: ProxyChoice) -> anyhow::Result<reqwest::Client> {
-    let key = RelayClientKey::current(user_agent, proxy);
+fn cached_relay_client(
+    user_agent: &str,
+    proxy: ProxyChoice,
+    follow_redirects: bool,
+) -> anyhow::Result<reqwest::Client> {
+    let key = RelayClientKey::current(user_agent, proxy, follow_redirects);
     let lock = || {
         relay_client_cache()
             .lock()
@@ -203,6 +209,7 @@ fn cached_relay_client(user_agent: &str, proxy: ProxyChoice) -> anyhow::Result<r
         user_agent,
         &key.proxy,
         ClientOptions {
+            redirect: (!follow_redirects).then(reqwest::redirect::Policy::none),
             pool_idle_timeout: Some(RELAY_CLIENT_POOL_IDLE_TIMEOUT),
             ..ClientOptions::default()
         },
@@ -313,8 +320,20 @@ pub fn proxied_client_for_relay(
     user_agent: &str,
     relay: &crate::settings::RelayProfile,
 ) -> anyhow::Result<reqwest::Client> {
+    relay_client_for_request(user_agent, relay, true)
+}
+
+pub(crate) fn relay_client_for_request(
+    user_agent: &str,
+    relay: &crate::settings::RelayProfile,
+    follow_redirects: bool,
+) -> anyhow::Result<reqwest::Client> {
     let proxy = crate::relay_proxy::proxy_for_relay(relay);
-    cached_relay_client(user_agent, resolve_proxy_choice(proxy.as_deref(), None))
+    cached_relay_client(
+        user_agent,
+        resolve_proxy_choice(proxy.as_deref(), None),
+        follow_redirects,
+    )
 }
 
 /// 代理取法与 [`proxied_client_for_relay`] 完全一致，但不进缓存，并使用调用方给的重定向策略。

@@ -533,6 +533,7 @@ pub(crate) async fn open_responses_for_agent(
         &request,
     )?;
     crate::responses_websocket::restrict_plan(&mut plan)?;
+    let is_stream = request.get("stream").and_then(Value::as_bool).unwrap_or(false);
     // 压缩模型（#3142）：压缩请求先改发到绑定里的压缩模型，失败回退原模型；没配置时照原样走。
     let (outcome, compaction_notes) = super::compaction_model::open(
         &settings,
@@ -546,7 +547,7 @@ pub(crate) async fn open_responses_for_agent(
             session_headers,
             live_request_id,
             auto_retry: true,
-            is_stream: false,
+            is_stream,
             upstream_path: if request_path.ends_with("/responses/compact") {
                 "/responses/compact"
             } else {

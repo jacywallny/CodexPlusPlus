@@ -6,8 +6,7 @@
 - **网关模式**：网关有自己的一份供应商池和组，所有接入的 Agent 共用整个池。Agent 的配置指向 Codex++ 本地 helper，
   请求在网关里按模型名选供应商。
 
-网关的数据只存在 `<状态目录>/gateway.json`，不读也不写 `settings.json` 里直连模式的供应商；
-从直连模式「导入」是复制一份，之后两边各改各的。没接入网关的 Agent 不受任何影响。
+网关供应商和路由数据存在 `<状态目录>/gateway.json`。从直连模式「导入」时复制一份供应商配置，之后分别维护。
 
 ## 能做什么
 
@@ -87,6 +86,19 @@ Grok ─────────POST /gw/grok/v1/responses───┤  helper�
   复用「关键字段」切换逻辑，hooks / permissions 等用户键不动；关闭时切回开启前的供应商。
 - Grok：写入一个指向网关的 Responses 供应商；关闭时重新应用 Grok 页当前选中的供应商。
 - Codex++ 不再提供 Claude Code / Grok 的供应商配置页：不接入网关时，它们照自己的配置文件直连；「断开并还原」恢复接入前的配置。
+
+## Codex HTTP 流式响应头等待
+
+同一次请求的网关排队和候选切换共用响应头总预算。每个候选能等到自己的期限或请求总期限，以先到者为准。
+成功收到 HTTP 响应头后，SSE 的首个输出和后续传输沿用原来的超时规则。
+
+`<状态目录>/settings.json` 支持两个可选项，单位均为秒。
+
+- `gatewayProviderStreamHeaderTimeoutSecs` 按网关供应商 ID 覆盖响应头等待。未指定的供应商沿用 `upstreamStreamHeaderTimeoutSecs`，默认 120 秒。
+- `gatewayStreamHeaderBudgetSecs` 限制一次请求用于取得响应头的总时间。默认取 240 秒和全局响应头等待设置中的较大值。
+
+响应头超时或发送后在响应头返回前断线时，上游执行结果未知。网关停止重发和切换，并用 Codex 识别为终止的 HTTP 400 返回 `gateway_error` 及专用错误码。上游重定向也终止请求，供应商地址需配置为 API 的最终地址。明确的限流或服务不可用响应等仍按原有规则处理。
+在 `codex-plus.log` 中可用 `requestId` 关联每次 `gateway.http_upstream_attempt`、候选失败记录和 `request-log.jsonl`，区分网关排队（`queueWaitMs`）、等待上游响应头、等待首个输出和流中断。排队耗尽总预算时记录 `gateway.http_header_budget_exhausted`，会注明等待阶段。
 
 ## 接入方式
 

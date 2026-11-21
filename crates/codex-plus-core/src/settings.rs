@@ -1126,6 +1126,10 @@ pub struct BackendSettings {
     /// （长推理模型、慢中转，#3130）可在 settings.json 调大，上限 3600，写小不生效。
     #[serde(rename = "upstreamStreamHeaderTimeoutSecs", default)]
     pub upstream_stream_header_timeout_secs: Option<u64>,
+    #[serde(rename = "gatewayProviderStreamHeaderTimeoutSecs", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub gateway_provider_stream_header_timeout_secs: BTreeMap<String, u64>,
+    #[serde(rename = "gatewayStreamHeaderBudgetSecs", default, skip_serializing_if = "Option::is_none")]
+    pub gateway_stream_header_budget_secs: Option<u64>,
     /// 当前 Codex 原生 auth 的显式选择；None 表示旧版本未设置，Some(None) 表示明确不登录。
     #[serde(rename = "nativeAuthSelection", default)]
     pub native_auth_selection: Option<NativeAuthSelection>,
@@ -1559,6 +1563,8 @@ impl Default for BackendSettings {
             thread_model_follow_switch_enabled: false,
             keep_projects_without_account: false,
             upstream_stream_header_timeout_secs: None,
+            gateway_provider_stream_header_timeout_secs: BTreeMap::new(),
+            gateway_stream_header_budget_secs: None,
             native_auth_selection: None,
             provider_sync_saved_providers: Vec::new(),
             provider_sync_manual_providers: Vec::new(),

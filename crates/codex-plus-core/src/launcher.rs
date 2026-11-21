@@ -2855,7 +2855,7 @@ impl ProxyRequestLog {
                 path: path.to_string(),
                 status_code: 0,
                 success: false,
-                stream: false,
+                stream: request.and_then(|request| request.get("stream")).and_then(Value::as_bool).unwrap_or(false),
                 model,
                 thread_id,
                 upstream_model: String::new(),
@@ -3042,7 +3042,7 @@ impl ProxyRequestLog {
         let finished_at_ms = current_time_ms();
         self.entry.finish(finished_at_ms);
         // 非流式响应没有首字概念，用总耗时作为首字耗时展示。
-        if !self.entry.stream && self.entry.first_token_ms.is_none() {
+        if self.entry.success && !self.entry.stream && self.entry.first_token_ms.is_none() {
             self.entry.first_token_ms = Some(self.entry.duration_ms);
         }
         crate::request_log::finish_request(&self.entry);
@@ -3181,8 +3181,14 @@ async fn handle_protocol_proxy_connection_inner(
                 let vlm_failure = error.downcast_ref::<crate::vision::VlmPreprocessError>();
                 let local_limited = error.downcast_ref::<crate::gateway::pipeline::LocalRateLimited>();
                 let retired_model = error.downcast_ref::<crate::gateway::server::RetiredCodexModel>();
+                let header_wait = error.downcast_ref::<crate::gateway::http_wait::HeaderWaitError>();
+                if matches!(opener, ProxyOpener::Gateway(_))
+                    && let Some(entry) = crate::request_log::running_request(&live_request_id)
+                {
+                    request_log.entry = entry;
+                }
                 let status = if unsupported.is_some() || search_unsupported.is_some() || file_unsupported.is_some()
-                    || retired_model.is_some()
+                    || retired_model.is_some() || header_wait.is_some()
                     || matches!(vlm_failure, Some(crate::vision::VlmPreprocessError::MissingConfiguration)) {
                     "400 Bad Request"
                 } else if local_limited.is_some() {
@@ -3202,10 +3208,14 @@ async fn handle_protocol_proxy_connection_inner(
                         .or_else(|| retired_model.map(|error| serde_json::json!({
                             "error": { "message": error.to_string(), "type": "invalid_request_error", "code": "model_not_found" }
                         })))
+                        .or_else(|| header_wait.map(|error| serde_json::json!({
+                            "error": { "message": error.to_string(), "type": "gateway_error", "code": error.code() }
+                        })))
                         .unwrap_or_else(
                             || serde_json::json!({"status":"failed","message":error_chain.clone()}),
                         ),
                 )?;
+                request_log.record_error(status, error_chain.clone());
                 write_http_response(stream, status, "application/json; charset=utf-8", &body)
                     .await?;
                 log_helper_proxy_failure(
@@ -3215,7 +3225,6 @@ async fn handle_protocol_proxy_connection_inner(
                     &error_chain,
                     remote_addr_text,
                 );
-                request_log.record_error(status, error_chain.clone());
                 stream.shutdown().await?;
                 return Ok(());
             }
