@@ -34,9 +34,11 @@ import {
   Settings,
   Square,
   Waypoints,
+  X,
   type LucideIcon,
 } from "lucide-react";
 import { t, tf } from "./i18n";
+import { useEscapeLayer } from "./use-escape-layer";
 import { ModelList, Floating, ownCurrent } from "./GatewayAgents";
 import { AgentDisconnectDialog } from "./AgentDisconnectDialog";
 import {
@@ -327,7 +329,8 @@ export function TrayPanel() {
     void invoke("tray_panel_action", { action: "open" });
   };
 
-  const action = (name: "open" | "quit") => void invoke("tray_panel_action", { action: name });
+  const action = (name: "open" | "quit" | "hide") => void invoke("tray_panel_action", { action: name });
+  useEscapeLayer(true, () => action("hide"));
 
   const refreshNow = async () => {
     setRefreshing(true);
@@ -356,6 +359,9 @@ export function TrayPanel() {
         </button>
         <button aria-label={t("打开 Codex++")} className="gw-icon-button" onClick={() => action("open")} title={t("打开 Codex++")} type="button">
           <ExternalLink className="h-4 w-4" />
+        </button>
+        <button aria-label={t("收起面板")} className="gw-icon-button" onClick={() => action("hide")} title={t("收起面板")} type="button">
+          <X className="h-4 w-4" />
         </button>
       </header>
 

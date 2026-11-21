@@ -233,6 +233,9 @@ pub fn run() {
             "version": env!("CARGO_PKG_VERSION")
         }),
     );
+    // 启动期间到达的请求也要交给稍后就绪的主窗口处理。
+    let activation_path = window_activation_request_path();
+    let previous_activation = std::fs::read(&activation_path).unwrap_or_default();
     let Some(_guard) = acquire_single_instance_guard() else {
         return;
     };
@@ -357,7 +360,11 @@ pub fn run() {
                 })?;
                 Ok(())
             });
-            start_window_activation_listener(app.handle().clone());
+            start_window_activation_listener(
+                app.handle().clone(),
+                activation_path.clone(),
+                previous_activation.clone(),
+            );
             // Computer Use 操作后台应用时的悬浮预览（同 Codex 的画中画）。
             cu_pip::start(app.handle().clone());
             commands::start_weixin_connect_from_saved_settings();
@@ -1171,7 +1178,7 @@ pub(crate) fn request_app_exit<R: tauri::Runtime>(app_handle: &tauri::AppHandle<
 /// 窗口在就显示并聚焦，轻量模式下已销毁就按原配置重建再显示（#2677）。必须在主线程调用。
 fn show_main_window<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
     lightweight::cancel_pending_release();
-    // 主窗口销毁后，Windows 上二次启动按进程找窗口时可能把隐藏的快捷面板翻出来，这里顺手收起。
+    // 各种入口打开主窗口时，都收起托盘面板。
     tray_panel::hide(app_handle);
     let Some((window, created)) = ensure_main_window(app_handle) else {
         return;
@@ -1209,6 +1216,10 @@ fn set_manager_activation_policy<R: tauri::Runtime>(
 /// Restores and focuses an existing manager window on desktop platforms.
 pub fn focus_existing_manager_window() {
     // 锁持有者在主进程内消费请求，Linux 及隐藏窗口也能重新打开。
+    // Windows 只转交前台权限。按进程枚举窗口会误选轻量模式下还存活的托盘面板。
+    #[cfg(windows)]
+    codex_plus_core::windows_allow_guard_owner_foreground(codex_plus_core::ports::manager_guard_port());
+
     let path = window_activation_request_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1219,23 +1230,6 @@ pub fn focus_existing_manager_window() {
         .as_nanos()
         .to_string();
     let _ = std::fs::write(path, request);
-    #[cfg(windows)]
-    {
-        let current_process_id = std::process::id();
-        for process in codex_plus_core::windows_enumerate_processes() {
-            if process.process_id == current_process_id {
-                continue;
-            }
-            if ["codex-plus-plus.exe", "codex-plus-plus-manager.exe"]
-                .iter()
-                .any(|name| process.exe_file.eq_ignore_ascii_case(name))
-                && codex_plus_core::windows_activate_process_window(process.process_id)
-            {
-                break;
-            }
-        }
-    }
-
     #[cfg(target_os = "macos")]
     {
         if let Ok(executable) = std::env::current_exe()
@@ -1258,9 +1252,11 @@ fn window_activation_request_path() -> std::path::PathBuf {
     ))
 }
 
-fn start_window_activation_listener(app: tauri::AppHandle) {
-    let path = window_activation_request_path();
-    let mut previous = std::fs::read(&path).unwrap_or_default();
+fn start_window_activation_listener(
+    app: tauri::AppHandle,
+    path: std::path::PathBuf,
+    mut previous: Vec<u8>,
+) {
     std::thread::spawn(move || {
         while !SHUTDOWN_STARTED.load(Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(300));

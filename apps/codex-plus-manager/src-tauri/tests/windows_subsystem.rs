@@ -37,7 +37,10 @@ fn manager_repeated_launch_activates_existing_window() {
         .expect("read manager lib.rs");
 
     assert!(lib_rs.contains("focus_existing_manager_window();"));
-    assert!(lib_rs.contains("windows_activate_process_window"));
+    assert!(lib_rs.contains("windows_allow_guard_owner_foreground"));
+    assert!(!lib_rs.contains("windows_activate_process_window"));
+    let listener = lib_rs.split("fn start_window_activation_listener(").nth(1).unwrap();
+    assert!(listener.contains("show_main_window(&app);"));
 }
 
 #[test]
