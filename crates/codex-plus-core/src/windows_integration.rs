@@ -43,9 +43,9 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWMINNOACTIVE;
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, EnumWindows, GWL_EXSTYLE, GetClassNameW, GetWindowLongPtrW, GetWindowTextLengthW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, SW_RESTORE, SW_SHOW, SetForegroundWindow,
-    ShowWindow, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    AllowSetForegroundWindow, EnumWindows, GWL_EXSTYLE, GetClassNameW, GetWindowLongPtrW,
+    GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SW_RESTORE, SW_SHOW,
+    SetForegroundWindow, ShowWindow, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
@@ -1429,16 +1429,23 @@ pub(crate) fn allow_guard_owner_foreground(port: u16) {
     let Ok(Some(pid)) = unique_listener_process_id(&ids) else {
         return;
     };
-    if pid != std::process::id()
-        && query_process_image_path(pid).and_then(|path| path.file_name().map(OsString::from)).is_some_and(|name| {
-            ["codex-plus-plus.exe", "codex-plus-plus-manager.exe"]
-                .iter()
-                .any(|expected| name.eq_ignore_ascii_case(expected))
-        })
-    {
-        // SAFETY: only grant the matching manager guard owner permission to activate its own window.
-        let _ = unsafe { AllowSetForegroundWindow(pid) };
+    if pid == std::process::id() {
+        return;
     }
+    let Some(path) = query_process_image_path(pid) else {
+        return;
+    };
+    let Some(name) = path.file_name() else {
+        return;
+    };
+    if !["codex-plus-plus.exe", "codex-plus-plus-manager.exe"]
+        .iter()
+        .any(|expected| name.eq_ignore_ascii_case(expected))
+    {
+        return;
+    }
+    // SAFETY: only grant the matching manager guard owner permission to activate its own window.
+    let _ = unsafe { AllowSetForegroundWindow(pid) };
 }
 
 /// 停止后复核失败时的监听者脱敏身份摘要：只暴露 PID 与映像文件名，不记录完整路径或参数（#3074）。

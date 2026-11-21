@@ -133,9 +133,9 @@ jobs:
     # 只有验证和打包都成功，才生成正式发布流程读取的同名产物。
     needs: [windows-artifacts, windows-build, windows-build-serial]
     if: >-
-      !cancelled() && github.event_name == 'workflow_dispatch' && needs.windows-artifacts.result == 'success' &&
+      ${{ !cancelled() && github.event_name == 'workflow_dispatch' && needs.windows-artifacts.result == 'success' &&
       ((inputs.platform == 'windows-serial' && needs.windows-build-serial.result == 'success') ||
-       ((inputs.platform == 'all' || inputs.platform == 'windows') && needs.windows-build.result == 'success'))
+       ((inputs.platform == 'all' || inputs.platform == 'windows') && needs.windows-build.result == 'success')) }}
     name: Deliver Windows artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 10

@@ -2,7 +2,18 @@
 
 本文记录如何在 `jacywallny/CodexPlusPlus` 使用 GitHub Actions 构建 Windows 成品，适用于只验证云端编译、不改动本机安装的场景。
 
-## Windows CI 提速（2026-11-20）
+## 2.8.3 串行与并行构建对照（2026-11-21）
+
+在同一个个人 fork 提交上，手动触发两个模式；不设置 Rust 测试筛选。验证和打包使用相同定义、Windows runner 类型和缓存设置。串行模式等待完整验证成功后才调度打包 runner；并行模式同时调度。两者都在验证和打包成功后交付正式命名的产物。
+
+```powershell
+gh workflow run pr-build.yml --repo jacywallny/CodexPlusPlus --ref fix/personal-windows-tray-v2.8.3 -f platform=windows-serial
+gh workflow run pr-build.yml --repo jacywallny/CodexPlusPlus --ref fix/personal-windows-tray-v2.8.3 -f platform=windows
+```
+
+对照时核对两轮的 head SHA、工具链和实际缓存命中；分别记录排队、验证、Release 编译、NSIS 打包和产物可用时间。并行主要缩短等待时间，不能用总耗时推导编译器提速。若一轮缓存未命中或排队异常，应单列条件，必要时重跑对照。
+
+## Windows CI 提速初稿（2026-11-20）
 
 基线为个人 fork `main` 的 `8863002d`。v2.8.2 的 [冷缓存运行 #44701908799](https://github.com/jacywallny/CodexPlusPlus/actions/runs/44701908799) 用时 32 分 05 秒：Rust 测试 12 分 17 秒，data 串行测试 5 分 08 秒，Release 编译 11 分 17 秒，NSIS 打包 57 秒。随后 `main` 已预热测试和 Release 两份 Windows 缓存。这个基线用于比较，不能代表缓存命中后的耗时。
 
