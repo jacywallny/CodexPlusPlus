@@ -1,0 +1,161 @@
+name: Windows packaging
+
+on:
+  workflow_call:
+    inputs:
+      preview:
+        type: boolean
+        default: false
+      rust_test_filter:
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  windows-build:
+    name: Windows build and package
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/codex-plus-manager/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # 与 release-cache.yml 共用 release 依赖，测试用的 dev 缓存由另一台 runner 读取。
+      - name: Cache Rust release dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-release
+          save-if: false
+
+      - name: Check sherpa-onnx prebuilt cache
+        shell: bash
+        run: |
+          node scripts/prepare-sherpa-cache.mjs
+          cargo clean --package sherpa-onnx-sys --release
+
+      - name: Install frontend dependencies
+        working-directory: apps/codex-plus-manager
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: apps/codex-plus-manager
+        run: npm run vite:build
+
+      - name: Build release application
+        run: cargo build --release --locked -p codex-plus-manager
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          $makensis = $null
+          for ($attempt = 0; $attempt -le 3; $attempt++) {
+            # Chocolatey 可能在下载失败后返回成功，必须实际验证编译器。
+            $candidates = @(
+              "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+              "$env:ProgramFiles\NSIS\makensis.exe"
+            )
+            $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+            if (-not $makensis) {
+              $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
+              if ($command) { $makensis = $command.Source }
+            }
+            if ($makensis) {
+              & $makensis /VERSION
+              if ($LASTEXITCODE -eq 0) { break }
+            }
+            $makensis = $null
+            if ($attempt -lt 3) {
+              if ($attempt -gt 0) { Start-Sleep -Seconds (10 * $attempt) }
+              choco install nsis -y --no-progress
+            }
+          }
+          if (-not $makensis) { throw "NSIS 安装失败或编译器不可用，停止 PR 构建。" }
+
+      - name: Stage Windows app files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/windows/app | Out-Null
+          Copy-Item target/release/codex-plus-plus.exe dist/windows/app/
+          if ((Get-ChildItem dist/windows/app -Filter *.exe).Count -ne 1) { throw "Windows 安装包必须只有一个应用程序。" }
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $version = (Get-Content -LiteralPath apps/codex-plus-manager/package.json -Raw | ConvertFrom-Json).version
+          node --test scripts/tests/release-meta.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw "版本元数据测试失败。" }
+          node scripts/release-meta.mjs check $version
+          if ($LASTEXITCODE -ne 0) { throw "版本号不一致，停止安装包构建。" }
+          # NSIS 的 64 位安装目录与 Chocolatey PATH 更新均需要兼容。
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+            "$env:ProgramFiles\NSIS\makensis.exe"
+          )
+          $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $makensis) {
+            $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
+            if ($command) { $makensis = $command.Source }
+          }
+          if (-not $makensis) {
+            throw "NSIS 编译器未找到，检查 Chocolatey 安装结果。"
+          }
+          Push-Location scripts/installer/windows
+          try {
+            # 版本资源只收 X.X.X.X：去掉预发布后缀；手动在分支上跑（版本是分支名）时用 0.0.0.0。
+            $viVersion = if ($version -match '^(\d+)\.(\d+)\.(\d+)') { "$($Matches[1]).$($Matches[2]).$($Matches[3]).0" } else { "0.0.0.0" }
+            & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" "/DVI_VERSION=$viVersion" CodexPlusPlus.nsi
+            if ($LASTEXITCODE -ne 0) { throw "NSIS 打包失败，退出码 $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Record build provenance and checksums
+        shell: pwsh
+        env:
+          RUST_TEST_FILTER: ${{ inputs.rust_test_filter }}
+          BUILD_MODE: ${{ inputs.preview && 'preview' || 'checked' }}
+        run: |
+          $appVersion = (Get-Content -LiteralPath apps/codex-plus-manager/package.json -Raw | ConvertFrom-Json).version
+          $buildInfo = [ordered]@{
+            version = $appVersion
+            commit = $env:GITHUB_SHA
+            ref = $env:GITHUB_REF
+            repository = $env:GITHUB_REPOSITORY
+            runId = $env:GITHUB_RUN_ID
+            runAttempt = $env:GITHUB_RUN_ATTEMPT
+            runnerOS = $env:RUNNER_OS
+            rustVersion = (rustc --version)
+            testFilter = [string]$env:RUST_TEST_FILTER
+            buildMode = $env:BUILD_MODE
+          }
+          $buildInfo | ConvertTo-Json | Set-Content -LiteralPath dist/windows/build-info.json -Encoding utf8NoBOM
+          $files = @('dist/windows/app/codex-plus-plus.exe') + @(Get-ChildItem -LiteralPath dist/windows -Filter *.exe | ForEach-Object FullName)
+          $checksums = foreach ($file in $files) {
+            $hash = Get-FileHash -LiteralPath $file -Algorithm SHA256
+            '{0}  {1}' -f $hash.Hash.ToLowerInvariant(), (Split-Path -Leaf $file)
+          }
+          $checksums | Set-Content -LiteralPath dist/windows/SHA256SUMS.txt -Encoding utf8NoBOM
+          "Windows $env:BUILD_MODE build: version $appVersion, commit $env:GITHUB_SHA" >> $env:GITHUB_STEP_SUMMARY
+          Get-Content -LiteralPath dist/windows/SHA256SUMS.txt >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload Windows build for handoff or preview
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.preview && 'codex-plus-plus-windows-preview' || 'codex-plus-plus-windows-staging' }}
+          path: dist/windows/
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 7
