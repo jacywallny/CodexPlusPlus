@@ -91,7 +91,13 @@ fn installer_name_helpers_and_legacy_constants_keep_api_compatibility() {
 
 #[test]
 fn windows_workflows_verify_nsis_and_support_both_program_files_directories() {
-    for workflow in ["pr-build.yml", "release-assets.yml"] {
+    let caller = include_str!("../../../../.github/workflows/pr-build.yml");
+    assert_eq!(
+        caller.matches("uses: ./.github/workflows/windows-packaging.yml").count(),
+        2,
+        "串行和并行构建应使用同一套打包步骤"
+    );
+    for workflow in ["windows-packaging.yml", "release-assets.yml"] {
         let text = std::fs::read_to_string(format!("../../.github/workflows/{workflow}"))
             .unwrap()
             .replace("\r\n", "\n");
@@ -149,7 +155,7 @@ fn windows_installer_carries_product_version_resource() {
     assert!(languages < product_version, "版本键要在语言加载之后");
     assert!(nsi.contains("VIProductVersion \"${VI_VERSION}\""), "{nsi}");
     assert!(nsi.contains("!define VI_VERSION \"0.0.0.0\""), "没传时要有兜底");
-    for workflow in ["pr-build.yml", "release-assets.yml"] {
+    for workflow in ["windows-packaging.yml", "release-assets.yml"] {
         let text =
             std::fs::read_to_string(format!("../../.github/workflows/{workflow}")).unwrap();
         assert!(text.contains("\"/DVI_VERSION=$viVersion\""), "{workflow} 要传数字版本");
