@@ -298,6 +298,7 @@ export type AgentActivityView = {
 
 export type GatewayPayload = {
   gateway: GatewaySettings;
+  streamHealthRoutingEnabled?: boolean;
   port: number;
   helperRunning: boolean;
   /** Codex 旧版供应商配置总开关；旧版后端没有这个字段。 */

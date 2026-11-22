@@ -1942,6 +1942,8 @@ export const EN_PLAIN: Record<string, string> = {
   "搜索组或模型": "Search groups or models",
   "多家都有的模型自动成一个组：Agent 选不带供应商的模型名时走它。关掉后只列出你建的组，不带供应商的模型名按供应商池的顺序依次尝试。": "A model offered by several providers becomes a group on its own, used when an agent picks the model name without a provider. Off: only your groups are listed, and a plain model name tries providers in pool order.",
   "自动建组": "Auto groups",
+  "自动组熔断": "Auto-group circuit breaker",
+  "仅用于 Codex HTTP 自动组。某供应商的同一模型连续两次流式故障后，后续请求暂时跳过它。": "Only for Codex HTTP auto groups. After two consecutive streaming failures for a provider and model, later requests temporarily skip that provider for that model.",
   "新建组": "New group",
   "组让 Agent 把几个模型当成一个来选：按什么方式先试哪个、同一会话要不要固定、出错换谁，都在卡片上改。": "A group lets agents pick several models as one. Which goes first, whether a conversation sticks to one, and who takes over on errors are all set on the card.",
   "Agent 里以 group/<id> 出现": "Agents see them as group/<id>",

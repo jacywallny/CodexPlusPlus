@@ -261,6 +261,7 @@ function RoutingView({ payload, busy, run }: { payload: GatewayPayload | null; b
   const [editing, setEditing] = useState<GatewayGroupEntry | "new" | null>(null);
   const [query, setQuery] = useState("");
   const autoOn = payload?.gateway.autoModels !== false;
+  const healthRoutingOn = payload?.streamHealthRoutingEnabled === true;
   const needle = query.trim().toLowerCase();
   const hit = (group: GatewayGroupEntry) =>
     !needle || group.name.toLowerCase().includes(needle) || group.members.some((member) => member.model.toLowerCase().includes(needle));
@@ -290,7 +291,6 @@ function RoutingView({ payload, busy, run }: { payload: GatewayPayload | null; b
 
   return (
     <>
-      {/* 一行工具条：搜索 + 自动建组 + 新建组。组是什么放在「我的组」标题的悬停说明里，不再单独占一行。 */}
       <div className="gw-models-toolbar cx-routing-toolbar">
         <label className="cx-search gw-models-search">
           <Search aria-hidden="true" />
@@ -303,6 +303,15 @@ function RoutingView({ payload, busy, run }: { payload: GatewayPayload | null; b
             label={t("自动建组")}
             on={autoOn}
             onToggle={() => void run("auto-models", "save_gateway_auto_models", { enabled: !autoOn }, t("自动建组"), true)}
+          />
+        </div>
+        <div className="gw-models-auto" title={t("仅用于 Codex HTTP 自动组。某供应商的同一模型连续两次流式故障后，后续请求暂时跳过它。")}>
+          <span>{t("自动组熔断")}</span>
+          <Switch
+            disabled={busy !== null || !payload}
+            label={t("自动组熔断")}
+            on={healthRoutingOn}
+            onToggle={() => void run("stream-health-routing", "save_gateway_stream_health_routing", { enabled: !healthRoutingOn }, t("自动组熔断"), true)}
           />
         </div>
         <button className="cx-primary" disabled={busy !== null || !payload} onClick={() => setEditing("new")} type="button">

@@ -13,6 +13,12 @@ import { fileURLToPath } from "node:url";
 export const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 export const VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const WINDOWS_HOTFIX_PATTERN = /^(\d+\.\d+\.\d+)\.([1-9]\d*)$/;
+
+export function packageVersionForRelease(version) {
+  const hotfix = WINDOWS_HOTFIX_PATTERN.exec(version);
+  return hotfix && Number(hotfix[2]) <= 65535 ? `${hotfix[1]}+${hotfix[2]}` : version;
+}
 
 const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -117,14 +123,15 @@ export function compareVersions(a, b) {
 function main(argv) {
   const [command, rawVersion] = argv;
   const version = (rawVersion || "").replace(/^v/i, "");
-  if (!["check", "notes"].includes(command) || !VERSION_PATTERN.test(version)) {
+  const expected = packageVersionForRelease(version);
+  if (!["check", "notes"].includes(command) || (!VERSION_PATTERN.test(version) && expected === version)) {
     console.error("用法：node scripts/release-meta.mjs check|notes <版本号>");
     return 2;
   }
   if (command === "check") {
-    const mismatched = readVersions().filter((entry) => entry.version !== version);
+    const mismatched = readVersions().filter((entry) => entry.version !== expected);
     for (const { file, version: found } of mismatched) {
-      console.error(`版本号不一致：${file} 是 ${found ?? "（读不出来）"}，期望 ${version}`);
+      console.error(`版本号不一致：${file} 是 ${found ?? "（读不出来）"}，期望 ${expected}`);
     }
     if (mismatched.length) return 1;
     console.error(`版本号一致：${version}`);

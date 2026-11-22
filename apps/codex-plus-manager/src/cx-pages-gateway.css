@@ -616,6 +616,7 @@
    一行工具条（搜索 · 自动建组 · 新建组），组卡片不再有底栏：隐藏成员、编辑、删除在标题行的三点菜单里。 */
 :root .shell .cx-routing-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 12px;
 }
@@ -630,6 +631,7 @@
   flex: none;
   align-items: center;
   gap: 8px;
+  margin-left: 0;
   color: hsl(var(--foreground) / 0.85);
   font-size: 12.5px;
 }

@@ -2990,6 +2990,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         );
     }
     merge_bool_setting(target, source, "protocolProxyAutoRetry");
+    merge_bool_setting(target, source, "gatewayStreamHealthRoutingEnabled");
     // 目录外模型映射开关同上：漏登记会让 /settings/set 补丁「保存了但没生效」。
     merge_bool_setting(target, source, "protocolProxyMapUnlistedModels");
     if let Some(value) = source

@@ -165,6 +165,7 @@ pub struct NativeAuthState {
 pub struct GatewayPayload {
     /// 绑定与选项；供应商池单独放在 `pool`（不带 Key），这里的 `providers` 总是空的。
     pub gateway: GatewaySettings,
+    pub stream_health_routing_enabled: bool,
     pub port: u16,
     pub helper_running: bool,
     /// Codex 旧版供应商配置总开关；网关接入 Codex 时也受此保护。
@@ -483,6 +484,7 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         image_options,
         image_auto,
         gateway,
+        stream_health_routing_enabled: settings.gateway_stream_health_routing_enabled,
         port,
         helper_running,
         relay_profiles_enabled: settings.relay_profiles_enabled,
@@ -1090,6 +1092,14 @@ pub fn save_gateway_auto_models(enabled: bool) -> CommandResult<Option<GatewayPa
         "保存网关选项失败",
         refresh_agents(result),
     )
+}
+
+#[tauri::command]
+pub fn save_gateway_stream_health_routing(enabled: bool) -> CommandResult<Option<GatewayPayload>> {
+    let result = SettingsStore::default().update(serde_json::json!({
+        "gatewayStreamHealthRoutingEnabled": enabled,
+    }));
+    respond("自动组熔断已保存。", "保存自动组熔断失败", result)
 }
 
 /// [`scan_gateway_local_logins`] 的结果。要包一层：[`CommandResult`] 把 payload 用 `serde(flatten)`

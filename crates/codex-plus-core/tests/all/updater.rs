@@ -16,6 +16,9 @@ fn version_comparison_uses_numeric_segments() {
     assert!(is_newer_version("v1.0.10", "1.0.4").unwrap());
     assert!(!is_newer_version("v1.0.4", "1.0.4").unwrap());
     assert!(!is_newer_version("v1.0.3", "1.0.4").unwrap());
+    assert!(is_newer_version("v2.9.3.1", "2.9.3").unwrap());
+    assert!(!is_newer_version("v2.9.3.1", "2.9.3.1").unwrap());
+    assert!(is_newer_version("v2.9.4", "2.9.3.1").unwrap());
 }
 
 #[test]

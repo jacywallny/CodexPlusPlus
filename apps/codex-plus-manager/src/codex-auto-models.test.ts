@@ -49,6 +49,12 @@ test("自动组：关了自动建组、或这个自动组被隐藏时，不出�
   assert.match(page, /"save_gateway_auto_models", \{ enabled: !autoOn \}/, "自动建组开关在路由页");
 });
 
+test("路由页：自动组熔断默认关，在自动建组旁切换独立设置", () => {
+  const page = readFileSync(new URL("./GatewayPage.tsx", import.meta.url), "utf8");
+  assert.match(page, /payload\?\.streamHealthRoutingEnabled === true/);
+  assert.match(page, /"save_gateway_auto_models"[\s\S]*label=\{t\("自动组熔断"\)\}[\s\S]*"save_gateway_stream_health_routing", \{ enabled: !healthRoutingOn \}/);
+});
+
 test("模型按钮：自动切换的模型带「自动」标签与专用图标；Codex 目录侧同样拆开（后端测试覆盖）", () => {
   const ui = readFileSync(new URL("./gateway-ui.tsx", import.meta.url), "utf8");
   assert.match(ui, /export function ModelViewGlyph/);

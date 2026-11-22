@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { VERSION_FILES } from "../release-meta.mjs";
+import { VERSION_FILES, packageVersionForRelease } from "../release-meta.mjs";
+
+test("four-part Windows release tags map to numeric SemVer build metadata", () => {
+  assert.equal(packageVersionForRelease("2.9.3.1"), "2.9.3+1");
+  assert.equal(packageVersionForRelease("2.9.4"), "2.9.4");
+  assert.equal(packageVersionForRelease("2.9.4-rc.1"), "2.9.4-rc.1");
+  assert.equal(packageVersionForRelease("2.9.3.65536"), "2.9.3.65536");
+});
 
 const lockFile = VERSION_FILES.find(({ file }) => file === "Cargo.lock");
 for (const [name, eol] of [["LF", "\n"], ["CRLF", "\r\n"]]) {

@@ -268,7 +268,7 @@ const overview = ok({
     debugger: { status: "disconnected", address: null, message: "等待 Codex 连接" },
     protocol_conversion_enabled: true,
   },
-  current_version: "2.9.3",
+  current_version: "2.9.3+1",
   update_status: "up_to_date",
   settings_path: "演示模式",
   logs_path: "演示模式",
@@ -299,6 +299,7 @@ const price = (input: number, cachedInput: number, output: number, currency = "C
 const demoKeys = (...masked: string[]) => masked.map((value, index) => ({ id: `k${index + 1}`, masked: value }));
 const minutesLater = (minutes: number) => Date.now() + minutes * 60_000;
 const gateway = ok({
+  streamHealthRoutingEnabled: false,
   gateway: {
     version: 1,
     bindings: {
@@ -687,6 +688,9 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
   switch (command) {
     case "list_tools": return tools as T;
     case "load_gateway": return gateway as T;
+    case "save_gateway_stream_health_routing":
+      gateway.streamHealthRoutingEnabled = args.enabled === true;
+      return gateway as T;
     case "start_gateway_subscription_login": return ok({ start: { message: "", state: {} } }) as T;
     case "scan_agent_cache": return ok({ report: agentCacheReport }) as T;
     case "fetch_provider_models": return ok({ models: ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"], endpoint: "https://api.anthropic.com/v1/models" }) as T;
