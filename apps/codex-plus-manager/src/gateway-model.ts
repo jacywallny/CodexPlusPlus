@@ -151,7 +151,7 @@ export function keyLabel(keys: ProviderKeyView[] | undefined, keyId: string): st
 
 export type ProviderPrice = { currency: string; input: number; cachedInput: number; output: number };
 
-export type GroupMember = { model: string; weight: number };
+export type GroupMember = { model: string; weight: number; disabled?: boolean };
 export type GatewayGroupEntry = {
   id: string;
   name: string;
@@ -976,7 +976,7 @@ export function parseWeight(text: string): number | null {
   if (!trimmed) return null;
   const value = Number(trimmed);
   if (!Number.isFinite(value)) return null;
-  return Math.max(1, Math.floor(value));
+  return Math.min(0xffff_ffff, Math.max(1, Math.floor(value)));
 }
 
 /** 「本地网关端口」（#3082）：与后端 `load_gateway_port` / `save_gateway_port` 的返回一致。 */

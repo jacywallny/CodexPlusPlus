@@ -13665,6 +13665,20 @@ impl ResponsesSseTransformer {
         self.failed
     }
 
+    pub(crate) fn has_completed(&self) -> bool {
+        self.completed
+    }
+
+    pub(crate) fn discard_unfinished_passthrough(&self) -> &'static [u8] {
+        if self.passthrough_event.is_none() {
+            b""
+        } else if self.event_tail.ends_with(b"\n") {
+            b"data: !\n\n"
+        } else {
+            b"\ndata: !\n\n"
+        }
+    }
+
     /// 取出 `response.completed` 里捕获的 usage（请求日志用）。
     pub(crate) fn take_usage(&mut self) -> Option<crate::request_log::RequestUsage> {
         self.usage.take()

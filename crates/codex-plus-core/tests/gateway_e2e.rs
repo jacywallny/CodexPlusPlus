@@ -682,10 +682,12 @@ async fn gateway_end_to_end() {
             GroupMember {
                 model: "bad/deepseek-v4-pro".into(),
                 weight: 1,
+                disabled: false,
             },
             GroupMember {
                 model: "good/glm-5.3".into(),
                 weight: 1,
+                disabled: false,
             },
         ],
         extra: Default::default(),
@@ -1405,10 +1407,12 @@ async fn gateway_end_to_end() {
             GroupMember {
                 model: "inherit-a/gpt-6.1-sol".into(),
                 weight: 1,
+                disabled: false,
             },
             GroupMember {
                 model: "inherit-b/gpt-6.1-terra".into(),
                 weight: 1,
+                disabled: false,
             },
         ],
         pick: "inherit-b/gpt-6.1-terra".into(),

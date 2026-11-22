@@ -3477,6 +3477,7 @@ async fn handle_protocol_proxy_connection_inner(
                 request_json.as_ref(),
                 session_headers.thread_id,
                 foreign_client,
+                matches!(&opener, ProxyOpener::Gateway(crate::tools::ToolId::Codex)),
                 Some(live_request_id.as_str()),
                 &mut final_usage,
             )
@@ -5585,7 +5586,7 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
     Option<u64>,
 )> {
     forward_protocol_proxy_stream_for_client_with_live_request(
-        stream, prefix, response, wire_api, request, thread_id, foreign_client, None, &mut None,
+        stream, prefix, response, wire_api, request, thread_id, foreign_client, false, None, &mut None,
     )
     .await
 }
@@ -5599,6 +5600,7 @@ async fn forward_protocol_proxy_stream_for_client_with_live_request<S: SseSink>(
     request: Option<&Value>,
     thread_id: Option<&str>,
     foreign_client: bool,
+    stop_codex_replay: bool,
     live_request_id: Option<&str>,
     final_response_usage: &mut Option<crate::request_log::FinalResponseUsage>,
 ) -> anyhow::Result<(
@@ -5624,7 +5626,10 @@ async fn forward_protocol_proxy_stream_for_client_with_live_request<S: SseSink>(
                 return Ok((transformer.finish(), usage, detail, first_output_at_ms));
             }
         }
-        while let Some(chunk) = chunks.next().await {
+        while !stop_codex_replay || !transformer.has_completed() {
+            let Some(chunk) = chunks.next().await else {
+                break;
+            };
             match chunk {
                 Ok(bytes) => {
                     observe_protocol_proxy_output(
@@ -5646,6 +5651,9 @@ async fn forward_protocol_proxy_stream_for_client_with_live_request<S: SseSink>(
                     if !pending.is_empty() {
                         stream.send(&pending).await?;
                     }
+                    if stop_codex_replay && !transformer.has_completed() {
+                        stop_codex_stream_replay(stream, &transformer).await?;
+                    }
                     let usage = transformer.take_usage();
                     let detail = transformer.take_failure_detail();
                     return Ok((
@@ -5660,6 +5668,9 @@ async fn forward_protocol_proxy_stream_for_client_with_live_request<S: SseSink>(
         let pending = transformer.flush_pending();
         if !pending.is_empty() {
             stream.send(&pending).await?;
+        }
+        if stop_codex_replay && !transformer.has_completed() {
+            stop_codex_stream_replay(stream, &transformer).await?;
         }
         let usage = transformer.take_usage();
         let detail = transformer.take_failure_detail();
@@ -5776,6 +5787,25 @@ async fn forward_protocol_proxy_stream_for_client_with_live_request<S: SseSink>(
     record_chat_converter_usage(thread_id, &converter);
     // 流式 Chat 上游的用量也要进请求日志和网关用量统计（#2803）。
     Ok((None, converter.request_usage(), None, first_output_at_ms))
+}
+
+async fn stop_codex_stream_replay<S: SseSink>(
+    sink: &mut S,
+    transformer: &crate::protocol_proxy::ResponsesSseTransformer,
+) -> std::io::Result<()> {
+    let mut frame = transformer.discard_unfinished_passthrough().to_vec();
+    let failure = serde_json::json!({
+        "type": "response.failed",
+        "response": {
+            "status": "failed",
+            "error": {
+                "code": "invalid_prompt",
+                "message": "Codex++ 网关：上游响应流在完成前断开。已停止重发，请先检查本轮输出和工具执行状态。"
+            }
+        }
+    });
+    frame.extend_from_slice(format!("event: response.failed\ndata: {failure}\n\n").as_bytes());
+    sink.send(&frame).await
 }
 
 // 沿用普通转发的首字口径：第一段非空上游 body；HTTP 头和空块不算。
@@ -10246,6 +10276,22 @@ mod proxy_stream_tests {
         Option<u64>,
         Option<crate::request_log::RequestUsage>,
     ) {
+        forward_fixture_with_replay_policy(prefix, body, truncated, wire, initial_delay, false).await
+    }
+
+    async fn forward_fixture_with_replay_policy(
+        prefix: &[u8],
+        body: &str,
+        truncated: bool,
+        wire: UpstreamWireApi,
+        initial_delay: Duration,
+        stop_codex_replay: bool,
+    ) -> (
+        Option<String>,
+        String,
+        Option<u64>,
+        Option<crate::request_log::RequestUsage>,
+    ) {
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = upstream.local_addr().unwrap();
         let body = body.to_owned();
@@ -10286,9 +10332,9 @@ mod proxy_stream_tests {
         let (mut writer, _) = downstream.accept().await.unwrap();
         let forwarded = tokio::spawn(async move {
             let (result, usage, _detail, first_output_at_ms) =
-                forward_protocol_proxy_stream(&mut writer, &prefix, response, wire, None, None)
-                    .await
-                    .unwrap();
+                super::forward_protocol_proxy_stream_for_client_with_live_request(
+                    &mut writer, &prefix, response, wire, None, None, false, stop_codex_replay, None, &mut None,
+                ).await.unwrap();
             writer.shutdown().await.unwrap();
             (result, first_output_at_ms, usage)
         });
@@ -10420,7 +10466,7 @@ mod proxy_stream_tests {
             let mut sink = NotifyingSink(Some(sent));
             let mut final_usage = None;
             let forward = super::forward_protocol_proxy_stream_for_client_with_live_request(
-                &mut sink, &[], response, wire, None, None, false, Some(&log.entry.id), &mut final_usage,
+                &mut sink, &[], response, wire, None, None, false, false, Some(&log.entry.id), &mut final_usage,
             );
             tokio::pin!(forward);
             send_body.send(()).unwrap();
@@ -10457,6 +10503,39 @@ mod proxy_stream_tests {
                 assert!(output.contains("event: response.failed"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn codex_gateway_native_stream_disconnect_is_terminal_without_fake_completion() {
+        let prefix = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"preserved\"}\n\n";
+        for truncated in [false, true] {
+            let (failure, output, _, _) = forward_fixture_with_replay_policy(
+                prefix,
+                "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"name\":\"do_not_run\"}}",
+                truncated,
+                UpstreamWireApi::Responses,
+                Duration::ZERO,
+                true,
+            ).await;
+            assert!(failure.is_some());
+            assert!(output.as_bytes().starts_with(prefix));
+            assert_eq!(output.matches("event: response.failed").count(), 1);
+            assert!(output.contains("\"code\":\"invalid_prompt\""));
+            assert!(!output.contains("response.completed"));
+            assert!(!output.contains("do_not_run"));
+        }
+
+        let (failure, output, _, _) = forward_fixture_with_replay_policy(
+            prefix,
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fixture\"}}\n\n",
+            true,
+            UpstreamWireApi::Responses,
+            Duration::ZERO,
+            true,
+        ).await;
+        assert!(failure.is_none());
+        assert!(output.contains("response.completed"));
+        assert!(!output.contains("response.failed"));
     }
 
     #[tokio::test]

@@ -136,32 +136,46 @@ fn enabled_relay_models(gateway: &GatewaySettings) -> Vec<(&RelayProfile, Vec<St
         .collect()
 }
 
-/// 用已解析的模型列表拼出一个模型的自动组；只有一家或没人提供时返回 None。
+/// 已自定义成员的自动组在供应商暂时离开池时继续应用其配置。
 fn build_auto_group(
     gateway: &GatewaySettings,
     lists: &[(&RelayProfile, Vec<String>)],
     model: &str,
 ) -> Option<GatewayGroup> {
-    let members: Vec<GroupMember> = lists
+    let key = model.to_ascii_lowercase();
+    let settings = gateway.auto_groups.get(&key).cloned().unwrap_or_default();
+    let mut members: Vec<GroupMember> = lists
         .iter()
         .filter(|(_, models)| models.iter().any(|known| known.eq_ignore_ascii_case(model)))
         .map(|(relay, _)| GroupMember {
             model: format!("{}/{model}", relay.id),
             weight: 1,
+            disabled: false,
         })
         .collect();
-    if members.len() < 2 {
+    if members.len() < 2 && settings.members.is_empty() {
         return None;
     }
-    let key = model.to_ascii_lowercase();
-    let settings = gateway.auto_groups.get(&key).cloned().unwrap_or_default();
+    let mut ordered = Vec::with_capacity(members.len());
+    for saved in &settings.members {
+        if let Some(index) = members
+            .iter()
+            .position(|member| member.model.eq_ignore_ascii_case(&saved.model))
+        {
+            let mut member = members.remove(index);
+            member.weight = saved.weight.max(1);
+            member.disabled = saved.disabled;
+            ordered.push(member);
+        }
+    }
+    ordered.extend(members);
     Some(GatewayGroup {
         id: format!("{AUTO_GROUP_PREFIX}{key}"),
         name: model.to_string(),
         disabled: false,
         mode: settings.mode,
         sticky: settings.sticky,
-        members,
+        members: ordered,
         hide_members: settings.hide_members,
         pick: settings.pick,
         // 自动组的成员都是同一个模型，不需要另指图像输入模型。
@@ -252,7 +266,7 @@ fn unlisted_members(gateway: &GatewaySettings) -> Vec<String> {
     let mut hidden: Vec<String> = Vec::new();
     let concrete = |member: &GroupMember| {
         let model = member.model.trim();
-        (!model.is_empty() && !is_pattern(model) && !model.starts_with(GROUP_MODEL_PREFIX))
+        (!member.disabled && !model.is_empty() && !is_pattern(model) && !model.starts_with(GROUP_MODEL_PREFIX))
             .then(|| model.to_ascii_lowercase())
     };
     for group in gateway.groups.iter().filter(|group| !group.disabled && group.hide_members) {
@@ -275,7 +289,9 @@ pub fn pool_models(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<Str
     for relay in binding_pool_relays(gateway, binding) {
         // 生图模型不能聊天，不进 Agent 的模型列表（在「网关设置」的生图模型里选）。
         for model in chat_models(relay) {
-            let model = if is_disabled_group_model(gateway, &model) {
+            let model = if is_disabled_group_model(gateway, &model)
+                || unavailable_auto_group(gateway, binding, &model)
+            {
                 format!("{}/{model}", relay.id)
             } else {
                 model
@@ -302,7 +318,7 @@ pub fn pool_models(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<Str
 /// 本来就展开不了的组（成员模型没人提供等）保持原样列出，由默认模型等环节各自处理。
 /// `advance = false`：只看能不能展开，不推进轮换进度。
 pub(crate) fn group_listed_for_binding(gateway: &GatewaySettings, binding: &AgentBinding, group: &GatewayGroup) -> bool {
-    if group.disabled || group.members.is_empty() {
+    if group.disabled || group.members.iter().all(|member| member.disabled) {
         return false;
     }
     if binding.pool_exclude.is_empty()
@@ -379,6 +395,7 @@ pub fn codex_binding_models(gateway: &GatewaySettings, binding: &AgentBinding) -
         if !model.is_empty()
             && !is_disabled_group_model(gateway, &model)
             && !unavailable_registered_model(gateway, binding, &model)
+            && !unavailable_auto_group(gateway, binding, &model)
             && !retired_codex_model(gateway, binding, &model)
             && !models
                 .iter()
@@ -424,7 +441,7 @@ fn codex_pool_blocks(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<V
                 }
                 continue;
             }
-            if serving_count(&relays, &model) > 1 {
+            if serving_count(&relays, &model) > 1 || unavailable_auto_group(gateway, binding, &model) {
                 let pinned = if unavailable_registered_model(gateway, binding, &model) {
                     let Some(pinned) = qualified_catalog_model(gateway, binding, relay, &model)
                     else {
@@ -476,7 +493,7 @@ fn codex_pool_blocks(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<V
             .into_iter()
             .filter(|model| gateway.auto_models && !auto_group_settings(gateway, model).hidden)
             .filter(|model| !unlisted.contains(&model.to_ascii_lowercase()))
-            .filter(|model| fresh(model))
+            .filter(|model| !unavailable_auto_group(gateway, binding, model) && fresh(model))
             .collect(),
     );
     blocks.push(
@@ -1011,7 +1028,9 @@ fn effective_model_detailed(
     if binding.selection_for(&requested_slug).is_some() {
         return (requested_slug, false);
     }
-    if is_disabled_group_model(gateway, &requested_slug) {
+    if is_disabled_group_model(gateway, &requested_slug)
+        || unavailable_auto_group(gateway, binding, &requested_slug)
+    {
         return (requested_slug, false);
     }
     let declared = binding.declared_models();
@@ -1286,6 +1305,14 @@ fn group_for(gateway: &GatewaySettings, model: &str) -> Option<GatewayGroup> {
         .or_else(|| active_auto_group(gateway, model))
 }
 
+fn unavailable_auto_group(gateway: &GatewaySettings, binding: &AgentBinding, model: &str) -> bool {
+    gateway.auto_groups.get(&model.to_ascii_lowercase()).is_some_and(|settings| {
+        !settings.members.is_empty() && active_auto_group(gateway, model).is_some_and(|group| {
+            expand_group(gateway, binding, &group, 0, &mut Vec::new(), false).is_empty()
+        })
+    })
+}
+
 /// 一个模型名展开成 (供应商, 发给它的模型) 列表。
 fn expand_model(
     gateway: &GatewaySettings,
@@ -1424,7 +1451,7 @@ fn expand_group(
             visiting,
             advance,
         ) {
-            if !relays
+            if !group_disables_target(group, &relay, &model) && !relays
                 .iter()
                 .any(|(known, known_model)| known.id == relay.id && *known_model == model)
             {
@@ -1454,7 +1481,21 @@ fn expand_image_input_model(
     if image.is_empty() {
         return Vec::new();
     }
-    expand_model(gateway, binding, image, 1, &mut vec![group.id.clone()], advance)
+    if group.members.iter().any(|member| member.disabled && member.model.eq_ignore_ascii_case(image)) {
+        return Vec::new();
+    }
+    let mut relays = expand_model(gateway, binding, image, 1, &mut vec![group.id.clone()], advance);
+    relays.retain(|(relay, model)| !group_disables_target(group, relay, model));
+    relays
+}
+
+fn group_disables_target(group: &GatewayGroup, relay: &RelayProfile, model: &str) -> bool {
+    group.members.iter().any(|member| {
+        member.disabled
+            && member.model.split_once('/').is_some_and(|(id, slug)| {
+                relay.id.eq_ignore_ascii_case(id) && model.eq_ignore_ascii_case(slug)
+            })
+    })
 }
 
 /// 目录用：模型组的图像输入模型实际会发给哪些（供应商, 上游模型），不推进轮换位置。
@@ -1646,7 +1687,7 @@ fn prefer_remembered(relays: &mut Vec<(RelayProfile, String)>, remembered: &(Str
 /// 按模型组模式排出成员的尝试顺序。轮换 / 权重的进度存在内存里，各组独立；
 /// `advance` 为 false 时只看当前进度、不往前推（count_tokens 这类预览用）。
 fn ordered_members(group: &GatewayGroup, advance: bool) -> Vec<GroupMember> {
-    let members = group.members.clone();
+    let members: Vec<_> = group.members.iter().filter(|member| !member.disabled).cloned().collect();
     if group.mode == GroupMode::Manual {
         // 手动：只用选中的那个成员（没选或选的已不在组里时用第一个），答不了也不换。
         let picked = members
@@ -2063,6 +2104,7 @@ mod tests {
         GroupMember {
             model: model.to_string(),
             weight: 1,
+            disabled: false,
         }
     }
 
@@ -2894,6 +2936,7 @@ mod tests {
                 GroupMember {
                     model: "ds/deepseek-v4-flash".to_string(),
                     weight: 3,
+                    disabled: false,
                 },
                 member("kimi/kimi-k3"),
             ],
@@ -4063,6 +4106,53 @@ mod tests {
                 .iter()
                 .any(|m| m == "deepseek-v4-pro")
         );
+    }
+
+    #[test]
+    fn auto_group_member_overrides_survive_pool_changes_and_scope_to_one_model() {
+        let mut gateway = gateway("gpt-6.2-sol");
+        let models = "gpt-6.2-sol\ngpt-6.2-astra";
+        gateway.providers = vec![provider("molifang", models), provider("nanlab", models), provider("third", models)];
+        gateway.groups.clear();
+        let mut molifang = member("molifang/gpt-6.2-astra");
+        molifang.disabled = true;
+        molifang.weight = 100;
+        let mut third = member("third/gpt-6.2-astra");
+        third.weight = 3;
+        gateway.auto_groups.insert("gpt-6.2-astra".into(), AutoGroupSettings {
+            members: vec![third, molifang, member("nanlab/gpt-6.2-astra")],
+            sticky: GroupSticky::Off,
+            ..Default::default()
+        });
+        let mut binding = gateway.bindings["claude"].clone();
+        binding.pool_exclude.clear();
+        gateway.bindings.insert("codex".into(), binding);
+        let members = |gateway: &GatewaySettings, model| {
+            model_entry_members(gateway, &gateway.bindings["codex"], model)
+                .into_iter().map(|(relay, _)| relay.id).collect::<Vec<_>>()
+        };
+        assert_eq!(members(&gateway, "gpt-6.2-astra"), ["third", "nanlab"]);
+        assert_eq!(members(&gateway, "gpt-6.2-sol"), ["molifang", "nanlab", "third"]);
+        assert_eq!(members(&gateway, "molifang/gpt-6.2-astra"), ["molifang"]);
+
+        let group = active_auto_group(&gateway, "gpt-6.2-astra").unwrap();
+        let weighted = GatewayGroup { id: "test-auto-member-weights".into(), mode: GroupMode::Weighted, ..group.clone() };
+        let weights: Vec<_> = (0..4).map(|_| ordered_members(&weighted, true)[0].model.clone()).collect();
+        assert_eq!(weights, ["third/gpt-6.2-astra", "third/gpt-6.2-astra", "third/gpt-6.2-astra", "nanlab/gpt-6.2-astra"]);
+        let manual = GatewayGroup { mode: GroupMode::Manual, pick: "molifang/gpt-6.2-astra".into(), ..group.clone() };
+        assert_eq!(ordered_members(&manual, false)[0].model, "third/gpt-6.2-astra");
+        let mut candidates = expand_group(&gateway, &gateway.bindings["codex"], &group, 0, &mut Vec::new(), false);
+        prefer_remembered(&mut candidates, &pair("molifang", "gpt-6.2-astra"));
+        assert_eq!(candidates.iter().map(|(relay, _)| relay.id.as_str()).collect::<Vec<_>>(), ["third", "nanlab"]);
+
+        gateway.providers[1].enabled = false;
+        gateway.providers[2].enabled = false;
+        assert!(resolve_plan(&gateway, &ToolId::Codex, "gpt-6.2-astra", None).is_err());
+        assert!(!codex_binding_models(&gateway, &gateway.bindings["codex"]).contains(&"gpt-6.2-astra".into()));
+        assert!(codex_pool_models(&gateway, &gateway.bindings["codex"]).contains(&"molifang/gpt-6.2-astra".into()));
+        gateway.providers[2].enabled = true;
+        gateway.providers.push(provider("newcomer", models));
+        assert_eq!(members(&gateway, "gpt-6.2-astra"), ["third", "newcomer"]);
     }
 
     #[test]

@@ -1,9 +1,12 @@
 /** 本地网关：让 Claude Code、Grok 经 Codex++ 使用统一的供应商池，支持多 Key 轮换与模型组。 */
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { closestCenter, DndContext, KeyboardSensor, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
+import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS as DndCSS } from "@dnd-kit/utilities";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { appConfirm } from "./app-dialog";
-import { AlertTriangle, Asterisk, Check, ChevronDown, ChevronRight, ChevronUp, Copy, Plus, RefreshCw, Search, Shuffle, Waypoints, X } from "lucide-react";
+import { AlertTriangle, Asterisk, Check, ChevronDown, ChevronRight, ChevronUp, Copy, GripVertical, Plus, RefreshCw, Search, Shuffle, Waypoints, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { t, tf } from "./i18n";
@@ -277,7 +280,7 @@ function RoutingView({ payload, busy, run }: { payload: GatewayPayload | null; b
     const next = { ...group, ...patch };
     void run(`auto:${group.id}`, "save_gateway_auto_group", {
       model: group.name,
-      settings: { mode: next.mode, sticky: next.sticky ?? "cache", hideMembers: next.hideMembers ?? false, pick: next.pick ?? "" },
+      settings: { mode: next.mode, sticky: next.sticky ?? "cache", hideMembers: next.hideMembers ?? false, pick: next.pick ?? "", preserveMembers: true, members: patch.members },
     }, t("保存自动组"), true);
   };
   const remove = async (group: GatewayGroupEntry) => {
@@ -413,8 +416,15 @@ function GroupCard({
   onReset?: () => void;
 }) {
   const manual = group.mode === "manual";
-  const picked = manual ? (group.members.find((member) => member.model.toLowerCase() === (group.pick ?? "").toLowerCase()) ?? group.members[0])?.model : "";
+  const enabledMembers = group.members.filter((member) => !member.disabled);
+  const picked = manual ? (enabledMembers.find((member) => member.model.toLowerCase() === (group.pick ?? "").toLowerCase()) ?? enabledMembers[0])?.model : "";
   const disabled = busy !== null;
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+  const editMember = (model: string, patch: Partial<GroupMember>) =>
+    onChange({ members: group.members.map((member) => member.model === model ? { ...member, ...patch } : member) });
   return (
     <section className="gw-card gw-route-group" data-auto={auto}>
       <header className="gw-route-group-head">
@@ -451,7 +461,7 @@ function GroupCard({
               <span title={t("打开后，组里的模型不再单独出现在 Agent 的模型列表里，只能通过这个组来选；直接写名字仍然能用。")}>{t("隐藏成员")}</span>
             </MenuItem>
             {onEdit ? <MenuItem disabled={disabled} onClick={onEdit}>{t("编辑")}</MenuItem> : null}
-            {onReset ? <MenuItem disabled={disabled} onClick={onReset}><span title={t("回到依次、缓存期内固定、不隐藏成员")}>{t("恢复默认")}</span></MenuItem> : null}
+            {onReset ? <MenuItem disabled={disabled} onClick={onReset}><span title={t("重置自动组的路由方式、成员顺序、权重和停用状态")}>{t("恢复默认")}</span></MenuItem> : null}
             {onDelete ? <MenuItem danger disabled={disabled} onClick={onDelete}>{t("删除")}</MenuItem> : null}
           </Menu>
         </div>
@@ -459,22 +469,39 @@ function GroupCard({
           <Switch label={tf("启用模型组 {0}", [group.name])} pending={disabled} on={auto ? !(group as AutoGroupEntry).hidden : !group.disabled} onToggle={onToggleEnabled} />
         </span>
       </header>
+      <DndContext
+        collisionDetection={closestCenter}
+        id={group.id}
+        onDragEnd={({ active, over }) => {
+          if (disabled || !auto || !over || active.id === over.id) return;
+          const from = group.members.findIndex((member) => member.model === active.id);
+          const to = group.members.findIndex((member) => member.model === over.id);
+          if (from >= 0 && to >= 0) onChange({ members: arrayMove(group.members, from, to) });
+        }}
+        sensors={sensors}
+      >
+      <SortableContext items={group.members.map((member) => member.model)} strategy={verticalListSortingStrategy}>
       <ol className="gw-route-members" data-manual={manual}>
         {group.members.map((member, index) => (
           <RouteMember
             disabled={disabled}
             index={index}
-            key={`${member.model}-${index}`}
+            key={member.model}
             manual={manual}
             member={member}
             mode={group.mode}
             onPick={() => onChange({ pick: member.model })}
+            onToggle={() => editMember(member.model, { disabled: !member.disabled })}
+            onWeight={auto ? (weight) => editMember(member.model, { weight }) : undefined}
+            sortable={auto && group.members.length > 1}
             payload={payload}
             picked={picked === member.model}
           />
         ))}
         {group.members.length === 0 ? <li className="gw-route-member-empty">{t("没有成员")}</li> : null}
       </ol>
+      </SortableContext>
+      </DndContext>
     </section>
   );
 }
@@ -489,6 +516,9 @@ function RouteMember({
   payload,
   disabled,
   onPick,
+  onToggle,
+  onWeight,
+  sortable,
 }: {
   member: GroupMember;
   index: number;
@@ -498,12 +528,18 @@ function RouteMember({
   payload: GatewayPayload | null;
   disabled: boolean;
   onPick: () => void;
+  onToggle: () => void;
+  onWeight?: (weight: number) => void;
+  sortable: boolean;
 }) {
   const target = memberTarget(payload, member.model);
   const view = modelDisplay(payload, member.model);
   const status = target ? dispatchStatus(payload, target.entry.id, target.model) : null;
   const speed = target ? speedOf(payload, target.entry.id, target.model) : null;
   const quota = target?.entry.quota ?? null;
+  const memberName = target ? `${maskAccountName(shortProviderName(target.entry.name))} · ${prettyModelName(target.model)}` : view.title;
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } =
+    useSortable({ id: member.model, disabled: disabled || !sortable });
   const body = (
     <>
       <span className="gw-route-member-mark">
@@ -514,20 +550,82 @@ function RouteMember({
         <strong>{target ? maskAccountName(shortProviderName(target.entry.name)) : view.title}</strong>
         <small>{target ? prettyModelName(target.model) : view.group ? view.sub : member.model}</small>
       </span>
-      {mode === "weighted" ? <span className="gw-route-member-weight">{tf("权重 {0}", [member.weight])}</span> : null}
+      {mode === "weighted" && !onWeight ? <span className="gw-route-member-weight">{tf("权重 {0}", [member.weight])}</span> : null}
       {status ? <span className="gw-route-member-status" data-state={status.state}><MemberStatusLabel status={status} /></span> : null}
       {quota ? <QuotaBadge quota={quota} /> : null}
       {speed !== null ? <small className="gw-route-member-speed" title={t("最近的平均首包耗时")}>{formatElapsed(speed)}</small> : null}
     </>
   );
   return (
-    <li className="gw-route-member" data-picked={picked} data-state={status?.state ?? "idle"}>
+    <li
+      className="gw-route-member"
+      data-dragging={isDragging}
+      data-picked={picked}
+      data-state={status?.state ?? "idle"}
+      data-disabled={member.disabled === true}
+      ref={setNodeRef}
+      style={{ transform: DndCSS.Transform.toString(transform), transition }}
+    >
+      {sortable ? (
+        <button
+          {...attributes}
+          {...listeners}
+          aria-label={tf("调整 {0} 的顺序", [memberName])}
+          className="gw-icon-button gw-route-member-grip"
+          disabled={disabled}
+          ref={setActivatorNodeRef}
+          title={t("拖动排序，或按空格和方向键")}
+          type="button"
+        ><GripVertical className="h-4 w-4" /></button>
+      ) : null}
       {manual ? (
-        <button className="gw-route-member-row" disabled={disabled || picked} onClick={onPick} title={picked ? t("正在用这一个") : t("改成只用这一个")} type="button">{body}</button>
+        <button className="gw-route-member-row" disabled={disabled || picked || member.disabled} onClick={onPick} title={picked ? t("正在用这一个") : t("改成只用这一个")} type="button">{body}</button>
       ) : (
         <div className="gw-route-member-row">{body}</div>
       )}
+      <div className="gw-route-member-actions">
+        {onWeight ? <RouteWeight disabled={disabled} key={member.weight} memberName={memberName} onSave={onWeight} weight={member.weight} /> : null}
+        <span title={t("只控制该成员是否参与本组路由")}>
+          <Switch disabled={disabled} label={tf("启用组内成员 {0}", [memberName])} on={!member.disabled} onToggle={onToggle} />
+        </span>
+      </div>
     </li>
+  );
+}
+
+function RouteWeight({ disabled, memberName, onSave, weight }: {
+  disabled: boolean;
+  memberName: string;
+  onSave: (weight: number) => void;
+  weight: number;
+}) {
+  const [draft, setDraft] = useState(String(weight));
+  const next = parseWeight(draft);
+  const changed = draft !== String(weight);
+  return (
+    <form className="gw-inline-field gw-route-weight" onSubmit={(event) => {
+      event.preventDefault();
+      if (disabled || next === null) return;
+      setDraft(String(next));
+      if (next !== weight) onSave(next);
+    }}>
+      <span>{t("权重")}</span>
+      <input
+        aria-label={tf("{0} 的权重", [memberName])}
+        className="gw-inline-input gw-weight-input"
+        disabled={disabled}
+        inputMode="numeric"
+        onChange={(event) => setDraft(event.currentTarget.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") setDraft(String(weight));
+        }}
+        title={t("仅在按权重路由时生效")}
+        value={draft}
+      />
+      {changed ? (
+        <button aria-label={t("保存权重")} className="gw-icon-button" disabled={disabled || next === null} type="submit"><Check className="h-4 w-4" /></button>
+      ) : null}
+    </form>
   );
 }
 

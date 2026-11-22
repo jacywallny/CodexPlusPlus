@@ -3961,6 +3961,41 @@ body:has(.gw-modal-backdrop) .app-select-menu-portal {
   text-align: left;
 }
 
+.shell .gw-route-member {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 6px;
+}
+
+.shell .gw-route-member-row {
+  flex: 1;
+  min-width: 0;
+}
+
+.shell .gw-route-member-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-inline-end: 6px;
+}
+
+.shell .gw-route-member[data-disabled="true"] .gw-route-member-row {
+  opacity: 0.5;
+}
+
+.shell .gw-route-member-grip {
+  cursor: grab;
+  flex: none;
+  touch-action: none;
+}
+
+.shell .gw-route-member[data-dragging="true"] {
+  position: relative;
+  z-index: 1;
+  background: var(--gw-surface, var(--background));
+}
+
 .shell button.gw-route-member-row {
   cursor: pointer;
 }

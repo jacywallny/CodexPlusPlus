@@ -385,6 +385,8 @@ pub struct GroupMember {
     pub model: String,
     #[serde(default = "default_weight")]
     pub weight: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disabled: bool,
 }
 
 fn default_weight() -> u32 {
@@ -428,7 +430,7 @@ impl GatewayGroup {
     }
 }
 
-/// 自动组上用户改过的设置。成员不存：总是池里提供这个模型的那几家，按池顺序。
+/// 自动组上用户改过的设置，实际成员仍从供应商池生成。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoGroupSettings {
@@ -443,6 +445,8 @@ pub struct AutoGroupSettings {
     pub hide_members: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pick: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<GroupMember>,
     /// 不认识的字段原样保留。
     #[serde(flatten)]
     pub extra: Map<String, Value>,

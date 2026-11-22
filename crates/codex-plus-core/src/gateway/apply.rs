@@ -3300,6 +3300,7 @@ pub fn import_codex_aggregate(
         members.push(GroupMember {
             model: format!("{provider_id}/{model}"),
             weight: member.weight.max(1),
+            disabled: false,
         });
     }
     if !aggregate.routes.is_empty() {
@@ -4400,6 +4401,7 @@ fn save_group_in(gateway: &mut GatewaySettings, input: &GroupInput) -> anyhow::R
             members.push(GroupMember {
                 model: model.to_string(),
                 weight: member.weight.max(1),
+                disabled: member.disabled,
             });
         }
     }
@@ -4447,7 +4449,7 @@ pub fn save_auto_group(
     settings: AutoGroupSettings,
 ) -> anyhow::Result<GatewaySettings> {
     let hidden = settings.hidden;
-    save_auto_group_with_hidden(store, model, settings, Some(hidden))
+    save_auto_group_with_hidden(store, model, settings, Some(hidden), false)
 }
 
 /// `hidden` 省略时保留当前状态，避免其它窗口的设置修改覆盖开关。
@@ -4456,6 +4458,7 @@ pub fn save_auto_group_with_hidden(
     model: &str,
     settings: AutoGroupSettings,
     hidden: Option<bool>,
+    preserve_members: bool,
 ) -> anyhow::Result<GatewaySettings> {
     let key = model.trim().to_ascii_lowercase();
     if key.is_empty() {
@@ -4463,9 +4466,24 @@ pub fn save_auto_group_with_hidden(
     }
     let (gateway, _) = store.update(|gateway| {
         let mut settings = settings;
-        settings.hidden = hidden.unwrap_or_else(|| {
-            gateway.auto_groups.get(&key).is_some_and(|current| current.hidden)
-        });
+        let current = gateway.auto_groups.get(&key);
+        settings.hidden = hidden.unwrap_or_else(|| current.is_some_and(|entry| entry.hidden));
+        if preserve_members {
+            let mut seen = std::collections::HashSet::new();
+            settings.members.retain_mut(|member| {
+                member.model = member.model.trim().to_string();
+                member.weight = member.weight.max(1);
+                !member.model.is_empty() && seen.insert(member.model.to_ascii_lowercase())
+            });
+            if let Some(current) = current {
+                settings.members.extend(
+                    current.members.iter()
+                        .filter(|member| !seen.contains(&member.model.to_ascii_lowercase()))
+                        .cloned(),
+                );
+                settings.extra = current.extra.clone();
+            }
+        }
         settings.pick = settings.pick.trim().to_string();
         if settings == AutoGroupSettings::default() {
             gateway.auto_groups.remove(&key);
@@ -4615,6 +4633,7 @@ mod tests {
             members: vec![GroupMember {
                 model: "provider/new-model".into(),
                 weight: 3,
+                disabled: false,
             }],
             hide_members: true,
             pick: "provider/new-model".into(),
@@ -4977,6 +4996,7 @@ mod tests {
                     .map(|model| GroupMember {
                         model: model.to_string(),
                         weight: 1,
+                        disabled: false,
                     })
                     .collect(),
                 ..GroupInput::default()
@@ -5028,6 +5048,7 @@ mod tests {
                     .map(|model| GroupMember {
                         model: model.to_string(),
                         weight: 1,
+                        disabled: false,
                     })
                     .collect(),
                 ..GroupInput::default()

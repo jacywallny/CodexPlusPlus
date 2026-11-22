@@ -152,10 +152,12 @@ fn gateway() -> GatewaySettings {
                 GroupMember {
                     model: "inherit-a/gpt-6.1-sol".into(),
                     weight: 1,
+                    disabled: false,
                 },
                 GroupMember {
                     model: "inherit-b/gpt-6.1-terra".into(),
                     weight: 1,
+                    disabled: false,
                 },
             ],
             pick: "inherit-b/gpt-6.1-terra".into(),
@@ -374,6 +376,7 @@ fn child_inherits_a_routable_hidden_default_model() {
     gateway.groups[0].members.push(GroupMember {
         model: "gpt-6.1-sol".into(),
         weight: 1,
+        disabled: false,
     });
     let binding = gateway.binding(&ToolId::Codex).unwrap();
     assert!(!route::pool_models(&gateway, binding).contains(&"gpt-6.1-sol".to_string()));

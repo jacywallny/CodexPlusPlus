@@ -1323,6 +1323,8 @@ pub struct AutoGroupInput {
     settings: codex_plus_core::gateway::store::AutoGroupSettings,
     #[serde(default)]
     hidden: Option<bool>,
+    #[serde(default)]
+    preserve_members: bool,
 }
 
 #[tauri::command]
@@ -1338,6 +1340,7 @@ pub fn save_gateway_auto_group(
             &model,
             settings.settings,
             settings.hidden,
+            settings.preserve_members,
         )),
     )
 }

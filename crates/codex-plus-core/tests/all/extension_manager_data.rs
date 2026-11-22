@@ -34,6 +34,7 @@ fn gateway() -> GatewaySettings {
         members: vec![GroupMember {
             model: "provider/model".into(),
             weight: 1,
+            disabled: false,
         }],
         ..GatewayGroup::default()
     };

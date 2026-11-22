@@ -1665,6 +1665,7 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
             members: vec![GroupMember {
                 model: "claude-opus-5-5".into(),
                 weight: 1,
+                disabled: false,
             }],
             ..GroupInput::default()
         },
@@ -1751,6 +1752,7 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
             members: vec![GroupMember {
                 model: "claude-opus-5-5".into(),
                 weight: 1,
+                disabled: false,
             }],
             ..GroupInput::default()
         },
@@ -1867,6 +1869,7 @@ fn codex_group_offers_fast_only_when_every_member_supports_it() {
     let member = |model: &str| GroupMember {
         model: model.into(),
         weight: 1,
+        disabled: false,
     };
     for (name, members) in [
         ("Fasty", vec![member("gpt-x")]),
@@ -2866,10 +2869,12 @@ fn providers_live_only_in_the_gateway_store() {
                 GroupMember {
                     model: "deepseek-2/deepseek-v4-pro".into(),
                     weight: 1,
+                    disabled: false,
                 },
                 GroupMember {
                     model: "deepseek/deepseek-v4-flash".into(),
                     weight: 1,
+                    disabled: false,
                 },
             ],
             ..GroupInput::default()
@@ -2920,6 +2925,7 @@ fn groups_are_saved_validated_and_unlinked_on_delete() {
     let member = |model: &str| GroupMember {
         model: model.into(),
         weight: 0,
+        disabled: false,
     };
     assert!(
         save_group(
@@ -2979,7 +2985,7 @@ fn group_switch_persists_and_refreshes_agent_model_catalogs() {
 
     let mut input = GroupInput {
         name: "Daily".into(),
-        members: vec![GroupMember { model: "deepseek-v4-pro".into(), weight: 1 }],
+        members: vec![GroupMember { model: "deepseek-v4-pro".into(), weight: 1, disabled: false }],
         ..GroupInput::default()
     };
     let (_, id) = save_group(store, &input).unwrap();
@@ -3038,7 +3044,7 @@ fn disabled_group_refreshes_live_agent_configs_and_goal_catalog() {
     ctx.settings.save(&settings).unwrap();
     let mut group = GroupInput {
         name: "Daily".into(),
-        members: vec![GroupMember { model: "deepseek-v4-flash".into(), weight: 1 }],
+        members: vec![GroupMember { model: "deepseek-v4-flash".into(), weight: 1, disabled: false }],
         ..GroupInput::default()
     };
     let (_, id) = save_group(&ctx.gateway, &group).unwrap();
@@ -3105,7 +3111,7 @@ fn empty_binding_keeps_qualified_provider_model_when_its_namesake_group_is_disab
     let qualified = format!("{provider_id}/group/fast");
     let mut group = GroupInput {
         name: "Fast".into(),
-        members: vec![GroupMember { model: qualified.clone(), weight: 1 }],
+        members: vec![GroupMember { model: qualified.clone(), weight: 1, disabled: false }],
         ..GroupInput::default()
     };
     let (_, id) = save_group(&ctx.gateway, &group).unwrap();
@@ -3226,6 +3232,7 @@ fn pool_changes_follow_into_grok_model_list() {
             members: vec![GroupMember {
                 model: "kimi-k3".into(),
                 weight: 1,
+                disabled: false,
             }],
             ..GroupInput::default()
         },
@@ -3394,12 +3401,40 @@ fn auto_group_settings_save_and_reset_to_default() {
     // 改回默认：记录删掉，自动组回到「没改过」、跟着池子变。
     let gateway = save_auto_group(store, "deepseek-v4-pro", AutoGroupSettings::default()).unwrap();
     assert!(gateway.auto_groups.is_empty());
-    let gateway = save_auto_group_with_hidden(store, "deepseek-v4-pro", AutoGroupSettings::default(), Some(true)).unwrap();
+    let gateway = save_auto_group_with_hidden(store, "deepseek-v4-pro", AutoGroupSettings::default(), Some(true), false).unwrap();
     assert!(gateway.auto_groups["deepseek-v4-pro"].hidden);
-    let gateway = save_auto_group_with_hidden(store, "deepseek-v4-pro", AutoGroupSettings::default(), None).unwrap();
+    let gateway = save_auto_group_with_hidden(store, "deepseek-v4-pro", AutoGroupSettings::default(), None, false).unwrap();
     assert!(gateway.auto_groups["deepseek-v4-pro"].hidden, "恢复默认不改另一窗口的开关");
-    let gateway = save_auto_group_with_hidden(store, "deepseek-v4-pro", AutoGroupSettings::default(), Some(false)).unwrap();
+    let gateway = save_auto_group_with_hidden(store, "deepseek-v4-pro", AutoGroupSettings::default(), Some(false), false).unwrap();
     assert!(gateway.auto_groups.is_empty());
+}
+
+#[test]
+fn auto_group_member_edits_persist_and_keep_temporarily_missing_overrides() {
+    use codex_plus_core::gateway::apply::{save_auto_group_with_hidden, set_auto_group_enabled};
+    use codex_plus_core::gateway::store::AutoGroupSettings;
+    let fixture = fixture(57396);
+    let store = &fixture.ctx.gateway;
+    let first = GroupMember { model: "a/gpt-6.2-astra".into(), weight: 3, disabled: false };
+    let disabled = GroupMember { model: "b/gpt-6.2-astra".into(), weight: 7, disabled: true };
+    save_auto_group_with_hidden(store, "GPT-6.2-Astra", AutoGroupSettings {
+        members: vec![disabled.clone(), first.clone()],
+        ..Default::default()
+    }, None, true).unwrap();
+    let before = store.load().unwrap();
+    assert_eq!(before.auto_groups["gpt-6.2-astra"].members, [disabled.clone(), first.clone()]);
+    let edit = GroupMember { weight: 8, ..first };
+    save_auto_group_with_hidden(store, "gpt-6.2-astra", AutoGroupSettings {
+        members: vec![edit.clone()],
+        mode: GroupMode::Weighted,
+        ..Default::default()
+    }, None, true).unwrap();
+    set_auto_group_enabled(store, "gpt-6.2-astra", false).unwrap();
+    let after = store.load().unwrap();
+    assert_eq!(after.auto_groups["gpt-6.2-astra"].members, [edit, disabled]);
+    assert!(after.auto_groups["gpt-6.2-astra"].hidden);
+    save_auto_group_with_hidden(store, "gpt-6.2-astra", AutoGroupSettings::default(), None, false).unwrap();
+    assert!(store.load().unwrap().auto_groups["gpt-6.2-astra"].members.is_empty());
 }
 
 /// 读 Codex 的模型目录：`config.toml` 里 `model_catalog_json` 指向的文件。按 TOML 解析取值：
@@ -3471,6 +3506,7 @@ fn gateway_catalog_includes_declared_models_with_provider_metadata() {
             members: vec![GroupMember {
                 model: format!("{id}/claude-opus-5-5"),
                 weight: 1,
+                disabled: false,
             }],
             ..GroupInput::default()
         },
@@ -3571,10 +3607,12 @@ fn gateway_declared_fallback_keeps_member_search_tool_restrictions() {
                 GroupMember {
                     model: format!("{first}/deepseek-v4-pro"),
                     weight: 1,
+                    disabled: false,
                 },
                 GroupMember {
                     model: format!("{second}/kimi-k3"),
                     weight: 1,
+                    disabled: false,
                 },
             ],
             ..GroupInput::default()
@@ -3650,8 +3688,8 @@ fn gateway_declared_fallback_keeps_model_capability_restrictions() {
         &GroupInput {
             name: "Fallback".into(),
             members: vec![
-                GroupMember { model: format!("{first}/deepseek-v4-pro"), weight: 1 },
-                GroupMember { model: format!("{second}/other-model"), weight: 1 },
+                GroupMember { model: format!("{first}/deepseek-v4-pro"), weight: 1, disabled: false },
+                GroupMember { model: format!("{second}/other-model"), weight: 1, disabled: false },
             ],
             ..GroupInput::default()
         },
@@ -3739,8 +3777,8 @@ fn gateway_catalog_forwards_declared_image_input_capability() {
         &GroupInput {
             name: "Mixed".into(),
             members: vec![
-                GroupMember { model: format!("{ark}/ark-vision"), weight: 1 },
-                GroupMember { model: format!("{ark}/ark-text"), weight: 1 },
+                GroupMember { model: format!("{ark}/ark-vision"), weight: 1, disabled: false },
+                GroupMember { model: format!("{ark}/ark-text"), weight: 1, disabled: false },
             ],
             ..GroupInput::default()
         },
@@ -3829,8 +3867,8 @@ fn gateway_catalog_opens_image_input_for_groups_with_image_model() {
     )
     .unwrap();
     let text_members = vec![
-        GroupMember { model: format!("{ark}/ark-text"), weight: 1 },
-        GroupMember { model: format!("{ark}/ark-text-2"), weight: 1 },
+        GroupMember { model: format!("{ark}/ark-text"), weight: 1, disabled: false },
+        GroupMember { model: format!("{ark}/ark-text-2"), weight: 1, disabled: false },
     ];
     let (_, plain) = save_group(
         &ctx.gateway,
@@ -3943,7 +3981,7 @@ fn gateway_catalog_opens_image_input_for_groups_with_image_model() {
         &GroupInput {
             id: visual.clone(),
             name: "Visual".into(),
-            members: vec![GroupMember { model: "deepseek-v4-pro".into(), weight: 1 }],
+            members: vec![GroupMember { model: "deepseek-v4-pro".into(), weight: 1, disabled: false }],
             image_input_model: Some(format!("{ark}/ark-vision")),
             ..GroupInput::default()
         },
@@ -4061,7 +4099,7 @@ fn gateway_catalog_recognizes_uppercase_group_prefix() {
         &ctx.gateway,
         &GroupInput {
             name: "Daily".into(),
-            members: vec![GroupMember { model: "kimi-k3".into(), weight: 1 }],
+            members: vec![GroupMember { model: "kimi-k3".into(), weight: 1, disabled: false }],
             ..GroupInput::default()
         },
     )
@@ -4168,6 +4206,7 @@ fn gateway_catalog_refresh_follows_model_sync_and_pool_changes() {
             members: vec![GroupMember {
                 model: format!("{second}/synced-*"),
                 weight: 1,
+                disabled: false,
             }],
             ..GroupInput::default()
         },
@@ -4190,6 +4229,7 @@ fn gateway_catalog_refresh_follows_model_sync_and_pool_changes() {
             members: vec![GroupMember {
                 model: format!("{first}/deepseek-v4-flash"),
                 weight: 1,
+                disabled: false,
             }],
             ..GroupInput::default()
         },
@@ -4264,6 +4304,7 @@ fn codex_gateway_directory_snapshot_matches_published_catalog_without_connection
             members: vec![GroupMember {
                 model: format!("{provider_id}/new-model"),
                 weight: 1,
+                disabled: false,
             }],
             ..GroupInput::default()
         },
@@ -4346,6 +4387,7 @@ fn gateway_catalog_refresh_keeps_provider_models_when_group_hides_shared_member(
             members: vec![GroupMember {
                 model: "deepseek-v4-pro".into(),
                 weight: 1,
+                disabled: false,
             }],
             hide_members: true,
             ..GroupInput::default()
@@ -4371,6 +4413,7 @@ fn gateway_catalog_refresh_keeps_provider_models_when_group_hides_shared_member(
             members: vec![GroupMember {
                 model: "deepseek-v4-pro".into(),
                 weight: 1,
+                disabled: false,
             }],
             hide_members: false,
             ..GroupInput::default()

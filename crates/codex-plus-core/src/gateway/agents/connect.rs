@@ -289,6 +289,7 @@ mod tests {
                             members: vec![GroupMember {
                                 model: "gpt-6.1-sol".to_string(),
                                 weight: 1,
+                                disabled: false,
                             }],
                             ..GroupInput::default()
                         },
