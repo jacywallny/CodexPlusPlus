@@ -14302,7 +14302,7 @@ ${key} = ${value}`]);
     if (!trimmed) return null;
     const value = Number(trimmed);
     if (!Number.isFinite(value)) return null;
-    return Math.max(1, Math.floor(value));
+    return Math.min(4294967295, Math.max(1, Math.floor(value)));
   }
   var MIN_GATEWAY_PORT = 1024;
   var MAX_GATEWAY_PORT = 65535;
