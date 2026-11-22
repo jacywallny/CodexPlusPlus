@@ -14,6 +14,7 @@ use crate::gateway::anthropic_inbound;
 use crate::gateway::http_wait::{self, HTTP_ATTEMPT, HeaderWaitError, HttpAttempt};
 use crate::gateway::key_pool::{self, FailureClass, KeyLimitState, KeySlot};
 use crate::gateway::route::{GatewayCandidate, RoutePlan};
+use crate::gateway::stream_health::{self, End as StreamEnd};
 use crate::protocol_proxy::{ForcedRelay, ProxySessionHeaders, UpstreamProxyResponse};
 use crate::request_log::RequestTrace;
 use crate::settings::{BackendSettings, RelayProtocol};
@@ -152,6 +153,11 @@ async fn open_candidates(
             .is_none())
     .then(|| http_wait::route_deadline(settings));
     let conversation_seed = conversation_seed(&request);
+    let health_routing = settings.gateway_stream_health_routing_enabled
+        && plan.group_id.as_deref().is_some_and(|id| id.starts_with(super::route::AUTO_GROUP_PREFIX))
+        && !depends_on_upstream_response(&request.responses_body)
+        && !crate::extension_gateway::builtin_replaced("builtin:key-breaker")
+        && !crate::extension_gateway::builtin_replaced("builtin:gateway-failover");
     let mut pending = fit_first(&plan.candidates, estimate_tokens(&request));
     // 拓展网关中间件的 route 段：按拓展给的顺序重排 / 筛选候选（供应商 + Key）；gateway.replaces 关掉
     // builtin:gateway-failover 时只试第一个，失败直接回错误，不再换下一个。
@@ -216,6 +222,9 @@ async fn open_candidates(
         }
     }
     let mut last_error: Option<anyhow::Error> = None;
+    let mut last_stream_failure = None;
+    let mut stream_cooling: Option<Duration> = None;
+    let mut health_skipped = Vec::new();
     // 主动限速：第一次因为候选都满了而排队的时刻，和累计排了多久。
     let mut queue_started: Option<Instant> = None;
     let mut dispatch_gate = crate::gateway::quota::DispatchGate::default();
@@ -263,6 +272,33 @@ async fn open_candidates(
                 slot: Some(slot),
                 refund: crate::responses_websocket::active(),
             };
+            let mut stream_attempt = if header_deadline.is_some()
+                && candidate.relay.protocol == RelayProtocol::Responses
+            {
+                match stream_health::Attempt::acquire(
+                    candidate, request.live_request_id, trace.attempts + 1, health_routing,
+                ) {
+                    Ok(attempt) => Some(attempt),
+                    Err(wait) => {
+                        slot.cancel();
+                        stream_cooling = Some(stream_cooling.map_or(wait, |current| current.min(wait)));
+                        health_skipped.push(candidate.relay.id.as_str());
+                        recorder.step(candidate, "cooling", Some("stream_health"), None);
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "gateway.http_stream_candidate_skipped",
+                            serde_json::json!({
+                                "requestId": request.live_request_id,
+                                "relayId": candidate.relay.id,
+                                "model": candidate.upstream_model,
+                                "retryInMs": wait.as_millis() as u64,
+                            }),
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             let has_more = index + 1 < total || !deferred.is_empty();
             trace.attempts += 1;
             trace.relay_id = candidate.relay.id.clone();
@@ -307,6 +343,11 @@ async fn open_candidates(
             let candidate = &prepared;
             let busy = recorder.begin(candidate);
             let started = Instant::now();
+            last_stream_failure = None;
+            let forward_native_stream = stream_attempt.is_some()
+                && (health_routing
+                    || settings.gateway_stream_first_output_timeout_secs.is_some_and(|timeout| timeout > 0)
+                    || settings.gateway_stream_body_idle_timeout_secs.is_some_and(|timeout| timeout > 0));
             // Anthropic → Anthropic 原生直通不经过拓展的 upstream 段：拓展关掉了 builtin:auth-headers 时
             // 改走协议代理链路，鉴权头才由拓展给。
             let native = request
@@ -334,6 +375,7 @@ async fn open_candidates(
                                     request.live_request_id,
                                     trace.attempts,
                                     queued,
+                                    forward_native_stream,
                                 ),
                                 dispatched,
                             )
@@ -347,7 +389,8 @@ async fn open_candidates(
                     // 限速临时顶替不改原会话粘性；WS 将同一规则保留到响应终态。
                     let same_relay_skipped = deferred
                         .iter()
-                        .any(|skipped| skipped.relay.id == candidate.relay.id);
+                        .any(|skipped| skipped.relay.id == candidate.relay.id)
+                        || health_skipped.contains(&candidate.relay.id.as_str());
                     let conversation = if same_relay_skipped {
                         None
                     } else {
@@ -372,16 +415,31 @@ async fn open_candidates(
                         });
                     }
                     recorder.step(candidate, "answered", None, upstream.status_code());
+                    let remember_route = deferred.is_empty() && health_skipped.is_empty();
                     // 排在它前面的候选因为限速满了被跳过：这次只是临时顶替，不改会话固定
                     // （同一家的 Key 粘性、模型组记住的成员都保持原样）。
-                    key_pool::record_success(&candidate.key, conversation);
-                    crate::gateway::speed::record(
-                        &candidate.relay.id,
-                        &candidate.upstream_model,
-                        started.elapsed(),
-                    );
-                    if deferred.is_empty() {
-                        crate::gateway::route::remember_answer(plan, candidate);
+                    if let GatewayUpstream::Pipeline(response) = &mut upstream
+                        && response.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses
+                        && response.is_stream
+                        && !response.exec_adapted
+                        && !response.compaction
+                        && !response.native_compaction_passthrough
+                        && let Some(body) = response.response.as_mut()
+                        && let Some(attempt) = stream_attempt.take()
+                    {
+                        attempt.headers(body, settings, stream_health::Completion {
+                            plan: remember_route.then(|| plan.clone()),
+                            candidate: candidate.clone(),
+                            key_conversation: conversation.map(str::to_owned),
+                        });
+                    } else {
+                        key_pool::record_success(&candidate.key, conversation);
+                        crate::gateway::speed::record(
+                            &candidate.relay.id, &candidate.upstream_model, started.elapsed(),
+                        );
+                        if remember_route {
+                            crate::gateway::route::remember_answer(plan, candidate);
+                        }
                     }
                     observe_quota(&candidate.relay, &upstream);
                     if let GatewayUpstream::Pipeline(response) = &upstream
@@ -417,7 +475,20 @@ async fn open_candidates(
                         Some(class.label()),
                         upstream.status_code(),
                     );
-                    let failover = record_key_failure(&candidate.key, &class);
+                    let scoped_health = health_routing && stream_attempt.is_some();
+                    if let Some(attempt) = stream_attempt.take() {
+                        let end = if matches!(&class, FailureClass::ServerError) {
+                            StreamEnd::HttpUnavailable
+                        } else {
+                            StreamEnd::UpstreamTerminalError
+                        };
+                        attempt.finish_before_body(end, upstream.status_code());
+                    }
+                    let failover = if scoped_health && matches!(&class, FailureClass::ServerError) {
+                        class.should_failover()
+                    } else {
+                        record_key_failure(&candidate.key, &class)
+                    };
                     // 失败也算「试过了」：速度优先的组不再把它当没测过的排第一。
                     crate::gateway::speed::record_failure(
                         &candidate.relay.id,
@@ -432,16 +503,37 @@ async fn open_candidates(
                             slot: None,
                         });
                     }
+                    if health_routing {
+                        last_stream_failure = Some(upstream);
+                    }
                     None
                 }
                 Err(AttemptError::Fatal(error)) => return Err(error),
                 Err(AttemptError::Transport(error)) => {
+                    let scoped_health = health_routing && stream_attempt.is_some();
                     let wait_error = error.downcast_ref::<HeaderWaitError>();
+                    let connect_error = error.downcast_ref::<reqwest::Error>()
+                        .is_some_and(reqwest::Error::is_connect);
+                    let end = match wait_error {
+                        Some(HeaderWaitError::Timeout { scope, .. })
+                            if *scope == http_wait::ROUTE_BUDGET_SCOPE => Some(StreamEnd::RouteHeaderTimeout),
+                        Some(HeaderWaitError::Timeout { .. }) => Some(StreamEnd::HeaderTimeout),
+                        Some(HeaderWaitError::Disconnected { .. }) => Some(StreamEnd::HeaderDisconnect),
+                        None if connect_error => Some(StreamEnd::ConnectError),
+                        _ => None,
+                    };
                     let reason = wait_error.map_or("server_error", HeaderWaitError::code);
                     recorder.step(candidate, "transport", Some(reason), None);
+                    if let (Some(attempt), Some(end)) = (stream_attempt.take(), end) {
+                        attempt.finish_before_body(end, None);
+                    }
                     if !matches!(wait_error, Some(HeaderWaitError::BudgetExhausted { .. } | HeaderWaitError::Redirect { .. })) {
-                        record_key_failure(&candidate.key, &FailureClass::ServerError);
-                        crate::gateway::speed::record_failure(&candidate.relay.id, &candidate.upstream_model);
+                        if !(scoped_health && (wait_error.is_some() || connect_error)) {
+                            record_key_failure(&candidate.key, &FailureClass::ServerError);
+                        }
+                        if !scoped_health || end != Some(StreamEnd::RouteHeaderTimeout) {
+                            crate::gateway::speed::record_failure(&candidate.relay.id, &candidate.upstream_model);
+                        }
                     }
                     log_attempt_failure(
                         request.live_request_id,
@@ -502,6 +594,18 @@ async fn open_candidates(
         }
         queued += now.elapsed();
         pending = deferred;
+    }
+    if let Some(upstream) = last_stream_failure {
+        return Ok(GatewayOutcome { upstream, trace, busy: None, slot: None });
+    }
+    if trace.attempts == 0 && last_error.is_none() && let Some(wait) = stream_cooling {
+        recorder.cooling(wait.as_millis() as u64);
+        return Ok(GatewayOutcome {
+            upstream: GatewayUpstream::Cooling(wait),
+            trace,
+            busy: None,
+            slot: None,
+        });
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("网关的所有上游都失败了")))
 }
@@ -673,6 +777,13 @@ fn estimate_tokens(request: &GatewayRequest<'_>) -> u64 {
     estimate_body_tokens(body)
 }
 
+fn depends_on_upstream_response(body: &Value) -> bool {
+    body.get("previous_response_id").is_some_and(|value| !value.is_null())
+        || body.get("input").and_then(Value::as_array).is_some_and(|items| {
+            items.iter().any(|item| item["type"].as_str() == Some("item_reference"))
+        })
+}
+
 /// 同 [`estimate_tokens`]，直接按一个请求体估。
 pub(crate) fn estimate_body_tokens(body: &Value) -> u64 {
     text_bytes(body) / 4
@@ -816,11 +927,10 @@ async fn attempt_pipeline(
     let pre_output_failover = allow_stream_failover
         && chatgpt
         && !crate::responses_websocket::active()
-        && request.responses_body.get("previous_response_id").is_none_or(Value::is_null)
+        && !depends_on_upstream_response(&request.responses_body)
         && request.responses_body.get("input").is_some_and(|input| {
-            input.as_array().is_some_and(|items| !items.is_empty() && !items.iter().any(|item| {
-                item.get("type").and_then(Value::as_str) == Some("item_reference")
-            })) || input.as_str().is_some_and(|text| !text.is_empty())
+            input.as_array().is_some_and(|items| !items.is_empty())
+                || input.as_str().is_some_and(|text| !text.is_empty())
         });
     if let Some(priority) = candidate.auto_priority {
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -1119,6 +1229,16 @@ mod window_tests {
     use super::*;
     use crate::gateway::key_pool::KeyRef;
     use serde_json::json;
+
+    #[test]
+    fn provider_bound_continuations_are_not_eligible_for_health_rerouting() {
+        assert!(depends_on_upstream_response(&json!({"previous_response_id": "resp_fixture"})));
+        assert!(depends_on_upstream_response(&json!({"input": [{"type": "item_reference", "id": "fixture"}]})));
+        assert!(!depends_on_upstream_response(&json!({
+            "previous_response_id": null,
+            "input": [{"type": "function_call_output", "call_id": "fixture", "output": "complete"}],
+        })));
+    }
 
     fn candidate(id: &str, window: Option<u64>) -> GatewayCandidate {
         GatewayCandidate {

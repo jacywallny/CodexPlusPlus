@@ -1130,6 +1130,12 @@ pub struct BackendSettings {
     pub gateway_provider_stream_header_timeout_secs: BTreeMap<String, u64>,
     #[serde(rename = "gatewayStreamHeaderBudgetSecs", default, skip_serializing_if = "Option::is_none")]
     pub gateway_stream_header_budget_secs: Option<u64>,
+    #[serde(rename = "gatewayStreamHealthRoutingEnabled", default)]
+    pub gateway_stream_health_routing_enabled: bool,
+    #[serde(rename = "gatewayStreamFirstOutputTimeoutSecs", default, skip_serializing_if = "Option::is_none")]
+    pub gateway_stream_first_output_timeout_secs: Option<u64>,
+    #[serde(rename = "gatewayStreamBodyIdleTimeoutSecs", default, skip_serializing_if = "Option::is_none")]
+    pub gateway_stream_body_idle_timeout_secs: Option<u64>,
     /// 当前 Codex 原生 auth 的显式选择；None 表示旧版本未设置，Some(None) 表示明确不登录。
     #[serde(rename = "nativeAuthSelection", default)]
     pub native_auth_selection: Option<NativeAuthSelection>,
@@ -1565,6 +1571,9 @@ impl Default for BackendSettings {
             upstream_stream_header_timeout_secs: None,
             gateway_provider_stream_header_timeout_secs: BTreeMap::new(),
             gateway_stream_header_budget_secs: None,
+            gateway_stream_health_routing_enabled: false,
+            gateway_stream_first_output_timeout_secs: None,
+            gateway_stream_body_idle_timeout_secs: None,
             native_auth_selection: None,
             provider_sync_saved_providers: Vec::new(),
             provider_sync_manual_providers: Vec::new(),

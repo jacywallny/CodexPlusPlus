@@ -58,6 +58,7 @@ pub mod route;
 pub mod server;
 pub mod sessions;
 pub mod speed;
+pub(crate) mod stream_health;
 pub mod store;
 mod subagent_models;
 pub mod subscriptions;

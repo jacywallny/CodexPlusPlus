@@ -9,6 +9,7 @@ use tokio::time::Instant;
 use crate::settings::{BackendSettings, RelayProfile};
 
 const DEFAULT_ROUTE_SECS: u64 = 240;
+pub(super) const ROUTE_BUDGET_SCOPE: &str = "请求总预算";
 
 pub(super) fn route_deadline(settings: &BackendSettings) -> Instant {
     let inherited = crate::protocol_proxy::configured_stream_header_timeout(
@@ -63,6 +64,7 @@ pub(crate) struct HttpAttempt {
     budget_scope: &'static str,
     queued: Duration,
     sends: Cell<u32>,
+    forward_native_stream: bool,
 }
 
 tokio::task_local! {
@@ -78,6 +80,7 @@ impl HttpAttempt {
         request_id: Option<&str>,
         candidate: u32,
         queued: Duration,
+        forward_native_stream: bool,
     ) -> Self {
         let configured = settings
             .gateway_provider_stream_header_timeout_secs
@@ -97,17 +100,22 @@ impl HttpAttempt {
             model: RefCell::new(model.to_owned()),
             deadline: route_deadline.min(provider_deadline),
             budget_scope: if route_deadline <= provider_deadline {
-                "请求总预算"
+                ROUTE_BUDGET_SCOPE
             } else {
                 "供应商预算"
             },
             queued,
             sends: Cell::new(0),
+            forward_native_stream,
         }
     }
 
     pub(crate) fn deadline(&self) -> Instant {
         self.deadline
+    }
+
+    pub(crate) fn forward_native_stream(&self) -> bool {
+        self.forward_native_stream
     }
 
     pub(crate) fn bind_model(&self, model: &str) {
@@ -204,7 +212,7 @@ pub(super) fn route_budget_exhausted(
         }),
     );
     HeaderWaitError::BudgetExhausted {
-        scope: "请求总预算",
+        scope: ROUTE_BUDGET_SCOPE,
         sent: false,
     }
 }
@@ -216,8 +224,23 @@ pub(crate) struct HttpSend {
     started: Instant,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct HeadersReceived {
+    pub sent: std::time::Instant,
+    pub received: std::time::Instant,
+    pub attempt: u32,
+}
+
 impl HttpSend {
     pub(crate) fn elapsed_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
+    }
+
+    pub(crate) fn headers_received(&self) -> HeadersReceived {
+        HeadersReceived {
+            sent: self.started.into_std(),
+            received: Instant::now().into_std(),
+            attempt: self.attempt,
+        }
     }
 }

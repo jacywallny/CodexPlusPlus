@@ -5595,7 +5595,7 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
 async fn forward_protocol_proxy_stream_for_client_with_live_request<S: SseSink>(
     stream: &mut S,
     prefix: &[u8],
-    response: reqwest::Response,
+    mut response: reqwest::Response,
     wire_api: crate::protocol_proxy::UpstreamWireApi,
     request: Option<&Value>,
     thread_id: Option<&str>,
@@ -5610,15 +5610,41 @@ async fn forward_protocol_proxy_stream_for_client_with_live_request<S: SseSink>(
     Option<u64>,
 )> {
     *final_response_usage = None;
+    use crate::gateway::stream_health::{Body as StreamHealth, End};
+    let mut health = StreamHealth::take(&mut response);
     let mut chunks = response.bytes_stream();
     let mut first_output_at_ms = None;
     if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
         let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::for_request(request)
             .filling_message_phase(crate::protocol_proxy::message_phase_fill_enabled())
-            .stripping_backend_events(foreign_client);
+            .stripping_backend_events(foreign_client)
+            .protecting_gateway_replay(stop_codex_replay);
+        let mut observe = |bytes: &[u8],
+                           transformer: &crate::protocol_proxy::ResponsesSseTransformer,
+                           health: &mut Option<StreamHealth>| {
+            if let Some(health) = health {
+                let progress = transformer.has_model_output();
+                health.observe(!bytes.is_empty(), progress);
+                if progress {
+                    observe_protocol_proxy_output(bytes, &mut first_output_at_ms, live_request_id);
+                }
+                if transformer.has_failed() {
+                    health.finish(if transformer.is_upstream_overloaded() {
+                        End::UpstreamOverloaded
+                    } else {
+                        End::UpstreamTerminalError
+                    });
+                } else if transformer.has_completed() {
+                    health.finish(End::Completed);
+                }
+            } else {
+                observe_protocol_proxy_output(bytes, &mut first_output_at_ms, live_request_id);
+            }
+        };
         // 代理预读过的开头必须先原样补写，否则 Codex 会丢掉 response.created 等事件。
         if !prefix.is_empty() {
             let out = transformer.push_bytes(prefix);
+            observe(prefix, &transformer, &mut health);
             stream.send(&out).await?;
             if transformer.has_failed() {
                 let usage = transformer.take_usage();
@@ -5626,16 +5652,30 @@ async fn forward_protocol_proxy_stream_for_client_with_live_request<S: SseSink>(
                 return Ok((transformer.finish(), usage, detail, first_output_at_ms));
             }
         }
+        let mut interruption = None;
         while !stop_codex_replay || !transformer.has_completed() {
-            let Some(chunk) = chunks.next().await else {
+            let next = match health.as_ref().and_then(StreamHealth::deadline) {
+                Some((deadline, end)) => match tokio::time::timeout_at(deadline.into(), chunks.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        let reason = if end == End::FirstOutputTimeout {
+                            "上游在收到响应头后未按时返回模型输出"
+                        } else {
+                            "上游 SSE 响应体传输超时"
+                        };
+                        interruption = Some((end, reason.to_string()));
+                        break;
+                    }
+                },
+                None => chunks.next().await,
+            };
+            let Some(chunk) = next else {
                 break;
             };
             match chunk {
                 Ok(bytes) => {
-                    observe_protocol_proxy_output(
-                        &bytes, &mut first_output_at_ms, live_request_id,
-                    );
                     let out = transformer.push_bytes(&bytes);
+                    observe(&bytes, &transformer, &mut health);
                     stream.send(&out).await?;
                     // 超限等终态失败要立即结束流，不能等上游 EOF；
                     // 否则上游保持连接时失败迟迟不上报，残片也会继续被转发。
@@ -5646,36 +5686,32 @@ async fn forward_protocol_proxy_stream_for_client_with_live_request<S: SseSink>(
                     }
                 }
                 Err(error) => {
-                    // 断流时仍在暂存的消息原样补写，不丢事件。
-                    let pending = transformer.flush_pending();
-                    if !pending.is_empty() {
-                        stream.send(&pending).await?;
-                    }
-                    if stop_codex_replay && !transformer.has_completed() {
-                        stop_codex_stream_replay(stream, &transformer).await?;
-                    }
-                    let usage = transformer.take_usage();
-                    let detail = transformer.take_failure_detail();
-                    return Ok((
-                        Some(error.without_url().to_string()),
-                        usage,
-                        detail,
-                        first_output_at_ms,
-                    ));
+                    interruption = Some((End::StreamReadError, error.without_url().to_string()));
+                    break;
                 }
             }
+        }
+        if let Some(health) = health.as_mut() {
+            health.finish(interruption.as_ref().map_or(End::MissingTerminal, |(end, _)| *end));
         }
         let pending = transformer.flush_pending();
         if !pending.is_empty() {
             stream.send(&pending).await?;
         }
         if stop_codex_replay && !transformer.has_completed() {
-            stop_codex_stream_replay(stream, &transformer).await?;
+            let reason = interruption.as_ref().and_then(|(end, reason)| match end {
+                End::FirstOutputTimeout | End::BodyIdleTimeout => Some(reason.as_str()),
+                _ => None,
+            });
+            stop_codex_stream_replay(
+                stream, &transformer, reason,
+            ).await?;
         }
         let usage = transformer.take_usage();
         let detail = transformer.take_failure_detail();
         *final_response_usage = transformer.final_response_usage();
-        return Ok((transformer.finish(), usage, detail, first_output_at_ms));
+        let failure = interruption.map(|(_, reason)| reason).or_else(|| transformer.finish());
+        return Ok((failure, usage, detail, first_output_at_ms));
     }
     if wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
         // Anthropic SSE → chat SSE → Responses SSE，终端事件语义与 chat 上游一致。
@@ -5792,20 +5828,28 @@ async fn forward_protocol_proxy_stream_for_client_with_live_request<S: SseSink>(
 async fn stop_codex_stream_replay<S: SseSink>(
     sink: &mut S,
     transformer: &crate::protocol_proxy::ResponsesSseTransformer,
+    reason: Option<&str>,
 ) -> std::io::Result<()> {
     let mut frame = transformer.discard_unfinished_passthrough().to_vec();
+    let reason = reason.unwrap_or("上游响应流在完成前断开");
+    frame.extend(gateway_stream_stop_event(&format!(
+        "Codex++ 网关：{reason}。已停止重发，请先检查本轮输出和工具执行状态。"
+    )));
+    sink.send(&frame).await
+}
+
+pub(crate) fn gateway_stream_stop_event(message: &str) -> Vec<u8> {
     let failure = serde_json::json!({
         "type": "response.failed",
         "response": {
             "status": "failed",
             "error": {
                 "code": "invalid_prompt",
-                "message": "Codex++ 网关：上游响应流在完成前断开。已停止重发，请先检查本轮输出和工具执行状态。"
+                "message": message
             }
         }
     });
-    frame.extend_from_slice(format!("event: response.failed\ndata: {failure}\n\n").as_bytes());
-    sink.send(&frame).await
+    format!("event: response.failed\ndata: {failure}\n\n").into_bytes()
 }
 
 // 沿用普通转发的首字口径：第一段非空上游 body；HTTP 头和空块不算。

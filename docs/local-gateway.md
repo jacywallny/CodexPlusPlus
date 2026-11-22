@@ -90,17 +90,23 @@ Grok ─────────POST /gw/grok/v1/responses───┤  helper�
 ## Codex HTTP 流式响应头等待
 
 同一次请求的网关排队和候选切换共用响应头总预算。每个候选能等到自己的期限或请求总期限，以先到者为准。
-成功收到 HTTP 响应头后，SSE 的首个输出和后续传输沿用原来的超时规则。
+成功收到 HTTP 响应头后，SSE 进入独立的响应体阶段。
 
 `<状态目录>/settings.json` 支持两个可选项，单位均为秒。
 
 - `gatewayProviderStreamHeaderTimeoutSecs` 按网关供应商 ID 覆盖响应头等待。未指定的供应商沿用 `upstreamStreamHeaderTimeoutSecs`，默认 120 秒。
 - `gatewayStreamHeaderBudgetSecs` 限制一次请求用于取得响应头的总时间。默认取 240 秒和全局响应头等待设置中的较大值。
+- `gatewayStreamFirstOutputTimeoutSecs` 从收到响应头起计时，等待可解析的正文、推理、拒答或工具输出。可按需启用，默认关闭。
+- `gatewayStreamBodyIdleTimeoutSecs` 限制等待下一段 SSE 响应体的时间。心跳会保持传输活跃。可按需启用，默认关闭。
+- `gatewayStreamHealthRoutingEnabled` 为 `true` 时，Codex 原生 HTTP Responses 自动组按供应商和模型做健康调度。连续两次健康类失败后冷却 30 秒，随后允许一条符合路由条件的新请求探测，收到 `response.completed` 才恢复。客户端取消、普通业务错误和路由总预算耗尽为中性结果。显式供应商、自建组和依赖原上游响应 ID 或条目引用的请求沿用原有路由。
 
 响应头超时或发送后在响应头返回前断线时，上游执行结果未知。网关停止重发和切换，并用 Codex 识别为终止的 HTTP 400 返回 `gateway_error` 及专用错误码。上游重定向也终止请求，供应商地址需配置为 API 的最终地址。明确的限流或服务不可用响应等仍按原有规则处理。
 
 原生 Responses HTTP 流在完成前意外断开时，网关保留已交付的完整事件，并返回带明确信息的失败事件，阻止 Codex 自动重发。恢复工作前可先检查已经收到的输出和工具执行状态。供应商须提供可读取的原响应和事件游标，才能支持原流的断点续读。
 在 `codex-plus.log` 中可用 `requestId` 关联每次 `gateway.http_upstream_attempt`、候选失败记录和 `request-log.jsonl`，区分网关排队（`queueWaitMs`）、等待上游响应头、等待首个输出和流中断。排队耗尽总预算时记录 `gateway.http_header_budget_exhausted`，会注明等待阶段。
+每个原生 HTTP Responses 候选的 `gateway.http_stream_outcome` 记录状态、HTTP 协议版本、响应头、首字节、首个模型输出、有无探测名额和终态。启用健康调度时，「速度优先」用完整结束请求的首输出样本。
+启用健康调度或响应体计时的请求直接转发原生 SSE，流内过载会明确终止当前请求。原有 HTTP 状态分类和上游建连重试仍生效。
+沿用兼容预读的请求，以预读数据交给转发层的时点记录首字节和首输出。
 
 ## 接入方式
 

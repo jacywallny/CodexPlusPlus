@@ -2507,7 +2507,8 @@ async fn send_gateway_http_request(
                     scope.redirect_error(status)
                 }).into());
             }
-            Ok(Ok(response)) => {
+            Ok(Ok(mut response)) => {
+                response.extensions_mut().insert(send.headers_received());
                 HTTP_ATTEMPT.with(|scope| scope.record(&send, "headers_received", Some(response.status().as_u16()), false));
                 return Ok(response);
             }
@@ -5275,12 +5276,16 @@ async fn open_responses_proxy_request_once(
             && foreign_retries < crate::foreign_reasoning::MAX_RETRIES
             && crate::foreign_reasoning::has_encrypted_items(&upstream_body);
         let mut stream_prefix = Vec::new();
+        let forward_native_stream = crate::gateway::http_wait::HTTP_ATTEMPT
+            .try_with(|scope| scope.forward_native_stream())
+            .unwrap_or(false);
         if is_stream
             && (200..300).contains(&status_code)
             && wire_api == UpstreamWireApi::Responses
             && !is_compaction_request
             && !experimental_local_compaction
             && !exec_adapted
+            && !forward_native_stream
             && auto_retry.is_some()
             && buffered_mode
             && !pre_output_failover
@@ -5408,6 +5413,7 @@ async fn open_responses_proxy_request_once(
             && !is_compaction_request
             && !experimental_local_compaction
             && !exec_adapted
+            && !forward_native_stream
             && (pre_output_failover || auto_retry.is_some() || foreign_stream_watch)
         {
             // 重试预算已用尽时再缓冲没有收益，直接退回旧提交时机，
@@ -13361,6 +13367,9 @@ pub(crate) struct ResponsesSseTransformer {
     event_tail: [u8; 4],
     completed: bool,
     failed: bool,
+    model_output: bool,
+    upstream_overloaded: bool,
+    protect_gateway_replay: bool,
     failure: Option<String>,
     /// 当前事件已超过缓冲上限，正在原样透传；值为从事件开头识别出的类型。
     passthrough_event: Option<String>,
@@ -13537,6 +13546,19 @@ pub fn message_phase_fill_enabled() -> bool {
 }
 
 impl ResponsesSseTransformer {
+    pub(crate) fn protecting_gateway_replay(mut self, enabled: bool) -> Self {
+        self.protect_gateway_replay = enabled;
+        self
+    }
+
+    pub(crate) fn has_model_output(&self) -> bool {
+        self.model_output
+    }
+
+    pub(crate) fn is_upstream_overloaded(&self) -> bool {
+        self.upstream_overloaded
+    }
+
     /// 按原始请求声明的工具形态创建：只有 freeform（custom）的 `apply_patch`
     /// 才需要把被模型包成 JSON 的输入解包回补丁文本。
     pub(crate) fn for_request(request: Option<&Value>) -> Self {
@@ -13762,6 +13784,7 @@ impl ResponsesSseTransformer {
         if self.strip_backend_events && is_backend_private_event(event_type) {
             return Vec::new();
         }
+        self.model_output |= responses_event_has_model_output(event_type, &data_json);
 
         // 缺 phase 的助手消息先暂存，到能判断阶段的事件时再补标记写出（issue #2659）。
         let mut released = Vec::new();
@@ -13804,10 +13827,16 @@ impl ResponsesSseTransformer {
             if !detail.is_empty() && self.failure_detail.is_none() {
                 self.failure_detail = Some(detail);
             }
-            if stream_failure_is_retryable(code.as_deref(), message.as_deref())
-                && let Some(normalized) = normalized_overload_failure_event(data_json)
-            {
-                return normalized.into_bytes();
+            if stream_failure_is_retryable(code.as_deref(), message.as_deref()) {
+                self.upstream_overloaded = true;
+                if self.protect_gateway_replay {
+                    return crate::launcher::gateway_stream_stop_event(
+                        "Codex++ 网关：上游在响应过程中报告过载。此请求已结束，请检查本轮输出和工具状态。",
+                    );
+                }
+                if let Some(normalized) = normalized_overload_failure_event(data_json) {
+                    return normalized.into_bytes();
+                }
             }
         }
 
@@ -13825,6 +13854,31 @@ impl ResponsesSseTransformer {
             Err(_) => return event_bytes.to_vec(),
         };
         replace_sse_data_line(event_str, &new_data).into_bytes()
+    }
+}
+
+fn responses_event_has_model_output(event_type: &str, data: &Value) -> bool {
+    let nonempty = |value: Option<&Value>| value.and_then(Value::as_str).is_some_and(|text| !text.is_empty());
+    match event_type {
+        "response.output_text.delta"
+        | "response.refusal.delta"
+        | "response.reasoning_summary_text.delta"
+        | "response.reasoning_text.delta"
+        | "response.function_call_arguments.delta"
+        | "response.custom_tool_call_input.delta" => nonempty(data.get("delta")),
+        "response.output_text.done" | "response.reasoning_summary_text.done"
+        | "response.reasoning_text.done" => nonempty(data.get("text")),
+        "response.refusal.done" => nonempty(data.get("refusal")),
+        "response.image_generation_call.partial_image" => nonempty(data.get("partial_image_b64")),
+        "response.output_item.done" => {
+            let item = &data["item"];
+            item["type"].as_str().is_some_and(|kind| {
+                is_client_tool_call_item_type(kind) || kind == "image_generation_call"
+            }) || item["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| nonempty(part.get("text")) || nonempty(part.get("refusal")))
+            })
+        }
+        _ => false,
     }
 }
 /// 从超大事件的开头识别类型：优先 `event:` 行，否则取 data JSON 里第一个 `"type"`。
@@ -14007,6 +14061,36 @@ mod responses_sse_transformer_tests {
 
     fn sse(data: Value) -> String {
         format!("event: {}\ndata: {}\n\n", data["type"].as_str().unwrap(), data)
+    }
+
+    #[test]
+    fn gateway_model_output_ignores_heartbeats_and_waits_for_a_complete_frame() {
+        let mut transformer = ResponsesSseTransformer::default().filling_message_phase(true);
+        transformer.push_bytes(b": ping\r\n\r\n");
+        transformer.push_bytes(sse(json!({"type": "response.created"})).as_bytes());
+        transformer.push_bytes(sse(json!({"type": "response.output_text.delta", "delta": ""})).as_bytes());
+        let message = message_done(None);
+        transformer.push_bytes(&message.as_bytes()[..message.len() - 1]);
+        assert!(!transformer.has_model_output());
+        transformer.push_bytes(b"\n");
+        assert!(transformer.has_model_output());
+    }
+
+    #[test]
+    fn gateway_overload_ends_without_a_retryable_client_error_code() {
+        let overload = sse(json!({
+            "type": "response.failed",
+            "response": {"error": {"code": "server_overloaded", "message": "fixture"}}
+        }));
+        let mut gateway = ResponsesSseTransformer::default().protecting_gateway_replay(true);
+        let out = String::from_utf8(gateway.push_bytes(overload.as_bytes())).unwrap();
+        assert!(gateway.has_failed());
+        assert!(gateway.is_upstream_overloaded());
+        assert!(out.contains("\"code\":\"invalid_prompt\""));
+        assert!(!out.contains("\"server_overloaded\""));
+        let mut direct = ResponsesSseTransformer::default();
+        let out = String::from_utf8(direct.push_bytes(overload.as_bytes())).unwrap();
+        assert!(out.contains("\"code\":\"server_overloaded\""));
     }
 
     fn message_done(phase: Option<&str>) -> String {
