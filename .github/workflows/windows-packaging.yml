@@ -93,7 +93,9 @@ jobs:
       - name: Build Windows installer
         shell: pwsh
         run: |
-          $version = (Get-Content -LiteralPath apps/codex-plus-manager/package.json -Raw | ConvertFrom-Json).version
+          $packageVersion = (Get-Content -LiteralPath apps/codex-plus-manager/package.json -Raw | ConvertFrom-Json).version
+          $version = node scripts/release-meta.mjs windows-version $packageVersion
+          if ($LASTEXITCODE -ne 0) { throw "Windows 版本号无效。" }
           node --test scripts/tests/release-meta.test.mjs
           if ($LASTEXITCODE -ne 0) { throw "版本元数据测试失败。" }
           node scripts/release-meta.mjs check $version
@@ -114,7 +116,7 @@ jobs:
           Push-Location scripts/installer/windows
           try {
             # 版本资源只收 X.X.X.X：去掉预发布后缀；手动在分支上跑（版本是分支名）时用 0.0.0.0。
-            $viVersion = if ($version -match '^(\d+)\.(\d+)\.(\d+)') { "$($Matches[1]).$($Matches[2]).$($Matches[3]).0" } else { "0.0.0.0" }
+            $viVersion = if ($version -match '^(\d+\.\d+\.\d+)(?:\.(\d+))?') { "$($Matches[1]).$($Matches[2] ?? 0)" } else { "0.0.0.0" }
             & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" "/DVI_VERSION=$viVersion" CodexPlusPlus.nsi
             if ($LASTEXITCODE -ne 0) { throw "NSIS 打包失败，退出码 $LASTEXITCODE" }
           } finally {

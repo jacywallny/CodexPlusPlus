@@ -20,6 +20,11 @@ export function packageVersionForRelease(version) {
   return hotfix && Number(hotfix[2]) <= 65535 ? `${hotfix[1]}+${hotfix[2]}` : version;
 }
 
+export function windowsReleaseVersion(version) {
+  const hotfix = /^(\d+\.\d+\.\d+)\+([1-9]\d*)$/.exec(version);
+  return hotfix && Number(hotfix[2]) <= 65535 ? `${hotfix[1]}.${hotfix[2]}` : version;
+}
+
 const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // 每个版本号文件：读出当前版本，以及把旧版本换成新版本。
@@ -123,9 +128,16 @@ export function compareVersions(a, b) {
 function main(argv) {
   const [command, rawVersion] = argv;
   const version = (rawVersion || "").replace(/^v/i, "");
+  if (command === "windows-version" && version) {
+    const display = windowsReleaseVersion(version);
+    if (VERSION_PATTERN.test(display) || (display !== version && packageVersionForRelease(display) === version)) {
+      console.log(display);
+      return 0;
+    }
+  }
   const expected = packageVersionForRelease(version);
   if (!["check", "notes"].includes(command) || (!VERSION_PATTERN.test(version) && expected === version)) {
-    console.error("用法：node scripts/release-meta.mjs check|notes <版本号>");
+    console.error("用法：node scripts/release-meta.mjs check|notes|windows-version <版本号>");
     return 2;
   }
   if (command === "check") {
