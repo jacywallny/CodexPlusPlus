@@ -17,6 +17,7 @@ const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 const KEEP_LOG_BYTES: u64 = 1024 * 1024;
 
 static ENTRY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static REQUEST_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static LOG_PATH_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
     std::sync::OnceLock::new();
 
@@ -372,22 +373,40 @@ pub fn append_request_log(entry: &RequestLogEntry) -> std::io::Result<()> {
 }
 
 pub fn append_request_log_at(path: &Path, entry: &RequestLogEntry) -> std::io::Result<()> {
-    use std::io::Write;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut line = serde_json::to_vec(entry)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    line.push(b'\n');
+    let _guard = lock_request_log()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let line = serde_json::to_string(entry)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)?;
-    writeln!(file, "{line}")?;
+    // 上次写入若在换行前中断，不让残行吞掉这次完整的请求。
+    if file.metadata()?.len() != 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0];
+        file.read_exact(&mut last)?;
+        if last != [b'\n'] {
+            file.write_all(b"\n")?;
+        }
+    }
+    file.write_all(&line)?;
+    let needs_trim = file.metadata()?.len() > MAX_LOG_BYTES;
     drop(file);
-    if std::fs::metadata(path).map(|meta| meta.len() > MAX_LOG_BYTES).unwrap_or(false) {
+    if needs_trim {
         trim_request_log_to_tail(path, KEEP_LOG_BYTES)?;
     }
     Ok(())
+}
+
+fn lock_request_log() -> std::io::Result<std::sync::MutexGuard<'static, ()>> {
+    REQUEST_IO_LOCK.lock().map_err(|_| std::io::Error::other("request log lock poisoned"))
 }
 
 fn trim_request_log_to_tail(path: &Path, keep_bytes: u64) -> std::io::Result<()> {
@@ -470,19 +489,22 @@ pub fn read_request_log_page_at(
     limit: usize,
     filter: &RequestLogFilter,
 ) -> std::io::Result<RequestLogPage> {
-    let contents = match std::fs::read_to_string(path) {
+    let contents = match {
+        let _guard = lock_request_log()?;
+        std::fs::read(path)
+    } {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(RequestLogPage::default()),
         Err(error) => return Err(error),
     };
     let mut page = RequestLogPage::default();
     let mut entries = VecDeque::with_capacity(limit.min(1024));
-    for line in contents.lines() {
-        let line = line.trim();
+    for raw in contents.split(|byte| *byte == b'\n') {
+        let line = raw.trim_ascii();
         if line.is_empty() {
             continue;
         }
-        let Ok(entry) = serde_json::from_str::<RequestLogEntry>(line) else {
+        let Ok(entry) = serde_json::from_slice::<RequestLogEntry>(line) else {
             continue;
         };
         if page.oldest_ms.is_none() {
@@ -502,18 +524,17 @@ pub fn read_request_log_page_at(
 }
 
 pub fn read_request_logs_at(path: &Path, limit: usize) -> std::io::Result<Vec<RequestLogEntry>> {
-    let contents = match std::fs::read_to_string(path) {
+    let contents = match {
+        let _guard = lock_request_log()?;
+        std::fs::read(path)
+    } {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
     let mut entries = VecDeque::with_capacity(limit.min(1024));
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<RequestLogEntry>(line) {
+    for line in contents.split(|byte| *byte == b'\n') {
+        if let Ok(entry) = serde_json::from_slice::<RequestLogEntry>(line.trim_ascii()) {
             entries.push_back(entry);
             if entries.len() > limit {
                 entries.pop_front();
@@ -539,6 +560,7 @@ pub fn read_recent_request_logs(limit: usize) -> std::io::Result<Vec<RequestLogE
 /// 只读日志文件末尾一段；末尾凑不够 `limit` 条时退回整文件读取。
 pub fn read_recent_request_logs_at(path: &Path, limit: usize) -> std::io::Result<Vec<RequestLogEntry>> {
     use std::io::{Read, Seek, SeekFrom};
+    let guard = lock_request_log()?;
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -548,19 +570,16 @@ pub fn read_recent_request_logs_at(path: &Path, limit: usize) -> std::io::Result
     file.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    let text = String::from_utf8_lossy(&bytes);
-    let mut lines = text.lines();
+    drop(file);
+    drop(guard);
+    let mut lines = bytes.split(|byte| *byte == b'\n');
     // 从文件中间开始读时，第一行多半被截断，丢掉。
     if start > 0 {
         lines.next();
     }
     let mut entries = VecDeque::with_capacity(limit.min(1024));
     for line in lines {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<RequestLogEntry>(line) {
+        if let Ok(entry) = serde_json::from_slice::<RequestLogEntry>(line.trim_ascii()) {
             entries.push_back(entry);
             if entries.len() > limit {
                 entries.pop_front();
@@ -578,6 +597,7 @@ pub fn clear_request_logs() -> std::io::Result<()> {
 }
 
 pub fn clear_request_logs_at(path: &Path) -> std::io::Result<()> {
+    let _guard = lock_request_log()?;
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1005,6 +1025,33 @@ mod tests {
         live_requests().lock().unwrap().remove(&running.id);
         update_running_route(&running.id, &RequestTrace::default(), false);
         assert!(!running_requests().iter().any(|row| row.id == running.id));
+    }
+
+    #[test]
+    fn interrupted_utf8_row_does_not_hide_or_consume_completed_requests() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.jsonl");
+        append_request_log_at(&path, &entry("before")).unwrap();
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"relayName\":\"\xe6\xb5").unwrap();
+        drop(file);
+
+        let first = read_request_log_page_at(&path, 10, &Default::default()).unwrap();
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(first.entries[0].id, "before");
+        append_request_log_at(&path, &entry("after")).unwrap();
+        for rows in [
+            read_request_logs_at(&path, 10).unwrap(),
+            read_recent_request_logs_at(&path, 10).unwrap(),
+            read_request_log_page_at(&path, 10, &Default::default()).unwrap().entries,
+        ] {
+            assert_eq!(
+                rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                ["after", "before"]
+            );
+        }
     }
 
     #[test]
