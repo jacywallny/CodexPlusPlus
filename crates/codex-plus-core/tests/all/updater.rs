@@ -294,3 +294,14 @@ fn prune_installed_installers_removes_versions_not_newer_than_current() {
     assert!(codex_plus_core::update::prune_installed_installers(&dir.path().join("missing"), "2.6.7").is_empty());
     assert!(codex_plus_core::update::prune_installed_installers(dir.path(), "dev").is_empty());
 }
+
+#[test]
+fn update_feed_points_to_personal_release_repository() {
+    use codex_plus_core::update::{DEFAULT_LATEST_JSON_URL, DEFAULT_REPOSITORY};
+
+    assert_eq!(DEFAULT_REPOSITORY, "jacywallny/CodexPlusPlus");
+    assert_eq!(
+        DEFAULT_LATEST_JSON_URL,
+        format!("https://github.com/{DEFAULT_REPOSITORY}/releases/latest/download/latest.json")
+    );
+}
