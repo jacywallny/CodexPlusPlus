@@ -99,7 +99,6 @@ test("Fast flows into new-chat descriptors without changing native names or reas
     prioritySupportOverride: true,
     serviceTiers: [{ id: "priority", name: "Fast", description: "Provider-declared priority" }],
     additionalSpeedTiers: ["fast"],
-    supportedReasoningEfforts: [],
   };
   const context = vm.createContext({
     codexPlusModelMetadata: () => metadata,

@@ -3635,12 +3635,15 @@ describe("renderer injection conversation view alignment", () => {
 });
 
 describe("renderer model reasoning efforts patch", () => {
-  // 补全逻辑只依赖 codexPlusModelMetadata，抽出来单独跑，避免再复制一份实现。
+  // 从组装产物中抽出模型名解析和档位处理，沿用实际实现。
   function reasoningRuntime(renderer: string, metadata: Record<string, unknown> | null) {
-    const start = renderer.indexOf("function modelReasoningEfforts(");
+    const modelNameStart = renderer.indexOf("  function codexServiceTierModelFromValue(");
+    const modelNameEnd = renderer.indexOf("  function codexServiceTierCurrentModelName(", modelNameStart);
+    assert.ok(modelNameStart >= 0 && modelNameEnd > modelNameStart, "产物里找不到模型名解析函数");
+    const start = renderer.indexOf("  function usesDeclaredReasoningEfforts(");
     const end = renderer.indexOf("\n  function applyCodexPlusModelMetadata(", start);
     assert.ok(start >= 0 && end > start, "产物里找不到 modelReasoningEfforts");
-    const source = renderer.slice(start, end);
+    const source = renderer.slice(modelNameStart, modelNameEnd) + renderer.slice(start, end);
     const create = new Function(
       "codexPlusModelMetadata",
       `${source}\nreturn modelReasoningEfforts;`,
