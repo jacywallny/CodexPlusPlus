@@ -6644,6 +6644,10 @@ async fn upstream_request_parts(
             json!({ "relayId": relay.id }),
         );
     }
+    // 转换前仍有完整的 data URL。Chat 兼容模式可能去掉前缀，Anthropic 会拆成 MIME 和数据。
+    if official_base.is_none() {
+        compress_embedded_request_images(relay, &mut request_json).await;
+    }
     // 拓展用 gateway.replaces 关掉 builtin:request-conversion：请求体保持 Responses 形状交给 upstream 段，
     // 由拓展转成上游协议（端点仍按供应商协议选；响应仍由 Codex++ 按上游协议转回 Responses）。
     let request_conversion =
@@ -6805,6 +6809,122 @@ async fn upstream_request_parts(
         wire_api,
         synthetic_compaction,
     ))
+}
+
+pub(crate) async fn compress_embedded_request_images(
+    relay: &crate::settings::RelayProfile,
+    body: &mut Value,
+) {
+    use crate::vision::{image_handling_mode, ImageHandling};
+
+    if !relay.compresses_large_images() {
+        return;
+    }
+    let Some(model) = body.get("model").and_then(Value::as_str) else {
+        return;
+    };
+    if model.is_empty() || image_handling_mode(model, &relay.model_vlm) != ImageHandling::SendAsIs {
+        return;
+    }
+
+    let mut count = 0;
+    let mut bytes_saved = 0;
+    let mut timed_out = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    'request: for key in ["input", "messages"] {
+        let Some(items) = body.get_mut(key).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for item in items {
+            let mut parts = Vec::new();
+            match item.get("type").and_then(Value::as_str) {
+                Some("function_call_output") => {
+                    if let Some(output) = item.get_mut("output").and_then(Value::as_array_mut) {
+                        parts.extend(output);
+                    }
+                }
+                Some("computer_call_output") => {
+                    parts.extend(item.get_mut("output"));
+                }
+                _ => {
+                    let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
+                        continue;
+                    };
+                    for part in content {
+                        if part.get("type").and_then(Value::as_str) == Some("tool_result") {
+                            if let Some(content) = part.get_mut("content").and_then(Value::as_array_mut) {
+                                parts.extend(content);
+                            }
+                        } else {
+                            parts.push(part);
+                        }
+                    }
+                }
+            }
+            for part in parts {
+                if tokio::time::Instant::now() >= deadline {
+                    timed_out = true;
+                    break 'request;
+                }
+                let Ok(saved) = tokio::time::timeout_at(deadline, compress_image_part(part)).await else {
+                    timed_out = true;
+                    break 'request;
+                };
+                count += usize::from(saved > 0);
+                bytes_saved += saved;
+            }
+        }
+    }
+    if count > 0 || timed_out {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "protocol_proxy.image_compressed",
+            json!({ "relayId": relay.id, "count": count, "bytesSaved": bytes_saved, "timedOut": timed_out }),
+        );
+    }
+}
+
+async fn compress_image_part(part: &mut Value) -> usize {
+    match part.get("type").and_then(Value::as_str) {
+        Some("input_image" | "image_url" | "computer_screenshot") => {
+            let Some(image) = part.get_mut("image_url") else {
+                return 0;
+            };
+            let url = if image.is_object() { image.get_mut("url") } else { Some(image) };
+            let Some(Value::String(url)) = url else {
+                return 0;
+            };
+            let Some(compressed) = crate::image_compress::compress_data_url(url).await else {
+                return 0;
+            };
+            let saved = url.len() - compressed.len();
+            *url = compressed;
+            saved
+        }
+        Some("image") => {
+            let Some(source) = part.get_mut("source") else {
+                return 0;
+            };
+            if source.get("type").and_then(Value::as_str) != Some("base64") {
+                return 0;
+            }
+            let (Some(media_type), Some(data)) = (
+                source.get("media_type").and_then(Value::as_str),
+                source.get("data").and_then(Value::as_str),
+            ) else {
+                return 0;
+            };
+            let Some((new_media_type, compressed)) =
+                crate::image_compress::compress_base64_image(media_type, data).await
+            else {
+                return 0;
+            };
+            let saved = data.len() - compressed.len();
+            source["media_type"] = json!(new_media_type);
+            source["data"] = Value::String(compressed);
+            saved
+        }
+        _ => 0,
+    }
 }
 
 async fn send_responses_upstream_request(
@@ -14844,6 +14964,110 @@ mod parallel_tool_call_pairing_tests {
         assert_eq!(body["tool_choice"]["tools"], json!([{"type": "function", "name": "exec"}]));
         let mut untouched = json!({"tools": [{"type": "function", "name": "exec"}], "tool_choice": "auto"});
         assert!(!strip_image_generation_tool(&mut untouched));
+    }
+
+    async fn prepare_image_compression_request(
+        relay: &crate::settings::RelayProfile,
+        body: &Value,
+        model: Option<&str>,
+    ) -> Value {
+        let (_, output, _, _) = upstream_request_parts(
+            relay,
+            body.clone(),
+            "/v1/responses",
+            model,
+            false,
+            None,
+            ProxySessionHeaders::default(),
+        )
+        .await
+        .unwrap();
+        output
+    }
+
+    #[tokio::test]
+    async fn upstream_request_compresses_message_and_tool_images_when_enabled() {
+        let image = crate::image_compress::sample_large_image_data_url();
+        let external = "https://example.com/screenshot.png";
+        let body = json!({
+            "model": "gpt-test",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_image", "image_url": image, "detail": "high"},
+                    {"type": "input_image", "image_url": external},
+                    {"type": "input_file", "filename": "fixture.pdf", "file_data": "data:application/pdf;base64,dGVzdA=="}
+                ]},
+                {"type": "function_call", "call_id": "call_read", "name": "view_image", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_read", "output": [
+                    {"type": "input_image", "image_url": image}
+                ]},
+                {"type": "computer_call_output", "call_id": "call_screen", "output": {
+                    "type": "computer_screenshot", "image_url": image
+                }}
+            ]
+        });
+        let mut relay = crate::settings::RelayProfile {
+            protocol: RelayProtocol::Responses,
+            relay_mode: crate::settings::RelayMode::PureApi,
+            base_url: "https://example.com/v1".into(),
+            api_key: "sk-test".into(),
+            ..Default::default()
+        };
+        let output = prepare_image_compression_request(&relay, &body, None).await;
+        assert!(output["input"][0]["content"][0]["image_url"] == image.as_str());
+
+        relay.image_compress = true;
+        let output = prepare_image_compression_request(&relay, &body, None).await;
+        let content = &output["input"][0]["content"];
+        let compressed = content[0]["image_url"].as_str().unwrap();
+        assert!(compressed.starts_with(concat!("data:", "image/jpeg;base64,")));
+        assert!(compressed.len() < image.len() / 2);
+        assert_eq!(content[0]["detail"], "high");
+        assert_eq!(content[1]["image_url"], external);
+        assert_eq!(content[2], body["input"][0]["content"][2]);
+        assert!(output["input"][2]["output"][0]["image_url"] == compressed);
+        assert!(output["input"][3]["output"]["image_url"] == compressed);
+
+        relay.model_vlm = r#"{"gpt-test":"strip"}"#.into();
+        let output = prepare_image_compression_request(&relay, &body, None).await;
+        assert!(output["input"][0]["content"].as_array().unwrap().iter().all(|part| part["type"] != "input_image"));
+        assert!(output["input"][3]["output"]["image_url"] == image.as_str());
+    }
+
+    #[tokio::test]
+    async fn upstream_request_compresses_images_before_converting_protocols() {
+        let image = crate::image_compress::sample_large_image_data_url();
+        let mut relay = crate::settings::RelayProfile {
+            image_compress: true,
+            protocol: RelayProtocol::ChatCompletions,
+            relay_mode: crate::settings::RelayMode::PureApi,
+            base_url: "https://example.com/v1".into(),
+            api_key: "sk-test".into(),
+            ..Default::default()
+        };
+        let body = json!({"model": "glm-test", "input": [{
+            "type": "message", "role": "user", "content": [{"type": "input_image", "image_url": image}]
+        }]});
+        let chat = prepare_image_compression_request(&relay, &body, Some("glm-test")).await;
+        let encoded = chat["messages"][0]["content"][0]["image_url"]["url"].as_str().unwrap();
+        assert!(encoded.starts_with("/9j/"));
+        assert!(encoded.len() < image.len() / 2);
+
+        relay.protocol = RelayProtocol::AnthropicMessages;
+        let mut anthropic = prepare_image_compression_request(&relay, &body, Some("claude-test")).await;
+        let source = &anthropic["messages"][0]["content"][0]["source"];
+        assert_eq!(source["type"], "base64");
+        assert_eq!(source["media_type"], "image/jpeg");
+        assert!(source["data"] == encoded);
+
+        let (_, original) = image.split_once(',').unwrap();
+        anthropic["messages"][0]["content"][0] = json!({"type":"tool_result", "content":[{
+            "type":"image", "source":{"type":"base64", "media_type":"image/png", "data":original}
+        }]});
+        compress_embedded_request_images(&relay, &mut anthropic).await;
+        let source = &anthropic["messages"][0]["content"][0]["content"][0]["source"];
+        assert_eq!(source["media_type"], "image/jpeg");
+        assert!(source["data"] == encoded);
     }
 
     /// #2870：供应商开关打开时剥离 `input_image.detail`；默认关闭保持 OpenAI 语义。

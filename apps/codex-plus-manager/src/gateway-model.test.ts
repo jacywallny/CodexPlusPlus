@@ -495,6 +495,7 @@ test("供应商表单：多 Key 每行一个；本机服务预填 Key；编辑�
     proxy: "",
     stripImageGenerationTool: false,
     stripResponsesImageDetail: false,
+    imageCompress: false,
     disableToolSearch: false,
     customHeaders: [],
   });
@@ -503,6 +504,10 @@ test("供应商表单：多 Key 每行一个；本机服务预填 Key；编辑�
   assert.equal(providerInput({ ...editing, stripImageGenerationTool: true }).stripImageGenerationTool, true);
   assert.equal(providerDraftFromEntry({ ...payload().pool[0], stripResponsesImageDetail: true }).stripResponsesImageDetail, true);
   assert.equal(providerInput({ ...editing, stripResponsesImageDetail: true }).stripResponsesImageDetail, true);
+  const compressed = providerDraftFromEntry({ ...payload().pool[0], imageCompress: true });
+  assert.equal(compressed.imageCompress, true);
+  assert.equal(providerInput(compressed).imageCompress, true);
+  assert.equal(providerInput({ ...compressed, imageCompress: false }).imageCompress, false);
   // #2868：「不发送 tool_search」从池条目读回、原样提交。
   assert.equal(providerDraftFromEntry({ ...payload().pool[0], disableToolSearch: true }).disableToolSearch, true);
   assert.equal(providerInput({ ...editing, disableToolSearch: true }).disableToolSearch, true);

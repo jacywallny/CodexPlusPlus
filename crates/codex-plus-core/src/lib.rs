@@ -59,6 +59,7 @@ pub mod global_dictation;
 pub mod history_turn_recovery;
 pub mod hooks_editor;
 pub mod http_client;
+mod image_compress;
 pub mod install;
 pub mod launcher;
 pub mod macos_window;

@@ -52,6 +52,19 @@ describe("供应商编辑函数打包（42 分片）", () => {
     assert.deepEqual(api.parseModelSuffix("deepseek-v4-pro[1M]"), { slug: "deepseek-v4-pro", window: 1000000 });
   });
 
+  it("大图压缩为直连 Responses 启用本地代理，关闭后恢复直连", () => {
+    const api = loadEditing();
+    const upstream = "https://a.example/v1";
+    const original = api.normalizeRelayProfile(pureProfile("a", upstream, "sk-live-aaaa1111"));
+    const enabled = api.applyRelayProfilePatchToFiles(original, { imageCompress: true });
+    assert.equal(original.imageCompress, false);
+    assert.equal(enabled.imageCompress, true);
+    assert.match(enabled.configContents, /base_url = "http:\/\/127\.0\.0\.1:57321\//);
+    assert.equal(enabled.upstreamBaseUrl, upstream);
+    const disabled = api.applyRelayProfilePatchToFiles(enabled, { imageCompress: false });
+    assert.match(disabled.configContents, /base_url = "https:\/\/a\.example\/v1"/);
+  });
+
   it("删除守卫与中文文案（i18n 换成原文直出）", () => {
     const api = loadEditing();
     const settings = { activeRelayId: "a", relayProfiles: [pureProfile("a", "https://a", "sk-1"), pureProfile("b", "https://b", "sk-2")].map((profile) => api.normalizeRelayProfile(profile)), aggregateRelayProfiles: [], activeAggregateRelayId: "" };

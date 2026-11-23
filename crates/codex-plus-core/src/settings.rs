@@ -186,6 +186,9 @@ pub struct RelayProfile {
     /// OpenAI 扩展字段，只会返回泛化的 invalid_request（#2870）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub strip_responses_image_detail: bool,
+    /// 转发前压缩过大的内联图像。默认关闭。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub image_compress: bool,
     /// 不向该上游发送 `tool_search` 托管工具：部分第三方 Responses 上游不认识
     /// 它，供应商测试能过但实际聊天整单 400（#2868 / #2871）。Kimi 官方自动处理。
     #[serde(default, skip_serializing_if = "is_false")]
@@ -414,6 +417,7 @@ impl Default for RelayProfile {
             strict_responses_reasoning: false,
             strip_image_generation_tool: false,
             strip_responses_image_detail: false,
+            image_compress: false,
             disable_tool_search: false,
             pure_api_image_generation: false,
             auto_review_model: String::new(),
@@ -477,6 +481,13 @@ impl RelayProfile {
     pub fn strips_responses_image_detail(&self) -> bool {
         self.strip_responses_image_detail
             && self.protocol == RelayProtocol::Responses
+            && self.relay_mode != RelayMode::Aggregate
+            && (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
+    }
+
+    /// 经本地代理转发的 API 供应商可在发送前压缩内联图像。
+    pub fn compresses_large_images(&self) -> bool {
+        self.image_compress
             && self.relay_mode != RelayMode::Aggregate
             && (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
     }
@@ -1763,6 +1774,7 @@ impl BackendSettings {
                 strict_responses_reasoning: false,
                 strip_image_generation_tool: false,
                 strip_responses_image_detail: false,
+                image_compress: false,
                 disable_tool_search: false,
                 pure_api_image_generation: false,
                 auto_review_model: String::new(),
@@ -1838,6 +1850,7 @@ impl BackendSettings {
             strict_responses_reasoning: false,
             strip_image_generation_tool: false,
             strip_responses_image_detail: false,
+            image_compress: false,
             disable_tool_search: false,
             pure_api_image_generation: false,
             auto_review_model: String::new(),
@@ -1911,6 +1924,7 @@ impl BackendSettings {
             || self.active_relay_profile().strips_image_generation_tool()
             || self.active_relay_profile().enables_pure_api_image_generation()
             || self.active_relay_profile().strips_responses_image_detail()
+            || self.active_relay_profile().compresses_large_images()
     }
 
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
@@ -3639,6 +3653,7 @@ pub(crate) const RELAY_PROFILE_KNOWN_FIELDS: &[&str] = &[
     "strictResponsesReasoning",
     "stripImageGenerationTool",
     "stripResponsesImageDetail",
+    "imageCompress",
     "disableToolSearch",
     "pureApiImageGeneration",
     "autoReviewModel",
@@ -6172,6 +6187,32 @@ experimental_bearer_token = "sk-existing""#
             ..BackendSettings::default()
         };
         assert!(!off.active_relay_transport_uses_protocol_proxy());
+    }
+
+    #[test]
+    fn image_compress_routes_through_protocol_proxy_only_when_enabled() {
+        let mut profile: RelayProfile = serde_json::from_str(
+            r#"{"id":"image-relay","name":"Image Relay","relayMode":"pureApi","baseUrl":"https://example.test/v1"}"#,
+        )
+        .unwrap();
+        let settings_with = |profile: RelayProfile| BackendSettings {
+            active_relay_id: profile.id.clone(),
+            relay_profiles: vec![profile],
+            ..BackendSettings::default()
+        };
+        assert!(!profile.image_compress);
+        assert!(serde_json::to_value(&profile)
+            .unwrap()
+            .get("imageCompress")
+            .is_none());
+        assert!(!settings_with(profile.clone()).active_relay_transport_uses_protocol_proxy());
+        profile.image_compress = true;
+        assert_eq!(serde_json::to_value(&profile).unwrap()["imageCompress"], true);
+        assert!(settings_with(profile.clone()).active_relay_transport_uses_protocol_proxy());
+        for mode in [RelayMode::Official, RelayMode::Aggregate] {
+            profile.relay_mode = mode;
+            assert!(!profile.compresses_large_images());
+        }
     }
 
     #[test]

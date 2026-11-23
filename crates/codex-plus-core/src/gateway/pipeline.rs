@@ -1116,6 +1116,7 @@ async fn attempt_native(
     body["model"] = Value::String(candidate.upstream_model.clone());
     anthropic_inbound::sanitize_for_native_anthropic(&mut body);
     let relay = &candidate.relay;
+    crate::protocol_proxy::compress_embedded_request_images(relay, &mut body).await;
     let endpoint = crate::anthropic_bridge::anthropic_messages_url(relay.base_url.trim());
     let user_agent = if relay.user_agent.trim().is_empty() {
         request.user_agent.unwrap_or_default().to_string()

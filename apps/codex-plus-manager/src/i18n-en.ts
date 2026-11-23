@@ -1158,6 +1158,8 @@ export const EN_PLAIN: Record<string, string> = {
   "移除请求里的托管生图工具（image_generation）": "Remove the hosted image tool (image_generation) from requests",
   "不发送 tool_search（上游不支持时开启）": "Do not send tool_search (enable when the upstream does not support it)",
   "部分第三方 Responses 上游不认 Codex 的托管工具 tool_search，供应商测试能通过，但实际聊天会返回 400（tool type \"tool_search\" is not supported）。开启后模型目录关闭 supports_search_tool，Codex 改为直接列出 MCP 工具。Kimi 官方地址会自动处理。重启 Codex 后生效。默认关闭。": "Some third-party Responses upstreams do not recognize Codex's hosted tool_search tool; the provider test passes but real chats return 400 (tool type \"tool_search\" is not supported). When enabled, the model catalog sets supports_search_tool to false and Codex lists MCP tools directly. Kimi official addresses are handled automatically. Takes effect after restarting Codex. Off by default.",
+  "压缩随请求发送的大图": "Compress large inline images",
+  "通过本地代理压缩原样发送的大型内联 JPEG／PNG 图片，减小截图和历史图片占用的请求体。压缩可能降低图片清晰度。默认关闭。": "Use the local proxy to compress large inline JPEG and PNG images when sending images as-is. This reduces the request size of screenshots and images from previous turns. Compression may reduce clarity. Off by default.",
   "不发送 tool_search": "Do not send tool_search",
   "上游不认 Codex 的 tool_search 工具（实际聊天会返回 400）时开启：模型目录关闭 supports_search_tool，Codex 改为直接列出 MCP 工具。默认关闭。": "Enable when the upstream does not recognize Codex's tool_search tool (real chats return 400): the model catalog sets supports_search_tool to false and Codex lists MCP tools directly. Off by default.",
   "纯 API 启用 Codex 原生生图（实验）": "Native Codex image generation for Pure API (experimental)",

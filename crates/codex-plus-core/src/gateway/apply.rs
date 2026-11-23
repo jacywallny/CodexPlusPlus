@@ -3027,6 +3027,7 @@ pub fn copy_claude_provider(provider: &ClaudeProvider) -> anyhow::Result<RelayPr
         strip_image_generation_tool: None,
         subscription_policy: None,
         strip_responses_image_detail: None,
+        image_compress: None,
         disable_tool_search: None,
         custom_headers: None,
     }, Vec::new())?;
@@ -3085,6 +3086,7 @@ pub fn copy_grok_profile(
         strip_image_generation_tool: None,
         subscription_policy: None,
         strip_responses_image_detail: None,
+        image_compress: None,
         disable_tool_search: None,
         custom_headers: None,
     }, Vec::new())?;
@@ -3416,6 +3418,9 @@ pub struct ProviderInput {
     /// 转发前移除 Responses 图片 `detail`（#2870）；不传表示不改（编辑时保留原来的）。
     #[serde(default)]
     pub strip_responses_image_detail: Option<bool>,
+    /// 转发前压缩过大的内联图像。编辑时未提供则保留原设置。
+    #[serde(default)]
+    pub image_compress: Option<bool>,
     /// 不向该上游发送 `tool_search` 托管工具（#2868）；不传表示不改。
     #[serde(default)]
     pub disable_tool_search: Option<bool>,
@@ -3478,6 +3483,7 @@ fn build_relay(
     relay.relay_mode = RelayMode::PureApi;
     relay.strip_image_generation_tool = input.strip_image_generation_tool.unwrap_or(false);
     relay.strip_responses_image_detail = input.strip_responses_image_detail.unwrap_or(false);
+    relay.image_compress = input.image_compress.unwrap_or(false);
     relay.disable_tool_search = input.disable_tool_search.unwrap_or(false);
     // 存盘前的规范化会再按 relay_headers 校验一次。
     relay.custom_headers = custom_headers;
@@ -3728,6 +3734,9 @@ fn update_provider_in(
     // 没传「移除图片 detail」时沿用原来的选择。
     if input.strip_responses_image_detail.is_none() {
         relay.strip_responses_image_detail = provider.relay.strip_responses_image_detail;
+    }
+    if input.image_compress.is_none() {
+        relay.image_compress = provider.relay.image_compress;
     }
     // 没传「不发 tool_search」时沿用原来的选择。
     if input.disable_tool_search.is_none() {
@@ -4828,6 +4837,7 @@ mod tests {
                 strip_image_generation_tool: None,
                 subscription_policy: None,
                 strip_responses_image_detail: None,
+                image_compress: None,
                 disable_tool_search: None,
                 custom_headers: None,
             },
@@ -4876,6 +4886,7 @@ mod tests {
                 strip_image_generation_tool: None,
                 subscription_policy: None,
                 strip_responses_image_detail: None,
+                image_compress: None,
                 disable_tool_search: None,
                 custom_headers: None,
             },

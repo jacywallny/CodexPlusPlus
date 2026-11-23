@@ -286,9 +286,23 @@ export function ProviderFormDialog({
             ) : null}
           </section>
 
-          {draft.protocol === "responses" ? (
+          {!subscriptionEditing || draft.protocol === "responses" ? (
             <section className="pf-section">
               <h4>{t("兼容")}</h4>
+              {!subscriptionEditing ? (
+                <label className="pf-switch">
+                  <input
+                    checked={draft.imageCompress === true}
+                    onChange={(event) => update({ imageCompress: event.currentTarget.checked })}
+                    type="checkbox"
+                  />
+                  <span>
+                    <strong>{t("压缩随请求发送的大图")}</strong>
+                    <small>{t("通过本地代理压缩原样发送的大型内联 JPEG／PNG 图片，减小截图和历史图片占用的请求体。压缩可能降低图片清晰度。默认关闭。")}</small>
+                  </span>
+                </label>
+              ) : null}
+              {draft.protocol === "responses" ? <>
               <label className="pf-switch">
                 <input
                   checked={draft.stripImageGenerationTool === true}
@@ -322,6 +336,7 @@ export function ProviderFormDialog({
                   <small>{t("上游不认 Codex 的 tool_search 工具（实际聊天会返回 400）时开启：模型目录关闭 supports_search_tool，Codex 改为直接列出 MCP 工具。默认关闭。")}</small>
                 </span>
               </label>
+              </> : null}
             </section>
           ) : null}
           {/* 自定义请求头（#3075）：和直连模式「高级兼容选项」里的同一套编辑行与规则；订阅账号的请求头由 Codex++ 自己定，不开放。 */}

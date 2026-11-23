@@ -18,6 +18,7 @@ export type RelayModelRouteProfile = {
   strictResponsesReasoning?: boolean;
   stripImageGenerationTool?: boolean;
   stripResponsesImageDetail?: boolean;
+  imageCompress?: boolean;
   pureApiImageGeneration?: boolean;
   modelMetadata?: string;
   modelRoutes?: RelayModelRoute[];
@@ -131,6 +132,15 @@ export function stripResponsesImageDetailEnabled(
     && (profile.relayMode !== "official" || profile.officialMixApiKey);
 }
 
+/** 图片压缩需要第三方请求经过本地代理。 */
+export function imageCompressEnabled(
+  profile: Pick<RelayModelRouteProfile, "relayMode" | "officialMixApiKey" | "imageCompress">,
+): boolean {
+  return profile.imageCompress === true
+    && profile.relayMode !== "aggregate"
+    && (profile.relayMode !== "official" || profile.officialMixApiKey);
+}
+
 /** #1433：纯 API 下让 Codex 注册原生生图工具，生图请求要经本地代理转给供应商。 */
 export function pureApiImageGenerationEnabled(
   profile: Pick<RelayModelRouteProfile, "relayMode" | "pureApiImageGeneration">,
@@ -152,6 +162,7 @@ export function settingsRequireLocalHelper(settings: RelayModelRouteSettings): b
     || localCompactionPromptAtEndEnabled(active)
     || requestCompatibilityEnabled(active)
     || stripImageGenerationToolEnabled(active)
+    || imageCompressEnabled(active)
     || pureApiImageGenerationEnabled(active)
     || normalizeRelayModelRoutes(active.modelRoutes).some(
       (route) => Boolean(route.model.trim() && route.targetRelayId.trim()),

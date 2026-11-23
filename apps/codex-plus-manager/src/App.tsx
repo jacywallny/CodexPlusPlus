@@ -757,6 +757,8 @@ export type RelayProfile = {
   stripImageGenerationTool?: boolean;
   /** #2870：转发前移除 Responses 图片 `detail`，默认关闭。 */
   stripResponsesImageDetail?: boolean;
+  /** 转发前压缩过大的内联图像，默认关闭。 */
+  imageCompress?: boolean;
   /** #2868：不向上游发送 tool_search，默认关闭。 */
   disableToolSearch?: boolean;
   /** #1433：纯 API 下让 Codex 注册原生生图工具，生图请求经本地代理发给本供应商，默认关闭。 */
@@ -12461,6 +12463,7 @@ function RelayProfileEditor({
     profile.strictResponsesReasoning === true,
     profile.stripImageGenerationTool === true,
     profile.stripResponsesImageDetail === true,
+    profile.imageCompress === true,
     profile.disableToolSearch === true,
     profile.pureApiImageGeneration === true,
   ].filter(Boolean).length;
@@ -14037,6 +14040,12 @@ function RelayProfileEditor({
                       <small>{t("仅支持旧版直连供应商，暂不支持 2.0 网关。实测可改善压缩请求的缓存命中概率，但不保证每次命中，也不保证后置压缩提示不影响摘要质量。缓存按 Key 隔离，切换或轮换 Key 可能降低命中率。未命中供应商缓存时，补回的工具声明会增加输入 token 开销；上游若忽略禁用工具调用要求，可能返回空摘要。默认关闭。")}</small>
                     </span>
                     <ToggleVisual />
+                  </label>
+                ) : null}
+                {showApiFields && profile.relayMode !== "aggregate" ? (
+                  <label className="switch-row compact relay-switch-row relay-field-image-compress">
+                    <input type="checkbox" checked={profile.imageCompress === true} onChange={(event) => updateDraft({ imageCompress: event.currentTarget.checked })} />
+                    <span><strong>{t("压缩随请求发送的大图")}</strong><small>{t("通过本地代理压缩原样发送的大型内联 JPEG／PNG 图片，减小截图和历史图片占用的请求体。压缩可能降低图片清晰度。默认关闭。")}</small></span><ToggleVisual />
                   </label>
                 ) : null}
                 {showApiFields && profile.protocol === "responses" ? <>
