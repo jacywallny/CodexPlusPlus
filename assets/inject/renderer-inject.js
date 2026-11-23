@@ -22350,8 +22350,16 @@ ${key} = ${value}`]);
     }
   }
 
+  function usesDeclaredReasoningEfforts(modelName) {
+    return /(?:^|\/)gpt-6\.2-(?:astra|sol)$/i.test(codexServiceTierModelFromValue(modelName));
+  }
+
   function modelReasoningEfforts(modelName) {
     const supported = codexPlusModelMetadata(modelName)?.supportedReasoningEfforts;
+    // GPT-6.2 的滑杆和 app-server 校验使用同一份目录档位。
+    if (Array.isArray(supported) && usesDeclaredReasoningEfforts(modelName)) {
+      return supported.map((entry) => ({ ...entry }));
+    }
     if (Array.isArray(supported) && supported.length > 0) {
       const efforts = supported.map((entry) => ({ ...entry }));
       const hasMax = efforts.some((e) => e.reasoningEffort === "max");
@@ -22396,9 +22404,10 @@ ${key} = ${value}`]);
       descriptor.supportsImageDetailOriginal = original;
       changed = true;
     }
-    if (Array.isArray(metadata.supportedReasoningEfforts) && metadata.supportedReasoningEfforts.length > 0) {
+    if (Array.isArray(metadata.supportedReasoningEfforts)
+      && (metadata.supportedReasoningEfforts.length > 0 || usesDeclaredReasoningEfforts(modelName))) {
       const nextEfforts = modelReasoningEfforts(modelName);
-      if (JSON.stringify(descriptor.supportedReasoningEfforts || []) !== JSON.stringify(nextEfforts)) {
+      if (JSON.stringify(descriptor.supportedReasoningEfforts) !== JSON.stringify(nextEfforts)) {
         descriptor.supportedReasoningEfforts = nextEfforts;
         changed = true;
       }
