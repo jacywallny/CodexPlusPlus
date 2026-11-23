@@ -14045,7 +14045,7 @@ function RelayProfileEditor({
                 {showApiFields && profile.relayMode !== "aggregate" ? (
                   <label className="switch-row compact relay-switch-row relay-field-image-compress">
                     <input type="checkbox" checked={profile.imageCompress === true} onChange={(event) => updateDraft({ imageCompress: event.currentTarget.checked })} />
-                    <span><strong>{t("压缩随请求发送的大图")}</strong><small>{t("通过本地代理压缩原样发送的大型内联 JPEG／PNG 图片，减小截图和历史图片占用的请求体。压缩可能降低图片清晰度。默认关闭。")}</small></span><ToggleVisual />
+                    <span><strong>{t("压缩随请求发送的大图")}</strong><small>{t("通过本地代理压缩原样发送的大型内联图片，支持 JPEG、PNG 和静态 WebP。压缩可以减小截图和历史图片占用的请求体，也可能降低图片清晰度。默认关闭。")}</small></span><ToggleVisual />
                   </label>
                 ) : null}
                 {showApiFields && profile.protocol === "responses" ? <>

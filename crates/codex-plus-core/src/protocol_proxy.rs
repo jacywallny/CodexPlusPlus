@@ -6838,7 +6838,7 @@ pub(crate) async fn compress_embedded_request_images(
         for item in items {
             let mut parts = Vec::new();
             match item.get("type").and_then(Value::as_str) {
-                Some("function_call_output") => {
+                Some("function_call_output" | "custom_tool_call_output") => {
                     if let Some(output) = item.get_mut("output").and_then(Value::as_array_mut) {
                         parts.extend(output);
                     }
@@ -15003,7 +15003,10 @@ mod parallel_tool_call_pairing_tests {
                 ]},
                 {"type": "computer_call_output", "call_id": "call_screen", "output": {
                     "type": "computer_screenshot", "image_url": image
-                }}
+                }},
+                {"type": "custom_tool_call_output", "call_id": "call_custom", "output": [
+                    {"type": "input_image", "image_url": image}
+                ]}
             ]
         });
         let mut relay = crate::settings::RelayProfile {
@@ -15027,6 +15030,7 @@ mod parallel_tool_call_pairing_tests {
         assert_eq!(content[2], body["input"][0]["content"][2]);
         assert!(output["input"][2]["output"][0]["image_url"] == compressed);
         assert!(output["input"][3]["output"]["image_url"] == compressed);
+        assert!(output["input"][4]["output"][0]["image_url"] == compressed);
 
         relay.model_vlm = r#"{"gpt-test":"strip"}"#.into();
         let output = prepare_image_compression_request(&relay, &body, None).await;

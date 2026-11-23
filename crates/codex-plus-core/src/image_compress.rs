@@ -6,6 +6,7 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::codecs::jpeg::{JpegDecoder, JpegEncoder};
 use image::codecs::png::{PngDecoder, PngEncoder};
+use image::codecs::webp::WebPDecoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageDecoder, ImageEncoder, ImageFormat, Limits};
 use sha2::{Digest, Sha256};
@@ -46,6 +47,7 @@ pub(crate) async fn compress_base64_image(media_type: &str, data: &str) -> Optio
     let format = match media_type {
         "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
         "image/png" => ImageFormat::Png,
+        "image/webp" => ImageFormat::WebP,
         _ => return None,
     };
     let original_size = media_type.len() + data.len();
@@ -75,7 +77,7 @@ fn compress_cached(format: ImageFormat, data: &str) -> Option<Arc<Compression>> 
     }
     let value = compress(format, data).map(Arc::new);
     if value
-        .as_ref()
+        .as_deref()
         .is_none_or(|(_, encoded)| encoded.len() <= MAX_CACHE_ENTRY_BYTES)
     {
         if let Ok(mut cache) = CACHE.lock() {
@@ -109,6 +111,14 @@ fn compress(format: ImageFormat, data: &str) -> Option<Compression> {
         }
         ImageFormat::Jpeg => {
             let mut decoder = JpegDecoder::new(source).ok()?;
+            decoder.set_limits(limits).ok()?;
+            decode(decoder)?
+        }
+        ImageFormat::WebP => {
+            let mut decoder = WebPDecoder::new(source).ok()?;
+            if decoder.has_animation() {
+                return None;
+            }
             decoder.set_limits(limits).ok()?;
             decode(decoder)?
         }
@@ -159,9 +169,9 @@ fn decode(mut decoder: impl ImageDecoder) -> Option<DynamicImage> {
 }
 
 #[cfg(test)]
-fn sample_png(width: u32, height: u32, transparent: bool) -> String {
+fn sample_pixels(width: u32, height: u32, transparent: bool) -> image::RgbaImage {
     let mut random = 123_456_789u32;
-    let pixels = image::RgbaImage::from_fn(width, height, |x, _| {
+    image::RgbaImage::from_fn(width, height, |x, _| {
         random ^= random << 13;
         random ^= random >> 17;
         random ^= random << 5;
@@ -172,7 +182,12 @@ fn sample_png(width: u32, height: u32, transparent: bool) -> String {
             255
         };
         image::Rgba([red, green, blue, alpha])
-    });
+    })
+}
+
+#[cfg(test)]
+fn sample_png(width: u32, height: u32, transparent: bool) -> String {
+    let pixels = sample_pixels(width, height, transparent);
     let mut bytes = Vec::new();
     PngEncoder::new(&mut bytes)
         .write_image(&pixels, width, height, image::ExtendedColorType::Rgba8)
@@ -216,6 +231,26 @@ mod tests {
         let data = sample_png(2000, 160, true);
         let (mime, encoded) = compress(ImageFormat::Png, &data).unwrap();
         assert_eq!(mime, "image/png");
+        let result = image::load_from_memory(&STANDARD.decode(encoded).unwrap())
+            .unwrap()
+            .into_rgba8();
+        assert_eq!(result.dimensions(), (1600, 128));
+        assert_eq!(result.get_pixel(0, 0)[3], 40);
+        assert_eq!(result.get_pixel(1599, 0)[3], 255);
+    }
+
+    #[test]
+    fn compresses_still_webp_without_losing_transparency() {
+        let pixels = sample_pixels(2000, 160, true);
+        let mut image_bytes = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut image_bytes)
+            .write_image(&pixels, 2000, 160, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let data = STANDARD.encode(image_bytes);
+        assert!(data.len() > MIN_BASE64_BYTES);
+        let (mime, encoded) = compress(ImageFormat::WebP, &data).unwrap();
+        assert_eq!(mime, "image/png");
+        assert!(encoded.len() < data.len());
         let result = image::load_from_memory(&STANDARD.decode(encoded).unwrap())
             .unwrap()
             .into_rgba8();
