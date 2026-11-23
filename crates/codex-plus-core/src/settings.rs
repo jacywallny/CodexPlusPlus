@@ -1143,6 +1143,8 @@ pub struct BackendSettings {
     pub gateway_stream_header_budget_secs: Option<u64>,
     #[serde(rename = "gatewayStreamHealthRoutingEnabled", default)]
     pub gateway_stream_health_routing_enabled: bool,
+    #[serde(rename = "gatewayTextContinuationEnabled", default)]
+    pub gateway_text_continuation_enabled: bool,
     #[serde(rename = "gatewayStreamFirstOutputTimeoutSecs", default, skip_serializing_if = "Option::is_none")]
     pub gateway_stream_first_output_timeout_secs: Option<u64>,
     #[serde(rename = "gatewayStreamBodyIdleTimeoutSecs", default, skip_serializing_if = "Option::is_none")]
@@ -1583,6 +1585,7 @@ impl Default for BackendSettings {
             gateway_provider_stream_header_timeout_secs: BTreeMap::new(),
             gateway_stream_header_budget_secs: None,
             gateway_stream_health_routing_enabled: false,
+            gateway_text_continuation_enabled: false,
             gateway_stream_first_output_timeout_secs: None,
             gateway_stream_body_idle_timeout_secs: None,
             native_auth_selection: None,
@@ -3005,6 +3008,24 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     }
     merge_bool_setting(target, source, "protocolProxyAutoRetry");
     merge_bool_setting(target, source, "gatewayStreamHealthRoutingEnabled");
+    merge_bool_setting(target, source, "gatewayTextContinuationEnabled");
+    for (key, minimum) in [
+        ("upstreamStreamHeaderTimeoutSecs", 120),
+        ("gatewayStreamHeaderBudgetSecs", 1),
+    ] {
+        if let Some(value) = source.get(key)
+            && (value.is_null()
+                || value.as_u64().is_some_and(|seconds| (minimum..=3600).contains(&seconds)))
+        {
+            target.insert(key.to_owned(), value.clone());
+        }
+    }
+    if let Some(value) = source.get("gatewayProviderStreamHeaderTimeoutSecs")
+        && value.as_object().is_some_and(|providers| providers.values().all(Value::is_u64))
+    {
+        // 已手填的旧值由网关按实际范围截断。更新某个供应商时保留其他已有条目。
+        target.insert("gatewayProviderStreamHeaderTimeoutSecs".to_owned(), value.clone());
+    }
     // 目录外模型映射开关同上：漏登记会让 /settings/set 补丁「保存了但没生效」。
     merge_bool_setting(target, source, "protocolProxyMapUnlistedModels");
     if let Some(value) = source
@@ -5326,6 +5347,61 @@ experimental_bearer_token = "sk-existing""#
 
         let ignored = store.update(json!({ "managerAgentFocus": "bogus" })).unwrap();
         assert_eq!(ignored.manager_agent_focus, "enhance", "未知值不覆盖");
+    }
+
+    #[test]
+    fn gateway_stream_settings_round_trip_through_settings_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let initial = store.load().unwrap();
+        assert!(!initial.gateway_text_continuation_enabled);
+        assert_eq!(initial.upstream_stream_header_timeout_secs, None);
+        assert_eq!(initial.gateway_stream_header_budget_secs, None);
+        assert!(initial.gateway_provider_stream_header_timeout_secs.is_empty());
+
+        store.update(json!({
+            "gatewayTextContinuationEnabled": true,
+            "upstreamStreamHeaderTimeoutSecs": 180,
+            "gatewayStreamHeaderBudgetSecs": 240,
+            "gatewayProviderStreamHeaderTimeoutSecs": { "provider-a": 200, "provider-b": 220 },
+        })).unwrap();
+        let saved = store.load().unwrap();
+        assert!(saved.gateway_text_continuation_enabled);
+        assert_eq!(saved.upstream_stream_header_timeout_secs, Some(180));
+        assert_eq!(saved.gateway_stream_header_budget_secs, Some(240));
+        assert_eq!(
+            saved.gateway_provider_stream_header_timeout_secs,
+            BTreeMap::from([("provider-a".into(), 200), ("provider-b".into(), 220)])
+        );
+
+        let invalid = store.update(json!({
+            "gatewayTextContinuationEnabled": 1,
+            "upstreamStreamHeaderTimeoutSecs": 119,
+            "gatewayStreamHeaderBudgetSecs": 3601,
+            "gatewayProviderStreamHeaderTimeoutSecs": { "provider-a": -1 },
+        })).unwrap();
+        assert!(invalid.gateway_text_continuation_enabled);
+        assert_eq!(invalid.upstream_stream_header_timeout_secs, Some(180));
+        assert_eq!(invalid.gateway_stream_header_budget_secs, Some(240));
+        assert_eq!(
+            invalid.gateway_provider_stream_header_timeout_secs,
+            saved.gateway_provider_stream_header_timeout_secs
+        );
+
+        store.update(json!({
+            "gatewayTextContinuationEnabled": false,
+            "upstreamStreamHeaderTimeoutSecs": null,
+            "gatewayStreamHeaderBudgetSecs": null,
+            "gatewayProviderStreamHeaderTimeoutSecs": { "provider-b": 220 },
+        })).unwrap();
+        let reset = store.load().unwrap();
+        assert!(!reset.gateway_text_continuation_enabled);
+        assert_eq!(reset.upstream_stream_header_timeout_secs, None);
+        assert_eq!(reset.gateway_stream_header_budget_secs, None);
+        assert_eq!(
+            reset.gateway_provider_stream_header_timeout_secs,
+            BTreeMap::from([("provider-b".into(), 220)])
+        );
     }
 
     #[test]

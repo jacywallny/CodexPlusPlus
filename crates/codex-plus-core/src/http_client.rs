@@ -60,6 +60,7 @@ struct ClientOptions {
     connect_timeout: Option<std::time::Duration>,
     total_timeout: Option<std::time::Duration>,
     redirect: Option<reqwest::redirect::Policy>,
+    disable_retries: bool,
     pool_idle_timeout: Option<std::time::Duration>,
 }
 
@@ -82,6 +83,9 @@ fn build_client_with_proxy_choice(
     }
     if let Some(policy) = options.redirect {
         builder = builder.redirect(policy);
+    }
+    if options.disable_retries {
+        builder = builder.retry(reqwest::retry::never());
     }
     if let Some(timeout) = options.pool_idle_timeout {
         builder = builder.pool_idle_timeout(timeout);
@@ -114,7 +118,7 @@ fn build_proxied_client_with_timeouts(
             connect_timeout,
             total_timeout,
             redirect,
-            pool_idle_timeout: None,
+            ..ClientOptions::default()
         },
     )
 }
@@ -210,6 +214,8 @@ fn cached_relay_client(
         &key.proxy,
         ClientOptions {
             redirect: (!follow_redirects).then(reqwest::redirect::Policy::none),
+            // 网关的重试由请求阶段和预算统一控制。
+            disable_retries: !follow_redirects,
             pool_idle_timeout: Some(RELAY_CLIENT_POOL_IDLE_TIMEOUT),
             ..ClientOptions::default()
         },

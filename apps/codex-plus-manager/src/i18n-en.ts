@@ -1945,6 +1945,16 @@ export const EN_PLAIN: Record<string, string> = {
   "多家都有的模型自动成一个组：Agent 选不带供应商的模型名时走它。关掉后只列出你建的组，不带供应商的模型名按供应商池的顺序依次尝试。": "A model offered by several providers becomes a group on its own, used when an agent picks the model name without a provider. Off: only your groups are listed, and a plain model name tries providers in pool order.",
   "自动建组": "Auto groups",
   "自动组熔断": "Auto-group circuit breaker",
+  "流式响应": "Streaming responses",
+  "默认响应头等待（秒）": "Default response header wait (s)",
+  "供应商未单独配置时使用。": "Used when the provider has no override.",
+  "响应头总预算（秒）": "Total response header budget (s)",
+  "同一请求的所有供应商尝试共用。": "Shared across all provider attempts for a request.",
+  "供应商响应头等待（秒）": "Provider response header wait (s)",
+  "保存响应头预算": "Save response header budget",
+  "纯文本断流后自动续写": "Continue interrupted text automatically",
+  "Codex HTTP 纯文本出字后断流时，向同一供应商和模型发起一次续写请求，会产生额外用量。": "If a Codex HTTP stream drops after producing text only, send one continuation request to the same provider and model. This adds usage.",
+  "保存自动续写": "Save automatic continuation",
   "仅用于 Codex HTTP 自动组。某供应商的同一模型连续两次流式故障后，后续请求暂时跳过它。": "Only for Codex HTTP auto groups. After two consecutive streaming failures for a provider and model, later requests temporarily skip that provider for that model.",
   "新建组": "New group",
   "组让 Agent 把几个模型当成一个来选：按什么方式先试哪个、同一会话要不要固定、出错换谁，都在卡片上改。": "A group lets agents pick several models as one. Which goes first, whether a conversation sticks to one, and who takes over on errors are all set on the card.",
@@ -3799,6 +3809,8 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "{0}–3600 秒，留空使用 {1} 秒": "{0}–3600 seconds. Leave blank to use {1} seconds.",
+  "当前上限 {0} 秒，且受请求剩余总预算限制。": "Current limit: {0} seconds, subject to the remaining request budget.",
   "{0} 个 Skill 失败": "{0} skill operation(s) failed",
   "已批量{0} {1} 个 Skill": "{0} {1} skill(s)",
   "删除 Skill 备份“{0}”？": "Delete skill backup \"{0}\"?",
@@ -4474,6 +4486,11 @@ export const EN_TEMPLATE: Record<string, string> = {
 // at the display layer (showNotice wraps message with t()). Exact-match first,
 // then pattern-based for messages that embed dynamic values.
 export const EN_BACKEND: Record<string, string> = {
+  "自动续写已保存。": "Automatic continuation saved.",
+  "保存自动续写失败": "Could not save automatic continuation",
+  "响应头预算已保存。": "Response header budget saved.",
+  "保存响应头预算失败": "Could not save the response header budget",
+  "未知的响应头预算设置": "Unknown response header budget setting",
   "不能另存到受控源、备份或共享目录，请选择 Agent 安装目录或其他目录": "Cannot save into a managed source, backup or shared directory. Choose an agent's installation folder or another folder.",
   "无法解析 Skill 管理目录": "Cannot resolve the skill management directory",
   "未配置共享目录": "No shared directory configured",

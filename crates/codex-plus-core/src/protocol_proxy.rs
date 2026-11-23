@@ -1094,6 +1094,9 @@ fn next_sse_boundary(bytes: &[u8], from: usize) -> Option<usize> {
     None
 }
 
+#[path = "protocol_proxy/text_continuation.rs"]
+pub(crate) mod text_continuation;
+
 /// 从 response.failed / error 事件里提取 (code, message)，兼容几种常见包裹层级。
 fn stream_failure_payload(block: &str) -> (Option<String>, Option<String>) {
     let mut data_parts = Vec::new();
@@ -2339,11 +2342,22 @@ pub fn upstream_stream_header_timeout() -> Duration {
 /// 可在 settings.json 写 `upstreamStreamHeaderTimeoutSecs` 调大（#3130：长推理模型
 /// 首字超过 120s 会被判超时）。下限 120（兜底真正卡死的连接）、上限 3600。
 pub fn stream_header_timeout() -> Duration {
-    let configured = SettingsStore::default()
-        .load()
-        .ok()
-        .and_then(|settings| settings.upstream_stream_header_timeout_secs);
-    configured_stream_header_timeout(configured)
+    type CachedTimeout = (std::path::PathBuf, Instant, Duration);
+    static CACHE: Mutex<Option<CachedTimeout>> = Mutex::new(None);
+    let path = crate::paths::default_settings_path();
+    let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some((cached_path, loaded_at, timeout)) = cache.as_ref()
+        && *cached_path == path
+        && loaded_at.elapsed() < Duration::from_secs(1)
+    {
+        return *timeout;
+    }
+    let Ok(settings) = SettingsStore::new(path.clone()).load() else {
+        return UPSTREAM_STREAM_HEADER_TIMEOUT;
+    };
+    let timeout = configured_stream_header_timeout(settings.upstream_stream_header_timeout_secs);
+    *cache = Some((path, Instant::now(), timeout));
+    timeout
 }
 
 pub(crate) fn configured_stream_header_timeout(configured: Option<u64>) -> Duration {
@@ -4465,8 +4479,9 @@ async fn open_responses_proxy_request_once(
                 );
             }
         }
-        let header_timeout =
-            responses_request_header_timeout(is_stream, is_compaction_request, via_gateway);
+        let header_timeout = crate::gateway::http_wait::HTTP_ATTEMPT
+            .try_with(|attempt| attempt.deadline().saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or_else(|_| responses_request_header_timeout(is_stream, is_compaction_request, via_gateway));
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "protocol_proxy.upstream_request",
             json!({
@@ -5568,6 +5583,33 @@ async fn open_responses_proxy_request_once(
                 .split(';')
                 .next()
                 .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"));
+        if settings.gateway_text_continuation_enabled
+            && is_stream
+            && status_code == 200
+            && content_type.starts_with("text/event-stream")
+            && wire_api == UpstreamWireApi::Responses
+            && !official_member
+            && !exec_adapted
+            && !is_compaction_request
+            && !local_compaction_request
+            && !experimental_local_compaction
+            && !via_gateway
+            && !is_local_protocol_proxy_base_url(&endpoint)
+            && let Ok(timeout) = crate::gateway::http_wait::HTTP_ATTEMPT
+                .try_with(|attempt| attempt.continuation_header_timeout())
+            && let Some(body) = text_continuation::request_body(&upstream_body)
+            && let Ok(mut builder) = build_responses_upstream_request(
+                &relay, &endpoint, &Value::Null, wire_api, true,
+                original_user_agent, beta_features, session_headers, None,
+            )
+        {
+            for (name, value) in crate::extension_gateway::extension_headers() {
+                builder = builder.header(name, value);
+            }
+            upstream.extensions_mut().insert(text_continuation::Pending::new(
+                builder, body, timeout,
+            ));
+        }
         return Ok(UpstreamProxyResponse {
             status_code,
             is_stream: (is_stream && !json_compaction)
@@ -13511,6 +13553,7 @@ pub(crate) struct ResponsesSseTransformer {
     phase_fill: Option<MessagePhaseFill>,
     /// 只补阶段标记、其余事件原样放行：接在别的 SSE 转换器后面用（见 [`Self::phase_fill_only`]）。
     phase_only: bool,
+    text_prefix: Option<text_continuation::TextPrefix>,
 }
 
 /// 给第三方 Responses 上游缺失的助手消息 `phase` 补标记（issue #2659）。
@@ -13668,6 +13711,17 @@ pub fn message_phase_fill_enabled() -> bool {
 }
 
 impl ResponsesSseTransformer {
+    pub(crate) fn tracking_text_prefix(mut self, enabled: bool) -> Self {
+        self.text_prefix = enabled.then(text_continuation::TextPrefix::default);
+        self
+    }
+
+    pub(crate) fn take_text_prefix(&mut self) -> Option<text_continuation::TextPrefix> {
+        if !self.buf.is_empty() || self.passthrough_event.is_some() || self.final_response_invalid {
+            return None;
+        }
+        self.text_prefix.take().filter(text_continuation::TextPrefix::recoverable)
+    }
     pub(crate) fn protecting_gateway_replay(mut self, enabled: bool) -> Self {
         self.protect_gateway_replay = enabled;
         self
@@ -13773,6 +13827,7 @@ impl ResponsesSseTransformer {
                     return out;
                 }
             } else if self.buf.len() >= RESPONSES_SSE_MAX_EVENT_BYTES {
+                self.text_prefix = None;
                 // 超大事件：识别类型后把已缓冲部分连同后续字节原样转发到事件边界。
                 let event_type = sse_event_type_from_prefix(&self.buf);
                 // 暂存的消息必须先于超大事件写出，按该事件类型决定阶段。
@@ -13889,6 +13944,7 @@ impl ResponsesSseTransformer {
         let data_json: Value = match serde_json::from_str(&data_json_str) {
             Ok(v) => v,
             Err(_) => {
+                self.text_prefix = None;
                 if data_json_str.trim() != "[DONE]" {
                     self.final_response_invalid = true;
                 }
@@ -13903,6 +13959,11 @@ impl ResponsesSseTransformer {
             .map(str::to_string)
             .or(sse_event_name);
         let event_type = event_type_owned.as_deref().unwrap_or("");
+        if let Some(prefix) = self.text_prefix.as_mut()
+            && !prefix.observe(event_type, &data_json)
+        {
+            self.text_prefix = None;
+        }
         if self.strip_backend_events && is_backend_private_event(event_type) {
             return Vec::new();
         }

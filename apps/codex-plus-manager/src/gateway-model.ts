@@ -300,6 +300,10 @@ export type AgentActivityView = {
 export type GatewayPayload = {
   gateway: GatewaySettings;
   streamHealthRoutingEnabled?: boolean;
+  textContinuationEnabled?: boolean;
+  streamHeaderTimeoutSecs?: number | null;
+  streamHeaderBudgetSecs?: number | null;
+  providerStreamHeaderTimeoutSecs?: Record<string, number>;
   port: number;
   helperRunning: boolean;
   /** Codex 旧版供应商配置总开关；旧版后端没有这个字段。 */

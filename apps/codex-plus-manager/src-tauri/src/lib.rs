@@ -478,6 +478,8 @@ pub fn run() {
             gateway_commands::set_gateway_auto_group_enabled,
             gateway_commands::save_gateway_auto_models,
             gateway_commands::save_gateway_stream_health_routing,
+            gateway_commands::save_gateway_text_continuation,
+            gateway_commands::save_gateway_header_timeout,
             gateway_commands::save_gateway_favorites,
             gateway_commands::save_gateway_options,
             gateway_commands::load_gateway_port,

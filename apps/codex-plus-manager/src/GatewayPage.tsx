@@ -984,6 +984,97 @@ function GatewayPortRow({ notify }: { notify: Notify }) {
   );
 }
 
+function HeaderTimeoutInput({ title, scope, providerId, value, fallback, minimum, busy, run }: {
+  title: string;
+  scope: "default" | "budget" | "provider";
+  providerId?: string;
+  value: number | null;
+  fallback: number;
+  minimum: number;
+  busy: string | null;
+  run: Run;
+}) {
+  const saved = value?.toString() ?? "";
+  const [draft, setDraft] = useState<string | null>(null);
+  const text = draft ?? saved;
+  const seconds = text === "" ? null : Number(text);
+  const invalid = seconds !== null && (!/^\d+$/.test(text) || seconds < minimum || seconds > 3600);
+  const canSave = !invalid && seconds !== value && busy === null;
+  return (
+    <form className="flex items-center gap-2" onSubmit={async (event) => {
+      event.preventDefault();
+      if (!canSave) return;
+      if (await run(`header-timeout:${scope}`, "save_gateway_header_timeout", { scope, providerId, seconds }, t("保存响应头预算"), true)) {
+        setDraft(null);
+      }
+    }}>
+      <Input
+        aria-invalid={invalid || undefined}
+        aria-label={title}
+        className="cx-set-input-port"
+        disabled={busy !== null}
+        inputMode="numeric"
+        onChange={(event) => setDraft(event.currentTarget.value)}
+        placeholder={String(fallback)}
+        title={tf("{0}–3600 秒，留空使用 {1} 秒", [minimum, fallback])}
+        value={text}
+      />
+      <button className="cx-secondary" disabled={!canSave} type="submit">{t("保存")}</button>
+    </form>
+  );
+}
+
+function GatewayStreamSettings({ payload, busy, run }: { payload: GatewayPayload; busy: string | null; run: Run }) {
+  const [selected, setSelected] = useState("");
+  const provider = payload.pool.find((entry) => entry.id === selected) ?? payload.pool[0];
+  const defaultOverride = payload.streamHeaderTimeoutSecs ?? null;
+  const budgetOverride = payload.streamHeaderBudgetSecs ?? null;
+  const defaultSeconds = defaultOverride ?? 120;
+  const budgetDefault = Math.max(240, defaultSeconds);
+  const providerSeconds = provider ? payload.providerStreamHeaderTimeoutSecs?.[provider.id] ?? null : null;
+  const continuationEnabled = payload.textContinuationEnabled === true;
+  return (
+    <CxSection title={t("流式响应")}>
+      <CxCard>
+        <CxRow title={t("默认响应头等待（秒）")} detail={t("供应商未单独配置时使用。")}>
+          <HeaderTimeoutInput title={t("默认响应头等待（秒）")} scope="default" value={defaultOverride} fallback={120} minimum={120} busy={busy} run={run} />
+        </CxRow>
+        <CxRow title={t("响应头总预算（秒）")} detail={t("同一请求的所有供应商尝试共用。")}>
+          <HeaderTimeoutInput title={t("响应头总预算（秒）")} scope="budget" value={budgetOverride} fallback={budgetDefault} minimum={1} busy={busy} run={run} />
+        </CxRow>
+        {provider && <CxRow
+          title={t("供应商响应头等待（秒）")}
+          detail={tf("当前上限 {0} 秒，且受请求剩余总预算限制。", [Math.min(providerSeconds ?? defaultSeconds, budgetOverride ?? budgetDefault)])}
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <AppSelect
+              className="cx-set-select"
+              disabled={busy !== null}
+              label={t("供应商")}
+              onChange={setSelected}
+              options={payload.pool.map((entry) => ({ value: entry.id, label: entry.name }))}
+              size="sm"
+              value={provider.id}
+            />
+            <HeaderTimeoutInput key={provider.id} title={t("供应商响应头等待（秒）")} scope="provider" providerId={provider.id} value={providerSeconds} fallback={defaultSeconds} minimum={1} busy={busy} run={run} />
+          </div>
+        </CxRow>}
+        <CxRow
+          title={t("纯文本断流后自动续写")}
+          detail={t("Codex HTTP 纯文本出字后断流时，向同一供应商和模型发起一次续写请求，会产生额外用量。")}
+        >
+          <Switch
+            label={t("纯文本断流后自动续写")}
+            on={continuationEnabled}
+            pending={busy !== null}
+            onToggle={() => void run("text-continuation", "save_gateway_text_continuation", { enabled: !continuationEnabled }, t("保存自动续写"), true)}
+          />
+        </CxRow>
+      </CxCard>
+    </CxSection>
+  );
+}
+
 function GatewayView({ payload, busy, run, notify }: { payload: GatewayPayload | null; busy: string | null; run: Run; notify: Notify }) {
   const agentFocus = useAgentFocus();
   // 刚复制的那一行，图标短暂换成对勾。
@@ -1058,6 +1149,7 @@ function GatewayView({ payload, busy, run, notify }: { payload: GatewayPayload |
         </CxCard>
       </CxSection>
 
+      <GatewayStreamSettings payload={payload} busy={busy} run={run} />
       <CxSection title={t("网关选项")}>
         <CxCard>
           <GatewayPortRow notify={notify} />

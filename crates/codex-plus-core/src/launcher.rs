@@ -3467,8 +3467,9 @@ async fn handle_protocol_proxy_connection_inner(
         // 拓展的网关响应流中间件：在 Codex++ 自己的转换之后、写给 Codex 之前改写事件。
         let mut sink = ExtensionResponseSink::new(stream, path, request_json.as_ref()).await;
         let response_unmodified = sink.filter.is_none();
+        let mut continuation_attempted = false;
         let mut final_usage = None;
-        let (failure, usage, failure_detail, first_output_at_ms) =
+        let forwarded =
             forward_protocol_proxy_stream_for_client_with_live_request(
                 &mut sink,
                 &stream_prefix,
@@ -3480,8 +3481,15 @@ async fn handle_protocol_proxy_connection_inner(
                 matches!(&opener, ProxyOpener::Gateway(crate::tools::ToolId::Codex)),
                 Some(live_request_id.as_str()),
                 &mut final_usage,
+                _key_slot.as_ref(),
+                &mut continuation_attempted,
             )
-            .await?;
+            .await;
+        if continuation_attempted {
+            request_log.entry.attempts = request_log.entry.attempts.saturating_add(1);
+            request_log.entry.retry_reasons.push("stream_text_continuation".to_owned());
+        }
+        let (failure, usage, failure_detail, first_output_at_ms) = forwarded?;
         sink.finish().await?;
         if !response_unmodified {
             final_usage = None;
@@ -5502,11 +5510,29 @@ async fn write_http_stream_headers_with_usage(
 /// 上游 → Responses 的整条归一化链路（Chat / Anthropic / 原生 Responses）因此只有一份。
 pub(crate) trait SseSink {
     async fn send(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+
+    async fn wait_for_disconnect(&self) {
+        std::future::pending::<()>().await;
+    }
+
+    fn allows_text_continuation(&self) -> bool {
+        false
+    }
 }
 
 impl SseSink for tokio::net::TcpStream {
     async fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.write_all(bytes).await
+    }
+
+    async fn wait_for_disconnect(&self) {
+        if matches!(self.peek(&mut [0]).await, Ok(1)) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    fn allows_text_continuation(&self) -> bool {
+        true
     }
 }
 
@@ -5547,6 +5573,14 @@ impl<S: SseSink> SseSink for ExtensionResponseSink<'_, S> {
             None => self.inner.send(bytes).await,
         }
     }
+
+    async fn wait_for_disconnect(&self) {
+        self.inner.wait_for_disconnect().await;
+    }
+
+    fn allows_text_continuation(&self) -> bool {
+        self.filter.is_none() && self.inner.allows_text_continuation()
+    }
 }
 
 // 返回流失败原因与（可选的）usage；HTTP 响应头已经发送，不能再把失败伪装成第二个 HTTP 502。
@@ -5586,7 +5620,7 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
     Option<u64>,
 )> {
     forward_protocol_proxy_stream_for_client_with_live_request(
-        stream, prefix, response, wire_api, request, thread_id, foreign_client, false, None, &mut None,
+        stream, prefix, response, wire_api, request, thread_id, foreign_client, false, None, &mut None, None, &mut false,
     )
     .await
 }
@@ -5603,6 +5637,8 @@ async fn forward_protocol_proxy_stream_for_client_with_live_request<S: SseSink>(
     stop_codex_replay: bool,
     live_request_id: Option<&str>,
     final_response_usage: &mut Option<crate::request_log::FinalResponseUsage>,
+    key_slot: Option<&crate::gateway::key_pool::KeySlot>,
+    continuation_attempted: &mut bool,
 ) -> anyhow::Result<(
     Option<String>,
     Option<crate::request_log::RequestUsage>,
@@ -5611,6 +5647,12 @@ async fn forward_protocol_proxy_stream_for_client_with_live_request<S: SseSink>(
 )> {
     *final_response_usage = None;
     use crate::gateway::stream_health::{Body as StreamHealth, End};
+    use crate::protocol_proxy::text_continuation::Pending;
+    let continuation = if stop_codex_replay && !foreign_client && stream.allows_text_continuation() {
+        key_slot.and_then(|slot| Pending::take(&mut response).map(|pending| (pending, slot)))
+    } else {
+        None
+    };
     let mut health = StreamHealth::take(&mut response);
     let mut chunks = response.bytes_stream();
     let mut first_output_at_ms = None;
@@ -5618,7 +5660,8 @@ async fn forward_protocol_proxy_stream_for_client_with_live_request<S: SseSink>(
         let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::for_request(request)
             .filling_message_phase(crate::protocol_proxy::message_phase_fill_enabled())
             .stripping_backend_events(foreign_client)
-            .protecting_gateway_replay(stop_codex_replay);
+            .protecting_gateway_replay(stop_codex_replay)
+            .tracking_text_prefix(continuation.is_some());
         let mut observe = |bytes: &[u8],
                            transformer: &crate::protocol_proxy::ResponsesSseTransformer,
                            health: &mut Option<StreamHealth>| {
@@ -5654,20 +5697,31 @@ async fn forward_protocol_proxy_stream_for_client_with_live_request<S: SseSink>(
         }
         let mut interruption = None;
         while !stop_codex_replay || !transformer.has_completed() {
-            let next = match health.as_ref().and_then(StreamHealth::deadline) {
-                Some((deadline, end)) => match tokio::time::timeout_at(deadline.into(), chunks.next()).await {
-                    Ok(next) => next,
-                    Err(_) => {
-                        let reason = if end == End::FirstOutputTimeout {
-                            "上游在收到响应头后未按时返回模型输出"
-                        } else {
-                            "上游 SSE 响应体传输超时"
-                        };
-                        interruption = Some((end, reason.to_string()));
-                        break;
+            let deadline = health.as_ref().and_then(StreamHealth::deadline);
+            let next = tokio::select! {
+                biased;
+                () = stream.wait_for_disconnect(), if continuation.is_some() => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into());
+                }
+                next = async {
+                    match deadline {
+                        Some((deadline, end)) => tokio::time::timeout_at(deadline.into(), chunks.next())
+                            .await.map_err(|_| end),
+                        None => Ok(chunks.next().await),
                     }
-                },
-                None => chunks.next().await,
+                } => next,
+            };
+            let next = match next {
+                Ok(next) => next,
+                Err(end) => {
+                    let reason = if end == End::FirstOutputTimeout {
+                        "上游在收到响应头后未按时返回模型输出"
+                    } else {
+                        "上游 SSE 响应体传输超时"
+                    };
+                    interruption = Some((end, reason.to_string()));
+                    break;
+                }
             };
             let Some(chunk) = next else {
                 break;
@@ -5693,6 +5747,41 @@ async fn forward_protocol_proxy_stream_for_client_with_live_request<S: SseSink>(
         }
         if let Some(health) = health.as_mut() {
             health.finish(interruption.as_ref().map_or(End::MissingTerminal, |(end, _)| *end));
+        }
+        if !transformer.has_completed()
+            && interruption.as_ref().is_none_or(|(end, _)| *end == End::StreamReadError)
+            && let Some((continuation, key_slot)) = continuation
+            && let Some(text_prefix) = transformer.take_text_prefix()
+        {
+            drop(chunks);
+            let start = current_time_ms();
+            let recovered = tokio::select! {
+                biased;
+                () = stream.wait_for_disconnect() => None,
+                result = continuation.complete(text_prefix, key_slot, continuation_attempted) => Some(result),
+            };
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "gateway.http_text_continuation",
+                serde_json::json!({
+                    "requestId": live_request_id,
+                    "attempted": *continuation_attempted,
+                    "completed": recovered.as_ref().is_some_and(Result::is_ok),
+                    "downstreamDisconnected": recovered.is_none(),
+                    "elapsedMs": current_time_ms().saturating_sub(start),
+                }),
+            );
+            let Some(recovered) = recovered else {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into());
+            };
+            if let Ok(events) = recovered {
+                let out = transformer.push_bytes(&events);
+                stream.send(&out).await?;
+                return Ok((None, None, None, first_output_at_ms));
+            }
+            stream.send(&gateway_stream_stop_event(
+                "Codex++ 网关：自动续写未完成，已保留此前收到的文字。",
+            )).await?;
+            return Ok((Some("自动续写未完成".to_owned()), None, None, first_output_at_ms));
         }
         let pending = transformer.flush_pending();
         if !pending.is_empty() {
@@ -10377,7 +10466,7 @@ mod proxy_stream_tests {
         let forwarded = tokio::spawn(async move {
             let (result, usage, _detail, first_output_at_ms) =
                 super::forward_protocol_proxy_stream_for_client_with_live_request(
-                    &mut writer, &prefix, response, wire, None, None, false, stop_codex_replay, None, &mut None,
+                    &mut writer, &prefix, response, wire, None, None, false, stop_codex_replay, None, &mut None, None, &mut false,
                 ).await.unwrap();
             writer.shutdown().await.unwrap();
             (result, first_output_at_ms, usage)
@@ -10510,7 +10599,7 @@ mod proxy_stream_tests {
             let mut sink = NotifyingSink(Some(sent));
             let mut final_usage = None;
             let forward = super::forward_protocol_proxy_stream_for_client_with_live_request(
-                &mut sink, &[], response, wire, None, None, false, false, Some(&log.entry.id), &mut final_usage,
+                &mut sink, &[], response, wire, None, None, false, false, Some(&log.entry.id), &mut final_usage, None, &mut false,
             );
             tokio::pin!(forward);
             send_body.send(()).unwrap();

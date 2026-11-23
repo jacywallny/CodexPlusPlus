@@ -5,7 +5,8 @@
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde_json::json;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -167,6 +168,10 @@ pub struct GatewayPayload {
     /// 绑定与选项；供应商池单独放在 `pool`（不带 Key），这里的 `providers` 总是空的。
     pub gateway: GatewaySettings,
     pub stream_health_routing_enabled: bool,
+    pub text_continuation_enabled: bool,
+    pub stream_header_timeout_secs: Option<u64>,
+    pub stream_header_budget_secs: Option<u64>,
+    pub provider_stream_header_timeout_secs: BTreeMap<String, u64>,
     pub port: u16,
     pub helper_running: bool,
     /// Codex 旧版供应商配置总开关；网关接入 Codex 时也受此保护。
@@ -487,6 +492,18 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         image_auto,
         gateway,
         stream_health_routing_enabled: settings.gateway_stream_health_routing_enabled,
+        text_continuation_enabled: settings.gateway_text_continuation_enabled,
+        stream_header_timeout_secs: settings
+            .upstream_stream_header_timeout_secs
+            .map(|value| value.clamp(120, 3600)),
+        stream_header_budget_secs: settings
+            .gateway_stream_header_budget_secs
+            .map(|value| value.clamp(1, 3600)),
+        provider_stream_header_timeout_secs: settings
+            .gateway_provider_stream_header_timeout_secs
+            .iter()
+            .map(|(id, value)| (id.clone(), (*value).clamp(1, 3600)))
+            .collect(),
         port,
         helper_running,
         relay_profiles_enabled: settings.relay_profiles_enabled,
@@ -1102,6 +1119,52 @@ pub fn save_gateway_stream_health_routing(enabled: bool) -> CommandResult<Option
         "gatewayStreamHealthRoutingEnabled": enabled,
     }));
     respond("自动组熔断已保存。", "保存自动组熔断失败", result)
+}
+
+#[tauri::command]
+pub fn save_gateway_text_continuation(enabled: bool) -> CommandResult<Option<GatewayPayload>> {
+    let result =
+        SettingsStore::default().update(json!({"gatewayTextContinuationEnabled": enabled}));
+    respond("自动续写已保存。", "保存自动续写失败", result)
+}
+
+#[tauri::command]
+pub fn save_gateway_header_timeout(
+    scope: String,
+    provider_id: Option<String>,
+    seconds: Option<u64>,
+) -> CommandResult<Option<GatewayPayload>> {
+    let result = (|| {
+        let minimum = if scope == "default" { 120 } else { 1 };
+        anyhow::ensure!(
+            seconds.is_none_or(|seconds| (minimum..=3600).contains(&seconds)),
+            "请输入 {minimum}–3600 秒，或留空恢复默认值"
+        );
+        let store = SettingsStore::default();
+        let patch = match scope.as_str() {
+            "default" => json!({"upstreamStreamHeaderTimeoutSecs": seconds}),
+            "budget" => json!({"gatewayStreamHeaderBudgetSecs": seconds}),
+            "provider" => {
+                let id = provider_id
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("请选择供应商"))?;
+                let settings = store.load()?;
+                let mut overrides = settings.gateway_provider_stream_header_timeout_secs;
+                if let Some(value) = seconds {
+                    overrides.insert(id, value);
+                } else {
+                    overrides.remove(&id);
+                }
+                json!({
+                    "revision": settings.settings_revision,
+                    "gatewayProviderStreamHeaderTimeoutSecs": overrides,
+                })
+            }
+            _ => anyhow::bail!("未知的响应头预算设置"),
+        };
+        store.update(patch)
+    })();
+    respond("响应头预算已保存。", "保存响应头预算失败", result)
 }
 
 /// [`scan_gateway_local_logins`] 的结果。要包一层：[`CommandResult`] 把 payload 用 `serde(flatten)`

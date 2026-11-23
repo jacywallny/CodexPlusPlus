@@ -817,7 +817,7 @@ pub fn limit_state(key: &KeyRef, limits: KeyLimits, now: Instant) -> KeyLimitSta
 /// 满了返回 None。没设上限时不记任何东西，直接给一个空名额。
 pub fn try_acquire(key: &KeyRef, limits: KeyLimits, now: Instant) -> Option<KeySlot> {
     if limits.is_unlimited() {
-        return Some(KeySlot { held: None });
+        return Some(KeySlot { held: None, rpm: None });
     }
     let id = (key.relay_id.clone(), key.key_id.clone());
     let mut table = usage_lock();
@@ -830,6 +830,7 @@ pub fn try_acquire(key: &KeyRef, limits: KeyLimits, now: Instant) -> Option<KeyS
     usage.in_flight = usage.in_flight.saturating_add(1);
     Some(KeySlot {
         held: Some((id, now)),
+        rpm: limits.rpm,
     })
 }
 
@@ -839,9 +840,25 @@ pub fn try_acquire(key: &KeyRef, limits: KeyLimits, now: Instant) -> Option<KeyS
 #[must_use = "名额在 drop 时释放，要持有到请求真正结束"]
 pub struct KeySlot {
     held: Option<((String, String), Instant)>,
+    rpm: Option<u32>,
 }
 
 impl KeySlot {
+    pub(crate) fn try_record_additional_send(&self) -> bool {
+        let Some((id, _)) = &self.held else {
+            return true;
+        };
+        let mut table = usage_lock();
+        let usage = table.entry(id.clone()).or_default();
+        let now = Instant::now();
+        usage.prune(now);
+        if self.rpm.is_some_and(|rpm| usage.sent.len() >= rpm as usize) {
+            return false;
+        }
+        usage.sent.push_back(now);
+        true
+    }
+
     /// 请求其实没发出去（例如发之前换 token 失败）：连 RPM 的这一次也退掉。
     pub fn cancel(mut self) {
         if let Some((id, at)) = self.held.take() {
@@ -1351,6 +1368,21 @@ mod tests {
         drop(slot);
         assert_eq!(limit_state(&key_a, limits, now), KeyLimitState::Free);
         assert_eq!(first_free(&relay, limits, now).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn additional_send_counts_against_rpm_without_acquiring_another_slot() {
+        let relay = relay("kp-additional-send", &[("a", "sk-a")]);
+        let limits = limits(Some(2), Some(1));
+        let key = expand_keys(&relay)[0].key.clone();
+        let slot = try_acquire(&key, limits, Instant::now()).unwrap();
+        assert!(slot.try_record_additional_send());
+        assert!(!slot.try_record_additional_send());
+        drop(slot);
+        assert!(matches!(
+            limit_state(&key, limits, Instant::now()),
+            KeyLimitState::Full { retry_in: Some(_) }
+        ));
     }
 
     #[test]
