@@ -2503,35 +2503,37 @@ async fn send_gateway_http_request(
             Ok(Ok(response)) if response.status().is_redirection() => {
                 let status = response.status().as_u16();
                 return Err(HTTP_ATTEMPT.with(|scope| {
-                    scope.record(&send, "redirect_refused", Some(status), false);
+                    scope.record(&send, "redirect_refused", Some(status), false, None);
                     scope.redirect_error(status)
                 }).into());
             }
             Ok(Ok(mut response)) => {
                 response.extensions_mut().insert(send.headers_received());
-                HTTP_ATTEMPT.with(|scope| scope.record(&send, "headers_received", Some(response.status().as_u16()), false));
+                HTTP_ATTEMPT.with(|scope| scope.record(&send, "headers_received", Some(response.status().as_u16()), false, None));
                 return Ok(response);
             }
             Ok(Err(error)) if error.is_connect() => {
                 let retry = retry_source.zip(delays.next()).filter(|(_, delay)| {
                     tokio::time::Instant::now() + *delay < deadline
                 });
-                HTTP_ATTEMPT.with(|scope| scope.record(&send, "connect_error", None, retry.is_some()));
+                let error = error.without_url();
+                HTTP_ATTEMPT.with(|scope| scope.record(&send, "connect_error", None, retry.is_some(), Some(&error)));
                 let Some((next, delay)) = retry else {
                     return Err(anyhow::Error::new(error).context("上游连接失败"));
                 };
                 tokio::time::sleep(delay).await;
                 builder = next;
             }
-            Ok(Err(_)) => {
+            Ok(Err(error)) => {
+                let error = error.without_url();
                 return Err(HTTP_ATTEMPT.with(|scope| {
-                    scope.record(&send, "disconnected_before_headers", None, false);
+                    scope.record(&send, "disconnected_before_headers", None, false, Some(&error));
                     scope.disconnected_error()
                 }).into());
             }
             Err(_) => {
                 return Err(HTTP_ATTEMPT.with(|scope| {
-                    scope.record(&send, "header_timeout", None, false);
+                    scope.record(&send, "header_timeout", None, false, None);
                     scope.timeout_error(send.elapsed_ms())
                 }).into());
             }

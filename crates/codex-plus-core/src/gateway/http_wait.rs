@@ -174,10 +174,9 @@ impl HttpAttempt {
         result: &'static str,
         status: Option<u16>,
         retry: bool,
+        error: Option<&reqwest::Error>,
     ) {
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "gateway.http_upstream_attempt",
-            json!({
+        let mut detail = json!({
                 "requestId": self.request_id,
                 "candidate": self.candidate,
                 "attempt": send.attempt,
@@ -193,9 +192,57 @@ impl HttpAttempt {
                 "result": result,
                 "statusCode": status,
                 "retry": retry,
-            }),
-        );
+        });
+        if let Some(error) = error {
+            detail["transportError"] = transport_error_detail(error);
+        }
+        let _ =
+            crate::diagnostic_log::append_diagnostic_log("gateway.http_upstream_attempt", detail);
     }
+}
+
+fn transport_error_detail(error: &reqwest::Error) -> serde_json::Value {
+    use std::error::Error;
+
+    // 从 source 开始，避免把 reqwest 的请求 URL 写进日志。
+    let mut current = error.source();
+    let mut causes = Vec::new();
+    let mut io_kind = None;
+    let mut os_code = None;
+    while let Some(cause) = current {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            io_kind = Some(format!("{:?}", io.kind()));
+            os_code = io.raw_os_error().or(os_code);
+        }
+        let message = cause.to_string();
+        let lower = message.to_ascii_lowercase();
+        let sensitive = [
+            "://",
+            "authorization",
+            "bearer ",
+            "token=",
+            "api_key=",
+            "api-key",
+            "password=",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+        causes.push(if sensitive {
+            "[redacted]".to_owned()
+        } else {
+            message
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(400)
+                .collect()
+        });
+        current = cause.source();
+        if causes.len() >= 12 {
+            break;
+        }
+    }
+    json!({"causes": causes, "ioKind": io_kind, "osCode": os_code,
+           "connect": error.is_connect(), "timeout": error.is_timeout()})
 }
 
 pub(super) fn route_budget_exhausted(
@@ -222,6 +269,48 @@ pub(crate) struct HttpSend {
     body_bytes: Option<usize>,
     started_at_ms: u64,
     started: Instant,
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::transport_error_detail;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn transport_error_detail_preserves_pre_header_close_without_request_secrets() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            assert!(connection.read(&mut bytes).await.unwrap() > 0);
+        });
+        let failure = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("http://{address}/?token=private-test-value"))
+            .bearer_auth("secret-auth-value")
+            .body("private-body")
+            .send()
+            .await
+            .unwrap_err();
+        peer.await.unwrap();
+        let detail = transport_error_detail(&failure);
+        assert_eq!(detail["connect"], false);
+        assert!(detail["causes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cause| cause
+                .as_str()
+                .is_some_and(|s| !s.is_empty() && s != "[redacted]")));
+        let serialized = detail.to_string();
+        for secret in ["private-test-value", "secret-auth-value", "private-body"] {
+            assert!(!serialized.contains(secret));
+        }
+        println!("loopback diagnostic: {serialized}");
+    }
 }
 
 #[derive(Clone, Copy)]

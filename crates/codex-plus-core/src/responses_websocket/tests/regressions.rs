@@ -134,6 +134,7 @@ struct HttpFixtureResponse {
     header_delay_ms: u64,
     output_delay_ms: u64,
     truncate_stream: bool,
+    close_before_headers: bool,
 }
 
 async fn scheduled_http_upstream(
@@ -146,6 +147,11 @@ async fn scheduled_http_upstream(
     if let Some(served) = served {
         let (mut socket, _) = listener.accept().await.unwrap();
         assert_eq!(http_fixture_body(&mut socket).await["model"], model);
+        if served.close_before_headers {
+            drop(socket);
+            assert!(tokio::time::timeout(Duration::from_millis(300), listener.accept()).await.is_err());
+            return;
+        }
         tokio::time::sleep(Duration::from_millis(served.header_delay_ms)).await;
         let body = if served.status == "200 OK" {
             let delta =
@@ -202,6 +208,7 @@ async fn gateway_http_stream_header_budgets_and_replay() {
         header_delay_ms: 0,
         output_delay_ms: 0,
         truncate_stream: false,
+        close_before_headers: false,
     };
     let unavailable = HttpFixtureResponse {
         status: "503 Service Unavailable",
@@ -226,6 +233,7 @@ async fn gateway_http_stream_header_budgets_and_replay() {
     let header_timeout = Some("gateway_upstream_header_timeout");
     for (case, model, provider_secs, total_secs, first, second, expected_code) in [
         ("provider", "gpt-6.2-sol", 1, 4, slow_header, None, header_timeout),
+        ("disconnect", "gpt-6.2-sol", 2, 4, HttpFixtureResponse { close_before_headers: true, ..success }, None, Some("gateway_upstream_outcome_unknown")),
         ("first-output", "gpt-6.2-astra", 1, 1, slow_output, None, None),
         ("override", "gpt-6.2-sol", 3, 4, slow_header, None, None),
         ("failover", "gpt-6.2-astra", 2, 4, unavailable, Some(success), None),
@@ -351,10 +359,16 @@ async fn gateway_http_stream_header_budgets_and_replay() {
             assert_eq!(failures[0]["willFailover"], true);
         }
         let last = attempts.last().unwrap();
+        assert_eq!(last.get("transportError").is_some(), case == "disconnect");
         if let Some(code) = expected_code {
             if case == "redirect" {
                 assert_eq!(last["result"], "redirect_refused");
                 assert_eq!(last["statusCode"], 307);
+            } else if case == "disconnect" {
+                assert_eq!(last["result"], "disconnected_before_headers");
+                assert_eq!(last["retry"], false);
+                assert!(!last["transportError"]["causes"].as_array().unwrap().is_empty());
+                println!("pre-header close diagnostic: {last}");
             } else {
                 assert_eq!(last["result"], "header_timeout");
             }
