@@ -115,7 +115,7 @@ fn compress(format: ImageFormat, data: &str) -> Option<Compression> {
             decode(decoder)?
         }
         ImageFormat::WebP => {
-            let mut decoder = WebPDecoder::new(source).ok()?;
+            let mut decoder = WebPDecoder::new(Cursor::new(bounded_webp(&bytes)?)).ok()?;
             if decoder.has_animation() {
                 return None;
             }
@@ -155,11 +155,45 @@ fn compress(format: ImageFormat, data: &str) -> Option<Compression> {
     (output.len() < bytes.len()).then(|| (media_type, STANDARD.encode(output)))
 }
 
+fn bounded_webp(bytes: &[u8]) -> Option<&[u8]> {
+    let declared_size = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?) as usize;
+    let bytes = bytes.get(..8usize.checked_add(declared_size)?)?;
+    if bytes.get(..4)? != b"RIFF" || bytes.get(8..12)? != b"WEBP" {
+        return None;
+    }
+    let mut chunks = bytes.get(12..)?;
+    while !chunks.is_empty() {
+        let size = u32::from_le_bytes(chunks.get(4..8)?.try_into().ok()?) as usize;
+        let rest = chunks.get(8..)?;
+        let payload = rest.get(..size)?;
+        // 扩展 WebP 有独立的画布和图像尺寸，对有损比特流的实际尺寸也要限额。
+        match chunks.get(..4)? {
+            b"VP8 " => {
+                let width = u16::from_le_bytes(payload.get(6..8)?.try_into().ok()?) & 0x3fff;
+                let height = u16::from_le_bytes(payload.get(8..10)?.try_into().ok()?) & 0x3fff;
+                if !valid_dimensions(u32::from(width), u32::from(height)) {
+                    return None;
+                }
+            }
+            b"ANIM" | b"ANMF" => return None,
+            _ => {}
+        }
+        chunks = rest.get(size.checked_add(size % 2)?..)?;
+    }
+    Some(bytes)
+}
+
+fn valid_dimensions(width: u32, height: u32) -> bool {
+    width > 0
+        && height > 0
+        && width <= MAX_SOURCE_SIDE
+        && height <= MAX_SOURCE_SIDE
+        && u64::from(width) * u64::from(height) <= MAX_SOURCE_PIXELS
+}
+
 fn decode(mut decoder: impl ImageDecoder) -> Option<DynamicImage> {
     let (width, height) = decoder.dimensions();
-    if u64::from(width) * u64::from(height) > MAX_SOURCE_PIXELS
-        || decoder.total_bytes() > MAX_DECODE_BYTES
-    {
+    if !valid_dimensions(width, height) || decoder.total_bytes() > MAX_DECODE_BYTES {
         return None;
     }
     let orientation = decoder.orientation().ok()?;
