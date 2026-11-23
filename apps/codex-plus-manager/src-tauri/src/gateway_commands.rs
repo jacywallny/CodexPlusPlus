@@ -1333,7 +1333,7 @@ pub struct AutoGroupInput {
     settings: codex_plus_core::gateway::store::AutoGroupSettings,
     #[serde(default)]
     hidden: Option<bool>,
-    #[serde(default)]
+    #[serde(default, rename = "preserveMembers", alias = "preserve_members")]
     preserve_members: bool,
 }
 
@@ -2465,6 +2465,45 @@ mod tests {
 
         let input: super::AutoGroupInput = serde_json::from_value(json!({})).unwrap();
         assert_eq!(input.hidden, None);
+    }
+
+    #[test]
+    fn auto_group_mode_change_preserves_disabled_members_on_reload() {
+        use codex_plus_core::gateway::apply;
+        use codex_plus_core::gateway::store::{GatewayStore, GroupMode};
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(directory.path().join("gateway.json"));
+        let model = "gpt-6.2-sol";
+        let old_gateway = serde_json::from_value(json!({
+            "autoGroups": {"gpt-6.2-sol": {"preserveMembers": true, "futureField": 3}}
+        })).unwrap();
+        store.save(&old_gateway).unwrap();
+        let save = |value| {
+            let input: super::AutoGroupInput = serde_json::from_value(value).unwrap();
+            apply::save_auto_group_with_hidden(
+                &store, model, input.settings, input.hidden, input.preserve_members,
+            ).unwrap();
+        };
+        save(json!({
+            "mode": "inOrder", "preserveMembers": true,
+            "members": [
+                {"model": "b/gpt-6.2-sol", "weight": 3, "disabled": true},
+                {"model": "a/gpt-6.2-sol", "weight": 2}
+            ]
+        }));
+        let members = store.load().unwrap().auto_groups[model].members.clone();
+        assert!(members[0].disabled);
+        save(json!({"mode": "fast", "sticky": "cache", "preserveMembers": true}));
+        let reloaded = store.load().unwrap();
+        assert_eq!(reloaded.auto_groups[model].mode, GroupMode::Fast);
+        assert_eq!(reloaded.auto_groups[model].members, members);
+        assert!(!reloaded.auto_groups[model].extra.contains_key("preserveMembers"));
+        assert_eq!(reloaded.auto_groups[model].extra["futureField"], 3);
+
+        save(json!({}));
+        assert!(!store.load().unwrap().auto_groups.contains_key(model));
     }
 
     #[test]

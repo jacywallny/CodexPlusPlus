@@ -4482,6 +4482,8 @@ pub fn save_auto_group_with_hidden(
                         .cloned(),
                 );
                 settings.extra = current.extra.clone();
+                // 旧版管理器曾把保存命令的参数误写进网关配置。
+                settings.extra.remove("preserveMembers");
             }
         }
         settings.pick = settings.pick.trim().to_string();
