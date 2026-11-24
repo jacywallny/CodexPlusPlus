@@ -1516,6 +1516,7 @@ mod limit_tests {
                 live_request_id: None,
                 auto_retry: false,
                 is_stream: true,
+                allow_header_backup: false,
                 upstream_path: "/responses",
                 client: Some(&server),
                 queue_timeout: Duration::from_secs(5),
