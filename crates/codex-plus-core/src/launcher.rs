@@ -3187,6 +3187,12 @@ async fn handle_protocol_proxy_connection_inner(
                 {
                     request_log.entry = entry;
                 }
+                if error.is::<crate::gateway::pipeline::DownstreamCancelled>() {
+                    request_log.record_stream(
+                        Some("downstream_cancelled"), None, Some(error.to_string()),
+                    );
+                    return Ok(());
+                }
                 let status = if unsupported.is_some() || search_unsupported.is_some() || file_unsupported.is_some()
                     || retired_model.is_some() || header_wait.is_some()
                     || matches!(vlm_failure, Some(crate::vision::VlmPreprocessError::MissingConfiguration)) {

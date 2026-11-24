@@ -365,8 +365,8 @@ async fn open_candidates(
                         settings, candidate, &request, same_model_group && has_more,
                     ));
                     match header_deadline {
-                        Some(deadline) => HTTP_ATTEMPT
-                            .scope(
+                        Some(deadline) => {
+                            let attempt = HTTP_ATTEMPT.scope(
                                 HttpAttempt::new(
                                     settings,
                                     deadline,
@@ -378,8 +378,20 @@ async fn open_candidates(
                                     forward_native_stream,
                                 ),
                                 dispatched,
-                            )
-                            .await,
+                            );
+                            tokio::select! {
+                                biased;
+                                _ = client_gone(request.client) => {
+                                    if let Some(attempt) = stream_attempt.take() {
+                                        attempt.finish_before_body(StreamEnd::DownstreamCancelled, None);
+                                    }
+                                    recorder.step(candidate, "cancelled", Some("downstream_cancelled"), None);
+                                    // 请求可能已经送达上游，保留这次 RPM，直接结束且不切换候选。
+                                    return Err(DownstreamCancelled.into());
+                                }
+                                result = attempt => result,
+                            }
+                        }
                         None => dispatched.await,
                     }
                 }
@@ -710,6 +722,10 @@ async fn client_gone(client: Option<&tokio::net::TcpStream>) {
         Ok(_) => std::future::pending().await,
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("等待上游流式响应时，Codex 客户端已断开")]
+pub(crate) struct DownstreamCancelled;
 
 /// 所有候选都因 Codex++ 本地限速满了、排队超时：不是上游的错误，回给客户端时用 429。
 #[derive(Debug)]
@@ -1298,6 +1314,99 @@ mod window_tests {
 mod limit_tests {
     use super::*;
     use crate::gateway::key_pool::{KeyLimits, KeyRef};
+
+    #[tokio::test]
+    async fn cancelled_header_wait_closes_upstream_without_trying_backup() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let backup = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let (submitted, submitted_rx) = tokio::sync::oneshot::channel();
+        let address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut connection, _) = upstream.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let size = connection.read(&mut buffer).await.unwrap();
+                assert!(size > 0);
+                bytes.extend_from_slice(&buffer[..size]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                    let length: usize = head.lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .unwrap().trim().parse().unwrap();
+                    if bytes.len() >= end + 4 + length { break; }
+                }
+            }
+            submitted.send(()).unwrap();
+            let closed = tokio::time::timeout(Duration::from_secs(3), connection.read(&mut buffer))
+                .await.expect("cancelled request must close upstream before headers");
+            assert!(matches!(closed, Ok(0) | Err(_)));
+        });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let make_candidate = |id: &str, url: String| GatewayCandidate {
+            relay: crate::settings::RelayProfile {
+                id: id.to_owned(),
+                name: id.to_owned(),
+                base_url: url.clone(),
+                upstream_base_url: url,
+                api_key: "fixture-key".to_owned(),
+                relay_mode: crate::settings::RelayMode::PureApi,
+                protocol: RelayProtocol::Responses,
+                ..Default::default()
+            },
+            key: KeyRef { relay_id: id.to_owned(), key_id: String::new(), fingerprint: 0 },
+            upstream_model: "gpt-6.2-sol".to_owned(),
+            window: None,
+            limits: Default::default(),
+            auto_priority: None,
+        };
+        let plan = RoutePlan {
+            agent: crate::tools::ToolId::Codex,
+            source_model: "gpt-6.2-sol".to_owned(),
+            model: "gpt-6.2-sol".to_owned(),
+            group_id: None,
+            conversation: None,
+            sticky_ttl: None,
+            preferred: None,
+            hold_on_switch: false,
+            candidates: vec![
+                make_candidate("cancel-header-primary", format!("http://{address}/v1")),
+                make_candidate("cancel-header-backup", format!("http://{}/v1", backup.local_addr().unwrap())),
+            ],
+            cooling: None,
+            waiting: Vec::new(),
+        };
+        let gateway = tokio::spawn(async move {
+            let settings = BackendSettings::default();
+            open(&settings, &plan, GatewayRequest {
+                responses_body: serde_json::json!({"model":"gpt-6.2-sol","input":"fixture","stream":true}),
+                anthropic: None,
+                user_agent: None,
+                session_headers: ProxySessionHeaders::default(),
+                live_request_id: None,
+                auto_retry: false,
+                is_stream: true,
+                upstream_path: "/responses",
+                client: Some(&server),
+                queue_timeout: Duration::from_secs(5),
+            }).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), submitted_rx).await.unwrap().unwrap();
+        client.shutdown().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), gateway).await
+            .expect("gateway must stop waiting immediately").unwrap();
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled request must not return an upstream response"),
+        };
+        assert!(error.is::<DownstreamCancelled>(), "{error:#}");
+        upstream_task.await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(100), backup.accept()).await.is_err(),
+            "client cancellation must not dispatch a backup request");
+    }
 
     /// 排队时客户端断开：等待马上结束，不再占着连接干等。
     #[tokio::test]
