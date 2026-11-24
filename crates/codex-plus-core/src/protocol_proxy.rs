@@ -2512,23 +2512,48 @@ async fn send_gateway_http_request(
         if tokio::time::Instant::now() >= deadline {
             return Err(HTTP_ATTEMPT.with(|scope| scope.budget_error()).into());
         }
+        anyhow::ensure!(
+            !HTTP_ATTEMPT.with(|scope| scope.is_backup() && scope.sent()),
+            "备用请求只允许发送一次"
+        );
         let send = HTTP_ATTEMPT.with(|scope| scope.begin_send(&request));
+        let dispatched = if HTTP_ATTEMPT.with(|scope| scope.track_dispatch())
+            && let Some(bytes) = request.body().and_then(reqwest::Body::as_bytes)
+        {
+            let bytes = bytes.to_vec();
+            let length = bytes.len();
+            let dispatched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let marker = dispatched.clone();
+            *request.body_mut() = Some(reqwest::Body::wrap_stream(futures_util::stream::once(async move {
+                marker.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok::<_, std::io::Error>(bytes)
+            })));
+            request.headers_mut().insert(reqwest::header::CONTENT_LENGTH, length.into());
+            Some(dispatched)
+        } else {
+            None
+        };
         match tokio::time::timeout_at(deadline, client.execute(request)).await {
             Ok(Ok(response)) if response.status().is_redirection() => {
                 let status = response.status().as_u16();
                 return Err(HTTP_ATTEMPT.with(|scope| {
+                    scope.mark_headers_received();
                     scope.record(&send, "redirect_refused", Some(status), false, None);
                     scope.redirect_error(status)
                 }).into());
             }
             Ok(Ok(mut response)) => {
                 response.extensions_mut().insert(send.headers_received());
-                HTTP_ATTEMPT.with(|scope| scope.record(&send, "headers_received", Some(response.status().as_u16()), false, None));
+                HTTP_ATTEMPT.with(|scope| {
+                    scope.mark_headers_received();
+                    scope.record(&send, "headers_received", Some(response.status().as_u16()), false, None);
+                });
                 return Ok(response);
             }
             Ok(Err(error)) if error.is_connect() => {
                 let retry = retry_source.zip(delays.next()).filter(|(_, delay)| {
-                    tokio::time::Instant::now() + *delay < deadline
+                    !HTTP_ATTEMPT.with(|scope| scope.is_backup())
+                        && tokio::time::Instant::now() + *delay < deadline
                 });
                 let error = error.without_url();
                 HTTP_ATTEMPT.with(|scope| scope.record(&send, "connect_error", None, retry.is_some(), Some(&error)));
@@ -2548,7 +2573,9 @@ async fn send_gateway_http_request(
             Err(_) => {
                 return Err(HTTP_ATTEMPT.with(|scope| {
                     scope.record(&send, "header_timeout", None, false, None);
-                    scope.timeout_error(send.elapsed_ms())
+                    scope.timeout_error(send.elapsed_ms(), dispatched.is_some_and(|marker| {
+                        marker.load(std::sync::atomic::Ordering::Relaxed)
+                    }))
                 }).into());
             }
         }
@@ -4003,6 +4030,10 @@ async fn open_responses_proxy_request_with_extensions(
         // 拓展拒绝了这一步：不发给模型、也不进失败重试，直接回一个 Codex 能显示原因的错误。
         return extension_rejected_response(&reason);
     }
+    if crate::gateway::http_wait::HTTP_ATTEMPT.try_with(|scope| scope.is_backup()).unwrap_or(false) {
+        request_json = crate::gateway::header_backup::portable_request(&request_json)
+            .context("备用请求包含不可移植的上下文")?;
+    }
     let mut body = request_json.to_string();
     let mut attempt = 0;
     loop {
@@ -4539,6 +4570,9 @@ async fn open_responses_proxy_request_once(
         .await
         {
             return Ok(extension_rejected_response(&reason)?);
+        }
+        if crate::gateway::http_wait::HTTP_ATTEMPT.try_with(|scope| scope.is_backup()).unwrap_or(false) {
+            crate::gateway::header_backup::guard_wire_request(wire_api, &mut upstream_body, &relay, model_override.as_deref())?;
         }
         request_trace.bind_upstream_model(&upstream_body);
         if let Some(model) = upstream_body.get("model").and_then(Value::as_str) {

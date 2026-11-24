@@ -81,6 +81,8 @@ pub struct GatewayRequest<'a> {
     pub live_request_id: Option<&'a str>,
     pub auto_retry: bool,
     pub is_stream: bool,
+    /// 仅 Codex 的 HTTP Responses 对话入口允许响应头超时后的备用生成。
+    pub allow_header_backup: bool,
     /// 发给上游的 Responses 路径：`/responses`，或旧版 Codex 远程压缩的 `/responses/compact`。
     pub upstream_path: &'a str,
     /// 客户端连接：因本地限速排队时用来发现客户端已断开，不再干等。
@@ -558,6 +560,16 @@ async fn open_candidates(
                     if wait_error.is_some() {
                         if matches!(wait_error, Some(HeaderWaitError::BudgetExhausted { sent: false, .. })) {
                             slot.cancel();
+                            return Err(error);
+                        }
+                        if request.allow_header_backup && settings.gateway_header_backup.enabled
+                            && let Some(HeaderWaitError::Timeout { eligible_for_backup: true, upstream_model, .. }) = wait_error
+                        {
+                            drop(slot);
+                            drop(busy);
+                            if let Some(outcome) = Box::pin(open_header_backup(settings, candidate, upstream_model, &request, &trace, recorder)).await {
+                                return Ok(outcome);
+                            }
                         }
                         return Err(error);
                     }
@@ -620,6 +632,121 @@ async fn open_candidates(
         });
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("网关的所有上游都失败了")))
+}
+
+async fn open_header_backup(
+    settings: &BackendSettings,
+    original: &GatewayCandidate,
+    original_model: &str,
+    request: &GatewayRequest<'_>,
+    original_trace: &RequestTrace,
+    recorder: &mut RouteRecorder,
+) -> Option<GatewayOutcome> {
+    use super::header_backup::{self, RESPONSE_BUDGET_SECS};
+    if crate::extension_gateway::builtin_replaced("builtin:gateway-failover") {
+        return None;
+    }
+    let target = &settings.gateway_header_backup;
+    if target.provider_id == original.relay.id
+        && target.model.eq_ignore_ascii_case(original_model)
+    {
+        return None;
+    }
+    let mut body = header_backup::portable_request(&request.responses_body)?;
+    let gateway = super::store::GatewayStore::default().load().ok()?.with_extension_providers();
+    if !header_backup::target_available(&gateway, target) {
+        return None;
+    }
+    let plan = super::route::preview_plan(
+        &gateway,
+        &crate::tools::ToolId::Codex,
+        &format!("{}/{}", target.provider_id, target.model),
+        None,
+    ).ok()?;
+    let mut candidate = plan.candidates.into_iter().find(|candidate| {
+        candidate.relay.id == target.provider_id
+            && candidate.upstream_model == target.model
+            && candidate.window.is_none_or(|window| window >= estimate_body_tokens(&body))
+    })?;
+    let slot = key_pool::try_acquire(&candidate.key, candidate.limits, Instant::now())?;
+    let slot = AttemptSlot { slot: Some(slot), refund: true };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(RESPONSE_BUDGET_SECS);
+    candidate.relay = tokio::time::timeout_at(deadline, super::accounts::prepare_relay(&candidate.relay))
+        .await.ok()?.ok()?;
+    super::opencode::prepare(&mut candidate.relay, &candidate.upstream_model, None).ok()?;
+    body["model"] = serde_json::json!(target.model);
+    let backup = GatewayRequest {
+        responses_body: body,
+        anthropic: None,
+        user_agent: request.user_agent,
+        session_headers: ProxySessionHeaders::default(),
+        live_request_id: None,
+        auto_retry: false,
+        is_stream: true,
+        allow_header_backup: false,
+        upstream_path: "/responses",
+        client: request.client,
+        queue_timeout: Duration::ZERO,
+    };
+    let busy = recorder.begin(&candidate);
+    let scope = HttpAttempt::new(settings, deadline, &candidate.relay, &candidate.upstream_model,
+        request.live_request_id, original_trace.attempts + 1, Duration::ZERO, true).as_backup();
+    let result = HTTP_ATTEMPT.scope(scope, async {
+        let generation = tokio::time::timeout_at(deadline, async {
+            let attempt = Box::pin(attempt_pipeline(settings, &candidate, &backup, false)).await;
+            let mut upstream = match attempt {
+                Ok(Attempt::Success(GatewayUpstream::Pipeline(upstream))) => upstream,
+                Ok(Attempt::Failed { upstream, .. }) => anyhow::bail!("备用供应商返回 {:?}", upstream.status_code()),
+                Ok(_) => anyhow::bail!("备用供应商响应类型无效"),
+                Err(AttemptError::Fatal(error) | AttemptError::Transport(error)) => return Err(error),
+            };
+            header_backup::validate_response(&mut upstream, &backup.responses_body).await?;
+            Ok(upstream)
+        });
+        let outcome = tokio::select! {
+            biased;
+            _ = client_gone(request.client) => Err(anyhow::anyhow!("客户端已断开")),
+            outcome = generation => outcome.map_err(anyhow::Error::from).and_then(|result| result),
+        };
+        let sent = HTTP_ATTEMPT.with(|scope| scope.sent());
+        (outcome, sent)
+    }).await;
+    let (result, sent) = result;
+    let slot = sent.then(|| slot.take());
+    let _ = crate::diagnostic_log::append_diagnostic_log("gateway.http_header_backup", serde_json::json!({
+        "requestId": request.live_request_id,
+        "originalRelayId": original.relay.id,
+        "originalModel": original_model,
+        "backupRelayId": candidate.relay.id,
+        "backupModel": candidate.upstream_model,
+        "sent": sent,
+        "completed": result.is_ok(),
+    }));
+    if let Some(id) = request.live_request_id {
+        crate::request_log::update_running_phase(id, "waiting");
+    }
+    let mut upstream = match result {
+        Ok(upstream) => upstream,
+        Err(_) => {
+            if sent {
+                recorder.step(&candidate, "failed", Some("header_backup"), None);
+            }
+            return None;
+        }
+    };
+    recorder.step(&candidate, "answered", Some("header_backup"), Some(upstream.status_code));
+    key_pool::record_success(&candidate.key, None);
+    let mut trace = upstream.request_trace.take().unwrap_or_default();
+    trace.model = original_trace.model.clone();
+    trace.attempts = original_trace.attempts + 1;
+    trace.retry_reasons.push("header_backup".into());
+    upstream.request_trace = Some(trace.clone());
+    Some(GatewayOutcome {
+        upstream: GatewayUpstream::Pipeline(upstream),
+        trace,
+        busy: Some(busy),
+        slot,
+    })
 }
 
 /// 把一次失败记进 Key 池，返回要不要换下一个候选。

@@ -535,7 +535,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-core"
-version = "2.9.4+1"
+version = "2.9.4+3"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-data"
-version = "2.9.4+1"
+version = "2.9.4+3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-launcher"
-version = "2.9.4+1"
+version = "2.9.4+3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-manager"
-version = "2.9.4+1"
+version = "2.9.4+3"
 dependencies = [
  "anyhow",
  "async-trait",

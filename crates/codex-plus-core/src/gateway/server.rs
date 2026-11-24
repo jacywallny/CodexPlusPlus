@@ -548,6 +548,8 @@ pub(crate) async fn open_responses_for_agent(
             live_request_id,
             auto_retry: true,
             is_stream,
+            allow_header_backup: *agent == ToolId::Codex && client.is_some()
+                && conversation_request && is_stream && request_path.ends_with("/responses"),
             upstream_path: if request_path.ends_with("/responses/compact") {
                 "/responses/compact"
             } else {
@@ -973,6 +975,7 @@ async fn handle_claude_messages(
             // 「请求避震」对新旧两套同时生效（只在用户打开时起作用）。
             auto_retry: true,
             is_stream: wants_stream,
+            allow_header_backup: false,
             upstream_path: "/responses",
             client: Some(&*stream),
             queue_timeout: key_pool::LIMIT_QUEUE_TIMEOUT,

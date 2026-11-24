@@ -42,6 +42,7 @@ pub mod disconnect_preview;
 pub mod drift;
 pub mod gemini_inbound;
 pub mod gemini_outbound;
+pub mod header_backup;
 pub(crate) mod http_wait;
 pub mod images;
 pub mod key_pool;

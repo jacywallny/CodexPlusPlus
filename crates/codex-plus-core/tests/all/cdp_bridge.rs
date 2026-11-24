@@ -2959,8 +2959,7 @@ fn injection_script_uses_an_icon_for_idle_dictation() {
 fn usage_status_line_and_proxy_request_status_left_the_injection_script() {
     let script = assets::injection_script(57321);
 
-    // 两者已改成官方拓展包（assets/extensions/usage-statusline、proxy-request-status），见 bundled_builtins.rs；
-    // 注入脚本里不再有它们的代码、设置开关和内置拓展项，也不再自己轮询 /thread-usage-live、/proxy-status。
+    // 用量状态栏与通用请求状态仍由拓展包提供。内置备用切换只读取当前聊天的切换状态。
     for gone in [
         "codexPlusUsageState",
         "codexPlusProxyStatusState",
@@ -2968,12 +2967,22 @@ fn usage_status_line_and_proxy_request_status_left_the_injection_script() {
         "proxyRequestStatus:",
         "__CODEX_PLUS_USAGE_STATUSLINE_SYNC__",
         "postJson(\"/thread-usage-live\"",
-        "postJson(\"/proxy-status\"",
         "id: \"usage-statusline\"",
         "id: \"proxy-request-status\"",
     ] {
         assert!(!script.contains(gone), "注入脚本里还有 {gone}");
     }
+    let backup_status = script
+        .split_once("function startCodexPlusHeaderBackupStatus()")
+        .and_then(|(_, rest)| rest.split_once("function historyTurnRecoverySignal"))
+        .map(|(backup, _)| backup)
+        .expect("找不到备用切换状态实现");
+    let status_route = "postJson(\"/proxy-status\"";
+    assert_eq!(script.matches(status_route).count(), 1);
+    assert!(backup_status.contains(status_route));
+    assert!(backup_status.contains("gatewayHeaderBackup?.enabled"));
+    assert!(backup_status.contains("item.phase === \"header_backup\""));
+    assert!(backup_status.contains("normalizedCodexThreadUuid(item.threadId) === target.id"));
 }
 
 #[test]

@@ -301,6 +301,7 @@ export type GatewayPayload = {
   gateway: GatewaySettings;
   streamHealthRoutingEnabled?: boolean;
   textContinuationEnabled?: boolean;
+  headerBackup?: { enabled: boolean; providerId: string; model: string };
   streamHeaderTimeoutSecs?: number | null;
   streamHeaderBudgetSecs?: number | null;
   providerStreamHeaderTimeoutSecs?: Record<string, number>;

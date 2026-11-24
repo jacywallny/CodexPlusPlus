@@ -222,6 +222,7 @@ async fn run(
         // 不做「请求避震」重试：测试要看上游第一次的真实答复。
         auto_retry: false,
         is_stream: true,
+        allow_header_backup: false,
         upstream_path: "/responses",
         client: None,
         queue_timeout: Duration::ZERO,

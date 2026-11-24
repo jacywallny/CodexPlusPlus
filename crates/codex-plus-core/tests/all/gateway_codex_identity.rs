@@ -127,6 +127,7 @@ async fn send_through_gateway(
         &BackendSettings::default(),
         &plan,
         GatewayRequest {
+            allow_header_backup: false,
             responses_body: json!({
                 "model": model,
                 "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }]

@@ -329,7 +329,14 @@ test("用量与请求日志并成一页：两个页签各是一条路由，统�
   assert.match(read("GatewayPage.tsx"), /<TopbarActions>\{tab === "usage" \? null : refreshButton\}<\/TopbarActions>/, "用量页签只留一个刷新");
 });
 
-test("统计里点「未知」供应商：请求页按「无供应商」筛，不退化成不筛（null）", () => {
+test("按供应商的用量明细只显示当前供应商池里的 ID", () => {
+  const usage = read("GatewayUsage.tsx");
+  assert.match(usage, /new Set\(payload\?\.pool\.map\(\(entry\) => entry\.id\)\)/);
+  assert.match(usage, /\(summary\?\.byProvider \?\? \[\]\)\.filter\(\(group\) => group\.key && poolIds\.has\(group\.key\)\)/);
+  assert.doesNotMatch(usage, /relayUnknown:/);
+});
+
+test("请求页仍可按「无供应商」筛，不退化成不筛（null）", () => {
   // 「全部供应商」：没有筛选，后端不收到任何供应商条件。
   assert.equal(relayFilterFromFocus({}), null);
   assert.deepEqual(relayFilterArgs(null), { relayId: null, relayUnknown: false });
@@ -348,8 +355,6 @@ test("统计里点「未知」供应商：请求页按「无供应商」筛，�
   assert.deepEqual(named, { id: "relay-a", label: "供应商 A" });
   assert.deepEqual(relayFilterArgs(named), { relayId: "relay-a", relayUnknown: false });
 
-  const usage = read("GatewayUsage.tsx");
-  assert.match(usage, /\{ relayUnknown: true, relayLabel: t\("未知"\), range \}/, "空 key 的供应商行点击带「未知」标记");
   const app = read("App.tsx");
   assert.match(app, /useState<RelayFilter \| null>\(\(\) => relayFilterFromFocus\(initialFocus\)\)/);
   assert.match(app, /\.\.\.relayFilterArgs\(relayFilter\),/, "「未知」要把 relayUnknown 传给 load_request_logs");

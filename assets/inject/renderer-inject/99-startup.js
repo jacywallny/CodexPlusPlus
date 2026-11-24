@@ -43,3 +43,4 @@
   document.querySelector('body > #codex-plus-instance-identity[data-codex-plus-ext="instance-identity"]')?.remove();
   window.__codexPlusSyncBuiltinExtensions = syncCodexPlusBuiltinExtensions;
   syncCodexPlusBuiltinExtensions();
+  startCodexPlusHeaderBackupStatus();

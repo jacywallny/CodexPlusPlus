@@ -216,6 +216,7 @@ async fn send(settings: &BackendSettings, plan: &RoutePlan) -> GatewayOutcome {
         settings,
         plan,
         GatewayRequest {
+            allow_header_backup: false,
             responses_body: json!({
                 "model": "rl-model",
                 "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }]
