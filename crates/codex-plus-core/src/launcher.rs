@@ -10598,8 +10598,9 @@ mod proxy_stream_tests {
             let (sent, observed) = tokio::sync::oneshot::channel();
             let mut sink = NotifyingSink(Some(sent));
             let mut final_usage = None;
+            let mut recovered = false;
             let forward = super::forward_protocol_proxy_stream_for_client_with_live_request(
-                &mut sink, &[], response, wire, None, None, false, false, Some(&log.entry.id), &mut final_usage, None, &mut false,
+                &mut sink, &[], response, wire, None, None, false, false, Some(&log.entry.id), &mut final_usage, None, &mut recovered,
             );
             tokio::pin!(forward);
             send_body.send(()).unwrap();
