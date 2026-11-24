@@ -14,15 +14,19 @@
       && !globalThis.__codexPlusBuiltinInactive?.has("history-turn-recovery");
   }
 
-  function historyTurnRecoveryTarget() {
+  function historyTurnRecoveryTarget(requireVisibleComposer = false) {
     if (document.hidden || /[?&]initialRoute=/.test(window.location.search)) return null;
     const ref = currentSessionRef();
     const id = normalizedCodexThreadUuid(ref?.session_id);
     // 原生使用内存路由，地址栏可以一直是 index.html；以侧栏归属与已挂载 composer 交叉核对。
     if (!id || ref.host_id !== "local") return null;
-    const marker = document.querySelector('[data-codex-composer-root][data-composer-placement="thread"] [data-above-composer-conversation-id]');
-    const mountedId = marker?.getAttribute("data-above-composer-conversation-id")?.replace(/^local:/, "");
-    if (normalizedCodexThreadUuid(mountedId) !== id) return null;
+    const rootSelector = '[data-codex-composer-root][data-composer-placement="thread"]';
+    const markerSelector = `${rootSelector} [data-above-composer-conversation-id]`;
+    const mountedId = (marker) => normalizedCodexThreadUuid(marker?.getAttribute("data-above-composer-conversation-id")?.replace(/^local:/, ""));
+    const marker = requireVisibleComposer
+      ? [...document.querySelectorAll(markerSelector)].find((element) => mountedId(element) === id && element.closest(rootSelector)?.getClientRects().length)
+      : document.querySelector(markerSelector);
+    if (!marker || mountedId(marker) !== id) return null;
     return { id, marker };
   }
 
@@ -33,7 +37,7 @@
     let indicator = null;
     let latest = [];
     const render = () => {
-      const target = historyTurnRecoveryTarget();
+      const target = historyTurnRecoveryTarget(true);
       const request = target && latest.find((item) => item.phase === "header_backup"
         && normalizedCodexThreadUuid(item.threadId) === target.id);
       if (!request) {
@@ -47,7 +51,7 @@
       indicator.dataset.codexPlusExt = "gateway-header-backup";
       indicator.dataset.requestId = request.id;
       indicator.setAttribute("role", "status");
-      indicator.style.cssText = "display:flex;align-items:center;gap:6px;padding:2px 12px 6px;font-size:12px;line-height:18px;color:var(--color-token-text-secondary,currentColor)";
+      indicator.style.cssText = "display:flex;align-items:center;gap:6px;padding:2px 12px 6px;font-size:12px;line-height:16px;color:var(--color-token-text-secondary,currentColor)";
       // Lucide Wifi，和管理器同一套图标。
       indicator.innerHTML = '<svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h.01M2 8.82a15 15 0 0 1 20 0M5 12.859a10 10 0 0 1 14 0M8.5 16.429a5 5 0 0 1 7 0"/></svg>';
       const language = document.documentElement.lang || navigator.language;
@@ -56,7 +60,7 @@
     };
     const refresh = async () => {
       if (disposed) return;
-      if (!codexPlusBackendSettings.gatewayHeaderBackup?.enabled || !historyTurnRecoveryTarget()) {
+      if (!codexPlusBackendSettings.gatewayHeaderBackup?.enabled || !historyTurnRecoveryTarget(true)) {
         latest = [];
         render();
         return;

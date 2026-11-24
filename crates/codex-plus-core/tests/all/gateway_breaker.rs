@@ -150,6 +150,7 @@ async fn send(plan: &RoutePlan) -> anyhow::Result<GatewayOutcome> {
         &BackendSettings::default(),
         plan,
         GatewayRequest {
+            allow_header_backup: false,
             responses_body: json!({
                 "model": MODEL,
                 "stream": true,

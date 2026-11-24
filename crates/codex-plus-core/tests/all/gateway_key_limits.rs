@@ -153,6 +153,7 @@ async fn send(
         &BackendSettings::default(),
         plan,
         GatewayRequest {
+            allow_header_backup: false,
             responses_body: json!({
                 "model": "limited-model",
                 "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }]

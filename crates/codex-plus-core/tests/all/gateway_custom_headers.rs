@@ -198,6 +198,7 @@ async fn gateway_requests_send_custom_headers() {
         &BackendSettings::default(),
         &plan,
         GatewayRequest {
+            allow_header_backup: false,
             responses_body: json!({
                 "model": model,
                 "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }]

@@ -148,6 +148,7 @@ async fn send(gateway: &GatewaySettings, body: Value) -> Vec<String> {
         &ToolId::Codex,
         &plan,
         GatewayRequest {
+            allow_header_backup: false,
             responses_body: body,
             anthropic: None,
             user_agent: None,
