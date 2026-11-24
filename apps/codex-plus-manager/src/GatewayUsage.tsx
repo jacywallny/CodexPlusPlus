@@ -103,7 +103,10 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
   const rate = totals ? successRate(totals) : null;
   const average = totals ? averageDuration(totals) : null;
   const cost = costText(summary?.costs);
-  const groups: UsageGroup[] = split === "provider" ? summary?.byProvider ?? [] : split === "model" ? summary?.byModel ?? [] : summary?.byAgent ?? [];
+  const poolIds = new Set(payload?.pool.map((entry) => entry.id));
+  const groups: UsageGroup[] = split === "provider"
+    ? (summary?.byProvider ?? []).filter((group) => group.key && poolIds.has(group.key))
+    : split === "model" ? summary?.byModel ?? [] : summary?.byAgent ?? [];
   const tokenTotal = Math.max(1, groups.reduce((sum, group) => sum + group.inputTokens + group.outputTokens, 0));
   const anyCost = groups.some((group) => costText(group.costs));
   const quotas = quotaEntries(payload?.pool);
@@ -221,9 +224,7 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
                 onClick={() => openRequestLog(split === "agent"
                   ? { agent: group.key === "claude" || group.key === "grok" ? group.key : "codex", range }
                   : split === "provider"
-                    ? group.key
-                      ? { relayId: group.key, relayLabel: maskAccountName(group.label), range }
-                      : { relayUnknown: true, relayLabel: t("未知"), range }
+                    ? { relayId: group.key, relayLabel: maskAccountName(group.label), range }
                     : { model: group.key, range })}
                 onKeyDown={(event) => { if (event.key === "Enter") (event.currentTarget as HTMLElement).click(); }}
                 role="button"
