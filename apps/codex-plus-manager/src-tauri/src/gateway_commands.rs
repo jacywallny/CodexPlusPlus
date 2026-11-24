@@ -169,6 +169,7 @@ pub struct GatewayPayload {
     pub gateway: GatewaySettings,
     pub stream_health_routing_enabled: bool,
     pub text_continuation_enabled: bool,
+    pub header_backup: codex_plus_core::settings::GatewayHeaderBackup,
     pub stream_header_timeout_secs: Option<u64>,
     pub stream_header_budget_secs: Option<u64>,
     pub provider_stream_header_timeout_secs: BTreeMap<String, u64>,
@@ -493,6 +494,7 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         gateway,
         stream_health_routing_enabled: settings.gateway_stream_health_routing_enabled,
         text_continuation_enabled: settings.gateway_text_continuation_enabled,
+        header_backup: settings.gateway_header_backup.clone(),
         stream_header_timeout_secs: settings
             .upstream_stream_header_timeout_secs
             .map(|value| value.clamp(120, 3600)),
@@ -1126,6 +1128,23 @@ pub fn save_gateway_text_continuation(enabled: bool) -> CommandResult<Option<Gat
     let result =
         SettingsStore::default().update(json!({"gatewayTextContinuationEnabled": enabled}));
     respond("自动续写已保存。", "保存自动续写失败", result)
+}
+
+#[tauri::command]
+pub fn save_gateway_header_backup(
+    backup: codex_plus_core::settings::GatewayHeaderBackup,
+) -> CommandResult<Option<GatewayPayload>> {
+    let result = (|| {
+        let gateway = GatewayStore::default().load()?.with_extension_providers();
+        if backup.enabled {
+            anyhow::ensure!(
+                codex_plus_core::gateway::header_backup::target_available(&gateway, &backup),
+                "请选择可用的备用供应商和聊天模型"
+            );
+        }
+        SettingsStore::default().update(json!({"gatewayHeaderBackup": backup}))
+    })();
+    respond("备用模型已保存。", "保存备用模型失败", result)
 }
 
 #[tauri::command]

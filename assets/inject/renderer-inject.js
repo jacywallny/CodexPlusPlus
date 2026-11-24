@@ -27227,6 +27227,67 @@ ${key} = ${value}`]);
     return { id, marker };
   }
 
+  function startCodexPlusHeaderBackupStatus() {
+    window.__codexPlusHeaderBackupStatus?.();
+    let disposed = false;
+    let fetching = false;
+    let indicator = null;
+    let latest = [];
+    const render = () => {
+      const target = historyTurnRecoveryTarget();
+      const request = target && latest.find((item) => item.phase === "header_backup"
+        && normalizedCodexThreadUuid(item.threadId) === target.id);
+      if (!request) {
+        indicator?.remove();
+        indicator = null;
+        return;
+      }
+      if (indicator?.parentElement === target.marker && indicator.dataset.requestId === request.id) return;
+      indicator?.remove();
+      indicator = document.createElement("div");
+      indicator.dataset.codexPlusExt = "gateway-header-backup";
+      indicator.dataset.requestId = request.id;
+      indicator.setAttribute("role", "status");
+      indicator.style.cssText = "display:flex;align-items:center;gap:6px;padding:2px 12px 6px;font-size:12px;line-height:18px;color:var(--color-token-text-secondary,currentColor)";
+      // Lucide Wifi，和管理器同一套图标。
+      indicator.innerHTML = '<svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h.01M2 8.82a15 15 0 0 1 20 0M5 12.859a10 10 0 0 1 14 0M8.5 16.429a5 5 0 0 1 7 0"/></svg>';
+      const language = document.documentElement.lang || navigator.language;
+      indicator.append(language.toLowerCase().startsWith("zh") ? "正在切换备用模型…" : "Switching to the backup model…");
+      target.marker.append(indicator);
+    };
+    const refresh = async () => {
+      if (disposed) return;
+      if (!codexPlusBackendSettings.gatewayHeaderBackup?.enabled || !historyTurnRecoveryTarget()) {
+        latest = [];
+        render();
+        return;
+      }
+      render();
+      if (fetching) return;
+      fetching = true;
+      try {
+        const result = await withBackendTimeout(postJson("/proxy-status", {}));
+        if (disposed) return;
+        latest = result?.status === "ok" && Array.isArray(result.requests) ? result.requests : [];
+        render();
+      } catch {
+        if (!disposed) {
+          latest = [];
+          render();
+        }
+      } finally {
+        fetching = false;
+      }
+    };
+    const timer = setInterval(refresh, 500);
+    window.__codexPlusHeaderBackupStatus = () => {
+      disposed = true;
+      clearInterval(timer);
+      indicator?.remove();
+    };
+    void refresh();
+  }
+
   function historyTurnRecoverySignal(module, source) {
     // AppScope families 没有公开标签；不能盲调用每个 family 的 scope.get（可能创建资源）。
     // 由原生默认管理器的空值守卫定位 raw manager family；hostState.client 是 RPC 包装，
@@ -40768,6 +40829,7 @@ ${key} = ${value}`]);
   document.querySelector('body > #codex-plus-instance-identity[data-codex-plus-ext="instance-identity"]')?.remove();
   window.__codexPlusSyncBuiltinExtensions = syncCodexPlusBuiltinExtensions;
   syncCodexPlusBuiltinExtensions();
+  startCodexPlusHeaderBackupStatus();
 })();
 
 // === 粘贴修复 (CodexPlusPlus 页面增强) ===

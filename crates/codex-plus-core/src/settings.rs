@@ -1091,6 +1091,14 @@ pub enum NativeAuthSelection {
     },
 }
 
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GatewayHeaderBackup {
+    pub enabled: bool,
+    pub provider_id: String,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BackendSettings {
     /// 读取快照的版本，只用于条件保存，不写入 settings.json。
@@ -1145,6 +1153,8 @@ pub struct BackendSettings {
     pub gateway_stream_health_routing_enabled: bool,
     #[serde(rename = "gatewayTextContinuationEnabled", default)]
     pub gateway_text_continuation_enabled: bool,
+    #[serde(rename = "gatewayHeaderBackup", default)]
+    pub gateway_header_backup: GatewayHeaderBackup,
     #[serde(rename = "gatewayStreamFirstOutputTimeoutSecs", default, skip_serializing_if = "Option::is_none")]
     pub gateway_stream_first_output_timeout_secs: Option<u64>,
     #[serde(rename = "gatewayStreamBodyIdleTimeoutSecs", default, skip_serializing_if = "Option::is_none")]
@@ -1586,6 +1596,7 @@ impl Default for BackendSettings {
             gateway_stream_header_budget_secs: None,
             gateway_stream_health_routing_enabled: false,
             gateway_text_continuation_enabled: false,
+            gateway_header_backup: GatewayHeaderBackup::default(),
             gateway_stream_first_output_timeout_secs: None,
             gateway_stream_body_idle_timeout_secs: None,
             native_auth_selection: None,
@@ -3009,6 +3020,11 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "protocolProxyAutoRetry");
     merge_bool_setting(target, source, "gatewayStreamHealthRoutingEnabled");
     merge_bool_setting(target, source, "gatewayTextContinuationEnabled");
+    if let Some(value) = source.get("gatewayHeaderBackup")
+        && serde_json::from_value::<GatewayHeaderBackup>(value.clone()).is_ok()
+    {
+        target.insert("gatewayHeaderBackup".to_owned(), value.clone());
+    }
     for (key, minimum) in [
         ("upstreamStreamHeaderTimeoutSecs", 120),
         ("gatewayStreamHeaderBudgetSecs", 1),

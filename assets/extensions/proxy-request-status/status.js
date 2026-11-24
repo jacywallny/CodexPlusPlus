@@ -189,7 +189,7 @@
       (item) => codexPlusProxyStatusNormalizeThreadId(item?.threadId) === threadId,
     );
     const request = visibleRequests[0];
-    if (!request) {
+    if (!request || request.phase === "header_backup") {
       codexPlusProxyStatusHide();
       return;
     }

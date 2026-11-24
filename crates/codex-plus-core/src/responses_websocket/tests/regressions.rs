@@ -459,6 +459,145 @@ async fn gateway_http_stream_budget_caps_local_queue_without_submission() {
     assert_ne!(sends[0]["detail"]["requestId"], exhausted["detail"]["requestId"]);
 }
 
+#[tokio::test]
+async fn gateway_http_header_backup_is_single_and_safe() {
+    if isolated("regressions::gateway_http_header_backup_is_single_and_safe").await {
+        return;
+    }
+    let state = crate::paths::state_dir_override().unwrap();
+    crate::request_log::set_request_log_path_for_tests(Some(state.join("request-log.jsonl")));
+    crate::diagnostic_log::set_diagnostic_log_path_for_tests(Some(state.join("codex-plus.log")));
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for (case, enabled, expect_backup) in [
+        ("default", false, false),
+        ("success", true, true),
+        ("unavailable", true, true),
+        ("pending-tool", true, false),
+        ("reference", true, false),
+        ("unexpected-tool", true, true),
+        ("same-target", true, false),
+    ] {
+        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backup = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_id = format!("backup-test-primary-{case}");
+        let backup_id = format!("backup-test-target-{case}");
+        let primary_model = "gpt-6.2-sol";
+        let backup_model = "gpt-6.2-astra";
+        let mut primary_relay = profile(primary.local_addr().unwrap());
+        let mut backup_relay = profile(backup.local_addr().unwrap());
+        for (relay, id, model) in [
+            (&mut primary_relay, &primary_id, primary_model),
+            (&mut backup_relay, &backup_id, backup_model),
+        ] {
+            relay["id"] = json!(id);
+            relay["modelList"] = json!(model);
+            relay["model"] = json!(model);
+        }
+        let fixture = Fixture::new(primary_relay.clone());
+        fixture.gateway_profiles(vec![primary_relay, backup_relay]);
+        let mut settings = json!({
+            "gatewayProviderStreamHeaderTimeoutSecs": {(primary_id.as_str()): 1}
+        });
+        if enabled {
+            let (provider, model) = if case == "same-target" {
+                (&primary_id, primary_model)
+            } else {
+                (&backup_id, backup_model)
+            };
+            settings["gatewayHeaderBackup"] = json!({
+                "enabled":true, "providerId":provider, "model":model
+            });
+        }
+        std::fs::write(fixture.temp.path().join("settings.json"), settings.to_string()).unwrap();
+        let primary_task = tokio::spawn(async move {
+            let (mut socket, _) = primary.accept().await.unwrap();
+            let body = http_fixture_body(&mut socket).await;
+            assert_eq!(body["model"], primary_model);
+            assert_eq!(body["tools"][0]["name"], "fixture");
+            assert!(tokio::time::timeout(Duration::from_millis(1_550), primary.accept()).await.is_err());
+        });
+        let backup_task = tokio::spawn(async move {
+            let connection = tokio::time::timeout(Duration::from_millis(1_450), backup.accept()).await;
+            let Ok(connection) = connection else {
+                assert!(!expect_backup, "{case}: no backup request");
+                return;
+            };
+            assert!(expect_backup, "{case}: unexpected backup request");
+            let (mut socket, _) = connection.unwrap();
+            let body = http_fixture_body(&mut socket).await;
+            assert!(crate::request_log::running_requests().iter().any(|entry| {
+                entry.thread_id.as_deref().is_some_and(|id| id == format!("fixture-{case}"))
+                    && entry.phase.as_deref() == Some("header_backup")
+            }));
+            assert_eq!(body["model"], backup_model);
+            assert_eq!(body["input"], "fixture prompt");
+            assert_eq!(body["tools"], json!([]));
+            assert_eq!(body["tool_choice"], "none");
+            assert_eq!(body["parallel_tool_calls"], false);
+            assert_eq!(body["stream"], true);
+            if case == "unavailable" {
+                socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            } else {
+                let mut event = completed("resp_backup", "");
+                event["response"]["output"] = if case == "unexpected-tool" {
+                    json!([{"type":"function_call","name":"fixture","arguments":"{}","call_id":"call_unexpected"}])
+                } else {
+                    json!([{"type":"message","id":"msg_backup","role":"assistant","status":"completed",
+                        "content":[{"type":"output_text","text":"backup answer","annotations":[]}]}])
+                };
+                let stream = format!("event: response.completed\r\ndata: {event}\r\n\r\n");
+                let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", stream.len());
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                socket.write_all(stream.as_bytes()).await.unwrap();
+            }
+            assert!(tokio::time::timeout(Duration::from_millis(450), backup.accept()).await.is_err());
+        });
+        let mut body = json!({
+            "model":format!("{primary_id}/{primary_model}"), "input":"fixture prompt",
+            "stream":true, "store":false, "parallel_tool_calls":true,
+            "tools":[{"type":"function","name":"fixture","parameters":{"type":"object"}}]
+        });
+        if case == "pending-tool" {
+            body["input"] = json!([
+                {"type":"message","role":"user","content":"fixture prompt"},
+                {"type":"function_call","name":"fixture","arguments":"{}","call_id":"call_pending"}
+            ]);
+        } else if case == "reference" {
+            body["previous_response_id"] = json!("resp_provider_only");
+        }
+        let thread_id = format!("fixture-{case}");
+        let (url, task) = helper(1).await;
+        let response = client.post(format!("{}/gw/codex/v1/responses", url.replacen("ws://", "http://", 1)))
+            .header("thread-id", &thread_id)
+            .bearer_auth("local-test")
+            .json(&body)
+            .send().await.unwrap();
+        if case == "success" {
+            assert_eq!(response.status(), 200);
+            assert!(response.text().await.unwrap().contains("backup answer"));
+        } else {
+            assert_eq!(response.status(), 400, "{case}");
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["error"]["code"], "gateway_upstream_header_timeout", "{case}");
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(message.starts_with("供应商「WS test」在 "), "{case}: {message}");
+            assert!(message.ends_with("ms 内未返回 HTTP 响应头（供应商预算），上游执行结果未知，已停止自动重发"), "{case}: {message}");
+        }
+        finish(task).await;
+        finish(primary_task).await;
+        finish(backup_task).await;
+        if case == "success" {
+            let records = std::fs::read_to_string(crate::request_log::request_log_path()).unwrap();
+            let entry: crate::request_log::RequestLogEntry = serde_json::from_str(records.lines().last().unwrap()).unwrap();
+            assert_eq!(entry.thread_id.as_deref(), Some(thread_id.as_str()));
+            assert_eq!(entry.relay_id, backup_id);
+            assert_eq!(entry.upstream_model, backup_model);
+            assert_eq!(entry.attempts, 2);
+            assert_eq!(entry.usage.unwrap().input_tokens, 3);
+        }
+    }
+}
+
 async fn http_fixture_body(socket: &mut tokio::net::TcpStream) -> Value {
     let mut reader = BufReader::new(socket);
     let mut line = String::new();

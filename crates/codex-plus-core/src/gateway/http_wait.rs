@@ -40,6 +40,8 @@ pub(crate) enum HeaderWaitError {
         provider: String,
         elapsed_ms: u64,
         scope: &'static str,
+        eligible_for_backup: bool,
+        upstream_model: String,
     },
     #[error("供应商「{provider}」在返回 HTTP 响应头前连接中断，上游执行结果未知，已停止自动重发")]
     Disconnected { provider: String },
@@ -70,6 +72,9 @@ pub(crate) struct HttpAttempt {
     sends: Cell<u32>,
     forward_native_stream: bool,
     continuation_timeout: Duration,
+    headers_seen: Cell<bool>,
+    backup: bool,
+    track_dispatch: bool,
 }
 
 tokio::task_local! {
@@ -113,7 +118,36 @@ impl HttpAttempt {
             sends: Cell::new(0),
             forward_native_stream,
             continuation_timeout: timeout.min(route_timeout(settings)),
+            headers_seen: Cell::new(false),
+            backup: false,
+            track_dispatch: settings.gateway_header_backup.enabled,
         }
+    }
+
+    pub(super) fn as_backup(mut self) -> Self {
+        self.backup = true;
+        self.budget_scope = "备用预算";
+        self
+    }
+
+    pub(crate) fn is_backup(&self) -> bool {
+        self.backup
+    }
+
+    pub(crate) fn backup_target(&self) -> Option<(String, String)> {
+        self.backup.then(|| (self.relay_id.clone(), self.model.borrow().clone()))
+    }
+
+    pub(crate) fn track_dispatch(&self) -> bool {
+        self.track_dispatch && !self.backup
+    }
+
+    pub(crate) fn sent(&self) -> bool {
+        self.sends.get() != 0
+    }
+
+    pub(crate) fn mark_headers_received(&self) {
+        self.headers_seen.set(true);
     }
 
     pub(crate) fn deadline(&self) -> Instant {
@@ -143,11 +177,13 @@ impl HttpAttempt {
         }
     }
 
-    pub(crate) fn timeout_error(&self, elapsed_ms: u64) -> HeaderWaitError {
+    pub(crate) fn timeout_error(&self, elapsed_ms: u64, body_dispatched: bool) -> HeaderWaitError {
         HeaderWaitError::Timeout {
             provider: self.provider.clone(),
             elapsed_ms,
             scope: self.budget_scope,
+            eligible_for_backup: body_dispatched && !self.headers_seen.get() && !self.backup,
+            upstream_model: self.model.borrow().clone(),
         }
     }
 
@@ -167,6 +203,9 @@ impl HttpAttempt {
     pub(crate) fn begin_send(&self, request: &reqwest::Request) -> HttpSend {
         let attempt = self.sends.get() + 1;
         self.sends.set(attempt);
+        if self.backup && let Some(id) = &self.request_id {
+            crate::request_log::update_running_phase(id, "header_backup");
+        }
         HttpSend {
             attempt,
             body_bytes: request
@@ -189,6 +228,7 @@ impl HttpAttempt {
         let mut detail = json!({
                 "requestId": self.request_id,
                 "candidate": self.candidate,
+                "headerBackup": self.backup,
                 "attempt": send.attempt,
                 "relayId": self.relay_id,
                 "relayName": self.provider,

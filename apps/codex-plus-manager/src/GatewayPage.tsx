@@ -1024,6 +1024,66 @@ function HeaderTimeoutInput({ title, scope, providerId, value, fallback, minimum
   );
 }
 
+function GatewayHeaderBackupSettings({ payload, busy, run }: { payload: GatewayPayload; busy: string | null; run: Run }) {
+  const saved = payload.headerBackup;
+  const [draft, setDraft] = useState<{ providerId: string; model: string } | null>(null);
+  const providerId = draft?.providerId ?? saved?.providerId ?? "";
+  const model = draft?.model ?? saved?.model ?? "";
+  const enabled = saved?.enabled === true;
+  const providers = payload.pool.filter((provider) => provider.enabled && provider.models.length > 0);
+  const provider = providers.find((entry) => entry.id === providerId);
+  const savedAvailable = providers.some((entry) => entry.id === saved?.providerId && entry.models.includes(saved.model));
+  const valid = provider?.models.includes(model) === true;
+  const save = async (nextEnabled: boolean, selection: { providerId: string; model: string }) => {
+    if (await run("header-backup", "save_gateway_header_backup", { backup: { enabled: nextEnabled, ...selection } }, t("保存备用模型"), true)) {
+      setDraft(null);
+    }
+  };
+  return (
+    <>
+      <CxRow title={t("响应头超时后切换备用模型")}>
+        <Switch
+          label={t("响应头超时后切换备用模型")}
+          on={enabled}
+          disabled={!enabled && !savedAvailable}
+          pending={busy !== null}
+          onToggle={() => void save(!enabled, { providerId: saved?.providerId ?? "", model: saved?.model ?? "" })}
+        />
+      </CxRow>
+      <CxRow title={t("备用模型")}>
+        <div className="flex flex-wrap items-center gap-2">
+          <AppSelect
+            className="cx-set-select"
+            disabled={busy !== null || providers.length === 0}
+            label={t("备用供应商")}
+            placeholder={providerId || t("选择供应商")}
+            onChange={(id) => setDraft({ providerId: id, model: "" })}
+            options={providers.map((entry) => ({ value: entry.id, label: entry.name }))}
+            size="sm"
+            value={providerId}
+          />
+          <AppSelect
+            className="cx-set-select"
+            disabled={busy !== null || !provider}
+            label={t("备用模型")}
+            placeholder={model || t("选择模型")}
+            onChange={(value) => setDraft({ providerId, model: value })}
+            options={(provider?.models ?? []).map((value) => ({ value, label: value }))}
+            size="sm"
+            value={model}
+          />
+          <Button
+            disabled={busy !== null || !valid || (providerId === saved?.providerId && model === saved?.model)}
+            onClick={() => void save(enabled, { providerId, model })}
+            size="sm"
+            type="button"
+          >{t("保存")}</Button>
+        </div>
+      </CxRow>
+    </>
+  );
+}
+
 function GatewayStreamSettings({ payload, busy, run }: { payload: GatewayPayload; busy: string | null; run: Run }) {
   const [selected, setSelected] = useState("");
   const provider = payload.pool.find((entry) => entry.id === selected) ?? payload.pool[0];
@@ -1059,6 +1119,7 @@ function GatewayStreamSettings({ payload, busy, run }: { payload: GatewayPayload
             <HeaderTimeoutInput key={provider.id} title={t("供应商响应头等待（秒）")} scope="provider" providerId={provider.id} value={providerSeconds} fallback={defaultSeconds} minimum={1} busy={busy} run={run} />
           </div>
         </CxRow>}
+        <GatewayHeaderBackupSettings payload={payload} busy={busy} run={run} />
         <CxRow
           title={t("纯文本断流后自动续写")}
           detail={t("Codex HTTP 纯文本出字后断流时，向同一供应商和模型发起一次续写请求，会产生额外用量。")}

@@ -268,7 +268,7 @@ const overview = ok({
     debugger: { status: "disconnected", address: null, message: "等待 Codex 连接" },
     protocol_conversion_enabled: true,
   },
-  current_version: "2.9.4+2",
+  current_version: "2.9.4+3",
   update_status: "up_to_date",
   settings_path: "演示模式",
   logs_path: "演示模式",

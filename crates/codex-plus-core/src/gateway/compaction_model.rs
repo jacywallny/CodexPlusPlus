@@ -237,6 +237,7 @@ pub async fn open(
                 live_request_id: request.live_request_id,
                 auto_retry: request.auto_retry,
                 is_stream: request.is_stream,
+                allow_header_backup: false,
                 upstream_path: request.upstream_path,
                 client: request.client,
                 queue_timeout: request.queue_timeout,
