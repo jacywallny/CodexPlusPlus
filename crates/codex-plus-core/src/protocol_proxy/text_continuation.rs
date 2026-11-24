@@ -9,7 +9,7 @@ const MAX_TEXT_BYTES: usize = 64_000;
 const MAX_RECOVERY_BYTES: usize = 2 * 1024 * 1024;
 
 pub(super) fn request_body(body: &Value) -> Option<Value> {
-    for key in ["previous_response_id", "conversation", "prompt"] {
+    for key in ["previous_response_id", "conversation", "conversation_id", "prompt"] {
         if body.get(key).is_some_and(|value| !value.is_null()) {
             return None;
         }
@@ -465,7 +465,10 @@ mod tests {
         assert_eq!(prepared["tool_choice"], "none");
         assert_eq!(prepared["parallel_tool_calls"], false);
         assert_eq!(prepared["input"][0]["content"], "hello");
-        body["previous_response_id"] = json!("resp_prior");
-        assert!(request_body(&body).is_none());
+        for key in ["previous_response_id", "conversation", "conversation_id", "prompt"] {
+            body[key] = json!("upstream_state");
+            assert!(request_body(&body).is_none(), "{key}");
+            body.as_object_mut().unwrap().remove(key);
+        }
     }
 }

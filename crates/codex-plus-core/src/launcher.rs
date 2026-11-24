@@ -3489,8 +3489,17 @@ async fn handle_protocol_proxy_connection_inner(
             request_log.entry.attempts = request_log.entry.attempts.saturating_add(1);
             request_log.entry.retry_reasons.push("stream_text_continuation".to_owned());
         }
-        let (failure, usage, failure_detail, first_output_at_ms) = forwarded?;
-        sink.finish().await?;
+        let forwarded = match forwarded {
+            Ok(outcome) => sink.finish().await.map(|()| outcome).map_err(anyhow::Error::from),
+            Err(error) => Err(error),
+        };
+        let (failure, usage, failure_detail, first_output_at_ms) = match forwarded {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                request_log.record_stream(Some("downstream_cancelled"), None, Some(error.to_string()));
+                return Err(error);
+            }
+        };
         if !response_unmodified {
             final_usage = None;
         }
